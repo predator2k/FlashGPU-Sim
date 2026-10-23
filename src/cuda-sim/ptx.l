@@ -377,6 +377,10 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.tf32  TC;  return TF32_TYPE;
 \.e4m3  TC;  return E4M3_TYPE;
 \.e5m2  TC;  return E5M2_TYPE;
+	/* yasai: packed fp8 pairs lex as the same-size b16 so NCCL's fp8 helpers parse; their
+	   conversions are only in fp8 reduction code, which f32 runs do not execute. */
+\.e4m3x2  TC;  return B16_TYPE;
+\.e5m2x2  TC;  return B16_TYPE;
 \.f32x2  TC;  return F32X2_TYPE;
 \.f32  TC;  return F32_TYPE;
 \.f64  TC;  return F64_TYPE;
@@ -388,6 +392,7 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.b64  TC;  return B64_TYPE;
 \.bb64  TC;  return BB64_TYPE;
 \.bb128  TC;  return BB128_TYPE;
+\.b128  TC;  return BB128_TYPE; /* yasai: PTX 8.3 128-bit type */
 \.pred TC;  return PRED_TYPE;
 
 \.texref TC; BEGIN(NOT_OPCODE); return TEXREF_TYPE;
