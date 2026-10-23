@@ -166,10 +166,8 @@ struct CUctx_st {
         if (s != NULL && s->get_pc() != NULL) {
           i->second = s->get_pc();
           m_yasai_pending_kernel.erase(p);
-        } else {
-          fprintf(stderr, "yasai: no PTX entry %s for a registered kernel\n", p->second.c_str());
-          abort();
-        }
+        }  // else NULL: callers handle kernels without PTX (NCCL queries its symmetric-memory
+           // kernels, which have no PTX for this architecture)
       }
     }
     return i->second;

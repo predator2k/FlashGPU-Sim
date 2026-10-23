@@ -2234,8 +2234,11 @@ static void do_tma_transfer_subbyte(const tensormap_descriptor_t &tm,
   const uint32_t bits = tm.subbyte_bits(), gsz = tm.subbyte_smem_group_bytes();
   const uint32_t dims = tm.num_dims();
   const uint32_t groups = tm.fields.boxDim[0] / 16, smem_row = groups * gsz;
+  uint32_t rows_total = 1;
+  for (uint32_t d = 1; d < dims; d++)
+    rows_total *= tm.fields.boxDim[d];
   if (is_load) {
-    std::vector<unsigned char> zero(tm.get_tile_size_bytes(), 0);
+    std::vector<unsigned char> zero(size_t(rows_total) * smem_row, 0);
     shared_mem->write(smem_addr, uint32_t(zero.size()), zero.data(), thread,
                       pI);
   }

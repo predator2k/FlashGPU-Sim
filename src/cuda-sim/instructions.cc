@@ -3161,6 +3161,8 @@ ptx_reg_t s2f(ptx_reg_t x, unsigned from_width, unsigned to_width, int to_sign,
         break;
     }
   } else {
+    y = x;  // yasai: the 64-bit source was never copied into y (cvt.f32.s64 returned garbage,
+            // 0 in practice: PyTorch argmax(...).float() gave all zeros)
     switch (to_width) {
       case 16:
         assert(0);
@@ -3233,6 +3235,7 @@ ptx_reg_t u2f(ptx_reg_t x, unsigned from_width, unsigned to_width, int to_sign,
         break;
     }
   } else {
+    y = x;  // yasai: as in s2f, the 64-bit source was never copied into y
     switch (to_width) {
       case 16:
         assert(0);
@@ -3240,16 +3243,16 @@ ptx_reg_t u2f(ptx_reg_t x, unsigned from_width, unsigned to_width, int to_sign,
       case 32:
         switch (rounding_mode) {
           case RZ_OPTION:
-            y.f32 = cuda_math::__ull2float_rn(y.u64);
+            y.f32 = cuda_math::__ull2float_rz(y.u64);
             break;
           case RN_OPTION:
             y.f32 = cuda_math::__ull2float_rn(y.u64);
             break;
           case RM_OPTION:
-            y.f32 = cuda_math::__ull2float_rn(y.u64);
+            y.f32 = cuda_math::__ull2float_rd(y.u64);
             break;
           case RP_OPTION:
-            y.f32 = cuda_math::__ull2float_rn(y.u64);
+            y.f32 = cuda_math::__ull2float_ru(y.u64);
             break;
           default:
             break;

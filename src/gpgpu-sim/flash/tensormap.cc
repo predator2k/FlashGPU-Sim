@@ -81,8 +81,12 @@ uint32_t tensormap_descriptor_t::get_tile_size_bytes() const {
   for (uint32_t i = 0; i < dims; i++) {
     total_elements *= fields.boxDim[i];
   }
+  // yasai: a sub-byte type completes its data bytes (packed, without the
+  // shared-memory padding of 16U4_ALIGN16B/16U6_ALIGN16B): CUTLASS's 2-SM MXFP8
+  // x MXFP4 GEMM expects 104448 bytes per stage, which counts its FP4 operand
+  // at 4 bits per element.
   if (subbyte_bits() != 0)
-    return total_elements / 16 * subbyte_smem_group_bytes(); // yasai
+    return total_elements * subbyte_bits() / 8;
   return total_elements * get_element_size();
 }
 

@@ -38,6 +38,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <list>
+#include <set>
+#include <string>
 #include <vector>
 
 class ptx_recognizer;
@@ -271,6 +273,17 @@ void d_cell(unsigned m_cta, unsigned n_total, bool pair, bool ws, unsigned m,
   col = n % span;
 }
 
+// First TMEM lane a warp reaches with tcgen05.ld/st at address addr: warp w of
+// a warpgroup can access only lanes 32 * (w % 4) to 32 * (w % 4) + 31, and the
+// lane field of the address selects the row inside that quarter. FlashMLA's
+// SM100 prefill reads the second N half of a .ws M=64 accumulator (Layout E,
+// lanes 64-127) from warps 2 and 3 with address lanes 0 and 32.
+unsigned quarter_lane(ptx_thread_info *t, uint32_t addr) {
+  const dim3 tid = t->get_tid(), nt = t->get_ntid();
+  const unsigned flat = tid.x + nt.x * (tid.y + nt.y * tid.z);
+  return 32 * ((flat / 32) % 4) + ((addr >> 16) & 31);
+}
+
 // Scale factor value for row/column x and K block j from TMEM (sf_id: data ID,
 // the byte offset of the first scale factor in each TMEM word, from the
 // instruction descriptor).
@@ -447,6 +460,20 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
       nsf = 1;
   }
   const unsigned block = K / nsf;
+  if (getenv(
+          "YASAI_UMMA_DEBUG")) { // one line per distinct shape and operand form
+    static std::set<std::string> seen;
+    char key[256];
+    snprintf(key, sizeof key,
+             "kind=%d M=%u N=%u K=%u ws=%d pair=%d a_tmem=%d a_mn=%d b_mn=%d "
+             "c=%u bs=%d nsf=%u "
+             "a_swz=%u b_swz=%u",
+             int(kind), M, N, K, int(ws), int(pair), int(a_tmem), int(a_mn),
+             int(b_mn), c_format, int(block_scale), nsf,
+             a_tmem ? 0u : unsigned(a_desc_v >> 61), unsigned(b_desc_v >> 61));
+    if (seen.insert(key).second)
+      fprintf(stderr, "yasai-umma %s\n", key);
+  }
 
   tcgen05_tmem_manager_t &mgr = t->get_gpu()->get_tcgen05_tmem_manager();
   const unsigned me = own_cta(t);
@@ -628,7 +655,7 @@ void ld(const ptx_instruction *pI, ptx_thread_info *t) {
   const unsigned nvals = pack ? nregs * 2 : nregs;
   tcgen05_tmem_manager_t &mgr = t->get_gpu()->get_tcgen05_tmem_manager();
   const tcgen05_tmem_scope_t sc = scope_of(t, own_cta(t));
-  const unsigned lane0 = (addr >> 16) & 0xFFFF, col0 = addr & 0xFFFF,
+  const unsigned lane0 = quarter_lane(t, addr), col0 = addr & 0xFFFF,
                  lane = t->get_laneid();
   std::vector<uint32_t> vals(nvals);
   for (unsigned v = 0; v < nvals; ++v) {
@@ -678,7 +705,7 @@ void st(const ptx_instruction *pI, ptx_thread_info *t) {
   }
   tcgen05_tmem_manager_t &mgr = t->get_gpu()->get_tcgen05_tmem_manager();
   const tcgen05_tmem_scope_t sc = scope_of(t, own_cta(t));
-  const unsigned lane0 = (addr >> 16) & 0xFFFF, col0 = addr & 0xFFFF,
+  const unsigned lane0 = quarter_lane(t, addr), col0 = addr & 0xFFFF,
                  lane = t->get_laneid();
   for (unsigned v = 0; v < vals.size(); ++v) {
     unsigned dp, col;

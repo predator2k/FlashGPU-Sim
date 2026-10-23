@@ -86,6 +86,8 @@ typedef union __attribute__((aligned(128))) tensormap_descriptor_t {
   // types.
   uint32_t subbyte_bits() const;
   // yasai: shared-memory bytes of 16 elements of a sub-byte type (8 or 16).
+  // get_tile_size_bytes of a sub-byte type is its data size (the transaction
+  // bytes), not its shared-memory size.
   uint32_t subbyte_smem_group_bytes() const;
   uint32_t get_tile_size_bytes() const;
   uint64_t calculate_src_addr(const int32_t coords[5]) const;
