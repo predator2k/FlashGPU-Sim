@@ -1299,7 +1299,7 @@ static std::list<operand_info> check_operands(
       (opcode == FMA_OP) ||
       (opcode == WGMMA_MMA_ASYNC_OP) ||
       (opcode == WGMMA_MMA_ASYNC_SP_OP) ||
-      (opcode == DP4A_OP) || (opcode == VMIN_OP) || (opcode == VMAX_OP)) {
+      (opcode == DP4A_OP) || (opcode == DP2A_OP) || (opcode == VMIN_OP) || (opcode == VMAX_OP)) {
     // just make sure these do not have have const operands...
     if (!g_warn_literal_operands_two_type_inst) {
       std::list<operand_info>::const_iterator o;
@@ -1551,6 +1551,14 @@ ptx_instruction::ptx_instruction(
         break;
       case SAT_OPTION:
         m_saturation_mode = 1;
+        break;
+      case RELU_OPTION:  // yasai
+        m_relu = true;
+        break;
+      case BF16X2_TYPE:  // yasai: marker from ptx_recognizer::note_bf16x2
+        m_bf16x2 = true;
+        break;
+      case NOFTZ_OPTION:  // yasai: no denormal flushing is modeled anyway
         break;
       case SATFINITE_OPTION:
         m_saturation_mode = 1;

@@ -654,7 +654,7 @@ void ptx_recognizer::add_scalar_type_spec(int type_spec) {
             (g_opcode == FMA_OP) ||
             (g_opcode == WGMMA_MMA_ASYNC_OP) ||
             (g_opcode == WGMMA_MMA_ASYNC_SP_OP) ||
-            (g_opcode == DP4A_OP) || (g_opcode == VMIN_OP) || (g_opcode == VMAX_OP),
+            (g_opcode == DP4A_OP) || (g_opcode == DP2A_OP) || (g_opcode == VMIN_OP) || (g_opcode == VMAX_OP),
         "only cvt, set, slct, tex, mma, fma, wgmma, vmin, vmax and dp4a can have "
         "more than one type specifier.");
   }
@@ -673,6 +673,11 @@ void ptx_recognizer::add_label(const char *identifier) {
 }
 
 void ptx_recognizer::add_opcode(int opcode) { g_opcode = opcode; }
+
+// yasai: see ptx_parser.h.
+void ptx_recognizer::note_bf16x2() {
+  if (g_opcode != -1) g_options.push_back(BF16X2_TYPE);
+}
 
 void ptx_recognizer::add_pred(const char *identifier, int neg,
                               int predModifier) {

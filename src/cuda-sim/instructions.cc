@@ -243,6 +243,41 @@ static inline float f32_from_f16_bits(uint16_t bits) {
   return half_float::detail::half2float<float>(bits);
 }
 
+// yasai: bf16 is the upper half of an f32.
+static inline float f32_from_bf16_bits(uint16_t bits) {
+  uint32_t u = uint32_t(bits) << 16;
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
+// yasai: f32 to bf16 rounding to nearest even (.rn) or toward zero (.rz); NaN gives the
+// canonical NaN 0x7FFF.
+static inline uint16_t bf16_bits_from_f32(float f, unsigned rounding_mode) {
+  uint32_t u;
+  std::memcpy(&u, &f, 4);
+  if ((u & 0x7FFFFFFFu) > 0x7F800000u) return 0x7FFF;
+  if (rounding_mode == RZ_OPTION || rounding_mode == RZI_OPTION) return uint16_t(u >> 16);
+  u += 0x7FFFu + ((u >> 16) & 1u);
+  return uint16_t(u >> 16);
+}
+
+// yasai: 16-bit result of one half of a packed operation: f16 or bf16 bits, with .relu (negative
+// to +0, NaN to the canonical NaN 0x7FFF) applied when relu is set.
+static inline uint16_t packed_half_from_f32(float f, bool bf16, bool relu,
+                                            unsigned rounding_mode) {
+  if (relu) {
+    if (std::isnan(f)) return 0x7FFF;
+    if (f < 0.0f) f = 0.0f;
+  }
+  return bf16 ? bf16_bits_from_f32(f, rounding_mode) : f16_bits_from_f32(f, rounding_mode);
+}
+
+// yasai: f32 value of one half of a packed f16x2 or bf16x2 register.
+static inline float packed_half_to_f32(uint16_t bits, bool bf16) {
+  return bf16 ? f32_from_bf16_bits(bits) : f32_from_f16_bits(bits);
+}
+
 void ptx_thread_info::set_reg(const symbol *reg, const ptx_reg_t &value) {
   assert(reg != NULL);
   if (reg->name() == "_") return;
@@ -3445,6 +3480,20 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     ptx_reg_t src2_data = thread->get_operand_value(src2, dst, from_type, thread, 1);
 
 
+    // yasai: bf16x2 and .relu (cvt.rn{.relu}.bf16x2.f32, cvt.rn.relu.f16x2.f32).
+    if (pI->is_bf16x2() || pI->is_relu()) {
+      const unsigned rm = (rounding_mode == RZ_OPTION || rounding_mode == RZI_OPTION)
+                              ? RZ_OPTION
+                              : RN_OPTION;
+      const uint16_t lo = packed_half_from_f32(src2_data.f32, pI->is_bf16x2(), pI->is_relu(), rm);
+      const uint16_t hi = packed_half_from_f32(src1_data.f32, pI->is_bf16x2(), pI->is_relu(), rm);
+      ptx_reg_t result;
+      result.u64 = 0;
+      result.u32 = (uint32_t(hi) << 16) | uint32_t(lo);
+      thread->set_operand_value(dst, result, to_type, thread, pI);
+      return;
+    }
+
     // Convert each f32 to f16 using the specified rounding mode
     half_float::detail::uint16 f16_low, f16_high;
     switch (rounding_mode) {
@@ -3515,6 +3564,7 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     }
     if (pI->is_neg()) f = -f;
     if (saturation_mode) f = cuda_math::__saturatef(f);
+    if (pI->is_relu() && !std::isnan(f) && f < 0.0f) f = 0.0f;  // yasai: cvt .relu
     ptx_reg_t out;
     out.u64 = 0;
     uint32_t fu;
@@ -3720,9 +3770,154 @@ void div_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   thread->set_operand_value(dst, data, i_type, thread, pI);
 }
 
+// yasai: byte k (0..3) of a 32-bit value, sign-extended when is_signed.
+static inline int64_t yasai_byte(uint32_t v, int k, bool is_signed) {
+  const uint32_t b = (v >> (8 * k)) & 0xFFu;
+  return is_signed ? int64_t(int8_t(b)) : int64_t(b);
+}
+
+// yasai: half k (0..1) of a 32-bit value, sign-extended when is_signed.
+static inline int64_t yasai_half(uint32_t v, int k, bool is_signed) {
+  const uint32_t h = (v >> (16 * k)) & 0xFFFFu;
+  return is_signed ? int64_t(int16_t(h)) : int64_t(h);
+}
+
+// yasai: dp4a.atype.btype d, a, b, c: d = c + sum over the four byte pairs of a and b.
 void dp4a_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
-  printf("DP4A instruction not implemented yet");
-  assert(0);
+  const operand_info &dst = pI->dst();
+  const unsigned a_type = pI->get_type();
+  const unsigned b_type = pI->get_type2() ? pI->get_type2() : a_type;
+  const uint32_t a = thread->get_operand_value(pI->src1(), dst, U32_TYPE, thread, 1).u32;
+  const uint32_t b = thread->get_operand_value(pI->src2(), dst, U32_TYPE, thread, 1).u32;
+  const uint32_t c = thread->get_operand_value(pI->src3(), dst, U32_TYPE, thread, 1).u32;
+  const bool as = (a_type == S32_TYPE), bs = (b_type == S32_TYPE);
+  int64_t sum = (as || bs) ? int64_t(int32_t(c)) : int64_t(c);
+  for (int k = 0; k < 4; ++k) sum += yasai_byte(a, k, as) * yasai_byte(b, k, bs);
+  ptx_reg_t d;
+  d.u64 = 0;
+  d.u32 = uint32_t(sum);
+  thread->set_operand_value(dst, d, (as || bs) ? S32_TYPE : U32_TYPE, thread, pI);
+}
+
+// yasai: dp2a.lo/hi.atype.btype d, a, b, c: the two 16-bit halves of a times bytes 0..1 (.lo)
+// or 2..3 (.hi) of b, plus c.
+void dp2a_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  const operand_info &dst = pI->dst();
+  const unsigned a_type = pI->get_type();
+  const unsigned b_type = pI->get_type2() ? pI->get_type2() : a_type;
+  const uint32_t a = thread->get_operand_value(pI->src1(), dst, U32_TYPE, thread, 1).u32;
+  const uint32_t b = thread->get_operand_value(pI->src2(), dst, U32_TYPE, thread, 1).u32;
+  const uint32_t c = thread->get_operand_value(pI->src3(), dst, U32_TYPE, thread, 1).u32;
+  const bool as = (a_type == S32_TYPE), bs = (b_type == S32_TYPE);
+  const int base = pI->is_hi() ? 2 : 0;
+  int64_t sum = (as || bs) ? int64_t(int32_t(c)) : int64_t(c);
+  for (int k = 0; k < 2; ++k) sum += yasai_half(a, k, as) * yasai_byte(b, base + k, bs);
+  ptx_reg_t d;
+  d.u64 = 0;
+  d.u32 = uint32_t(sum);
+  thread->set_operand_value(dst, d, (as || bs) ? S32_TYPE : U32_TYPE, thread, pI);
+}
+
+// yasai: copysign.f32/.f64 d, a, b: the magnitude of b with the sign of a.
+void copysign_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  const operand_info &dst = pI->dst();
+  const unsigned t = pI->get_type();
+  ptx_reg_t a = thread->get_operand_value(pI->src1(), dst, t, thread, 1);
+  ptx_reg_t b = thread->get_operand_value(pI->src2(), dst, t, thread, 1);
+  ptx_reg_t d;
+  d.u64 = 0;
+  if (t == F64_TYPE)
+    d.f64 = std::copysign(b.f64, a.f64);
+  else
+    d.f32 = std::copysign(b.f32, a.f32);
+  thread->set_operand_value(dst, d, t, thread, pI);
+}
+
+// yasai: lop3.b32 d, a, b, c, immLut: bit i of d is bit (a_i*4 + b_i*2 + c_i) of immLut.
+void lop3_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  const operand_info &dst = pI->dst();
+  const uint32_t a = thread->get_operand_value(pI->src1(), dst, B32_TYPE, thread, 1).u32;
+  const uint32_t b = thread->get_operand_value(pI->src2(), dst, B32_TYPE, thread, 1).u32;
+  const uint32_t c = thread->get_operand_value(pI->src3(), dst, B32_TYPE, thread, 1).u32;
+  const uint32_t lut =
+      thread->get_operand_value(pI->operand_lookup(4), dst, B32_TYPE, thread, 1).u32 & 0xFFu;
+  uint32_t r = 0;
+  for (int i = 0; i < 32; ++i) {
+    const unsigned idx = (((a >> i) & 1u) << 2) | (((b >> i) & 1u) << 1) | ((c >> i) & 1u);
+    r |= ((lut >> idx) & 1u) << i;
+  }
+  ptx_reg_t d;
+  d.u64 = 0;
+  d.u32 = r;
+  thread->set_operand_value(dst, d, B32_TYPE, thread, pI);
+}
+
+// yasai: bmsk.clamp/.wrap.b32 d, a, b: a mask of b ones starting at bit a. .wrap takes a and b
+// modulo 32, .clamp limits them to 32; bits above 31 are dropped.
+void bmsk_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  const operand_info &dst = pI->dst();
+  uint32_t a = thread->get_operand_value(pI->src1(), dst, U32_TYPE, thread, 1).u32;
+  uint32_t b = thread->get_operand_value(pI->src2(), dst, U32_TYPE, thread, 1).u32;
+  if (pI->clamp_mode()) {
+    a = a > 32 ? 32 : a;
+    b = b > 32 ? 32 : b;
+  } else {
+    a &= 31u;
+    b &= 31u;
+  }
+  const unsigned long long m = ((b >= 64 ? ~0ull : ((1ull << b) - 1ull)) << a) & 0xFFFFFFFFull;
+  ptx_reg_t d;
+  d.u64 = 0;
+  d.u32 = uint32_t(m);
+  thread->set_operand_value(dst, d, B32_TYPE, thread, pI);
+}
+
+// yasai: redux.sync.op.type d, a, membermask: reduction of a over the active lanes of the warp
+// (op add/min/max for .u32/.s32, and/or/xor for .b32). Lanes are visited one after another, as
+// in vote_impl: the last active lane writes the result to every lane.
+void redux_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  static thread_local bool first_in_warp = true;
+  static thread_local int64_t acc;
+  static thread_local std::list<ptx_thread_info *> threads_in_warp;
+  static thread_local unsigned last_tid;
+  const unsigned t = pI->get_type();
+  const bool is_signed = (t == S32_TYPE);
+  const unsigned op = pI->get_atomic();
+  if (first_in_warp) {
+    first_in_warp = false;
+    threads_in_warp.clear();
+    int offset = 31;
+    while ((offset >= 0) && !pI->active(offset)) offset--;
+    assert(offset >= 0);
+    last_tid = (thread->get_hw_tid() - (thread->get_hw_tid() % pI->warp_size())) + offset;
+    switch (op) {
+      case ATOMIC_MIN: acc = is_signed ? INT32_MAX : int64_t(UINT32_MAX); break;
+      case ATOMIC_MAX: acc = is_signed ? INT32_MIN : 0; break;
+      case ATOMIC_AND: acc = int64_t(UINT32_MAX); break;
+      default: acc = 0; break;
+    }
+  }
+  const uint32_t v = thread->get_operand_value(pI->src1(), pI->dst(), t, thread, 1).u32;
+  const int64_t x = is_signed ? int64_t(int32_t(v)) : int64_t(v);
+  switch (op) {
+    case ATOMIC_ADD: acc += x; break;
+    case ATOMIC_MIN: acc = x < acc ? x : acc; break;
+    case ATOMIC_MAX: acc = x > acc ? x : acc; break;
+    case ATOMIC_AND: acc &= x; break;
+    case ATOMIC_OR: acc |= x; break;
+    case ATOMIC_XOR: acc ^= x; break;
+    default:
+      printf("GPGPU-Sim PTX: redux operation 0x%x not supported\n", op);
+      abort();
+  }
+  threads_in_warp.push_back(thread);
+  if (thread->get_hw_tid() == last_tid) {
+    ptx_reg_t d;
+    d.u64 = 0;
+    d.u32 = uint32_t(acc);
+    for (ptx_thread_info *th : threads_in_warp) th->set_operand_value(pI->dst(), d, t, th, pI);
+    first_in_warp = true;
+  }
 }
 
 void ex2_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
@@ -4416,6 +4611,26 @@ void mad_def(const ptx_instruction *pI, ptx_thread_info *thread,
   }
 
   unsigned rounding_mode = pI->rounding_mode();
+
+  // yasai: packed fma/mad on f16x2 or bf16x2, per half in f32 (one rounding), with .sat and
+  // .relu.
+  if (i_type == F16X2_TYPE) {
+    const bool bf16 = pI->is_bf16x2();
+    const unsigned rm = (rounding_mode == RZ_OPTION) ? RZ_OPTION : RN_OPTION;
+    uint32_t r = 0;
+    for (int h = 0; h < 2; ++h) {
+      const float x = packed_half_to_f32(uint16_t(a.u32 >> (16 * h)), bf16);
+      const float y = packed_half_to_f32(uint16_t(b.u32 >> (16 * h)), bf16);
+      const float z = packed_half_to_f32(uint16_t(c.u32 >> (16 * h)), bf16);
+      float v = std::fma(x, y, z);
+      if (pI->saturation_mode()) v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+      r |= uint32_t(packed_half_from_f32(v, bf16, pI->is_relu(), rm)) << (16 * h);
+    }
+    d.u64 = 0;
+    d.u32 = r;
+    thread->set_operand_value(dst, d, i_type, thread, pI);
+    return;
+  }
 
   switch (i_type) {
     case S16_TYPE:
@@ -5982,6 +6197,30 @@ void set_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
   a = thread->get_operand_value(src1, dst, src_type, thread, 1);
   b = thread->get_operand_value(src2, dst, src_type, thread, 1);
+
+  // yasai: packed set (set.cmp.dtype.f16x2/.bf16x2): each 16-bit half of the result is all ones
+  // (u32/s32 destination) or 1.0 (f16x2 destination) when the comparison of that half holds.
+  if (src_type == F16X2_TYPE) {
+    const bool bf16 = pI->is_bf16x2();
+    uint32_t r = 0;
+    for (int h = 0; h < 2; ++h) {
+      ptx_reg_t x, y;
+      x.u64 = 0;
+      y.u64 = 0;
+      x.f32 = packed_half_to_f32(uint16_t(a.u32 >> (16 * h)), bf16);
+      y.f32 = packed_half_to_f32(uint16_t(b.u32 >> (16 * h)), bf16);
+      if (pI->is_abs()) x.f32 = std::fabs(x.f32);
+      if (CmpOp(F32_TYPE, x, y, cmpop)) {
+        const uint32_t one = (pI->get_type() == F16X2_TYPE) ? (bf16 ? 0x3F80u : 0x3C00u) : 0xFFFFu;
+        r |= one << (16 * h);
+      }
+    }
+    ptx_reg_t data;
+    data.u64 = 0;
+    data.u32 = r;
+    thread->set_operand_value(dst, data, pI->get_type(), thread, pI);
+    return;
+  }
 
   // Take abs of first operand if needed
   if (pI->is_abs()) {

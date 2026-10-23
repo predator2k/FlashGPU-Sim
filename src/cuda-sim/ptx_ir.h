@@ -1294,6 +1294,10 @@ class ptx_instruction : public warp_inst_t {
     return false;
   }
   bool is_hi() const { return m_hi; }
+  // yasai: .relu on cvt/fma (negative results become +0, NaN becomes the canonical NaN).
+  bool is_relu() const { return m_relu; }
+  // yasai: the packed 16-bit type is bf16x2 (get_type() still answers F16X2_TYPE).
+  bool is_bf16x2() const { return m_bf16x2; }
   bool is_lo() const { return m_lo; }
   bool is_wide() const { return m_wide; }
   bool is_uni() const { return m_uni; }
@@ -1402,6 +1406,8 @@ class ptx_instruction : public warp_inst_t {
   unsigned m_compare_op;
   unsigned m_saturation_mode;
   unsigned m_clamp_mode;
+  bool m_relu = false;    // yasai: see is_relu()
+  bool m_bf16x2 = false;  // yasai: see is_bf16x2()
   unsigned m_left_mode;
   unsigned m_barrier_op;
   bool m_parity_op = false;

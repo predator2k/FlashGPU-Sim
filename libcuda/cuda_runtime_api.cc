@@ -500,6 +500,14 @@ char *get_app_binary_name(std::string abs_path) {
 
 static int get_app_cuda_version_internal(std::string app_binary) {
   int app_cuda_version = 0;
+  // yasai: an interpreter (python running PyTorch) does not link libcudart, so the version is
+  // read from YASAI_APP_CUDA_VERSION if set, else from the library named by PYTORCH_BIN.
+  if (const char *v = getenv("YASAI_APP_CUDA_VERSION")) {
+    if (atoi(v) > 0) return atoi(v);
+  }
+  if (const char *pb = getenv("PYTORCH_BIN")) {
+    if (strlen(pb) != 0) app_binary = pb;
+  }
   char fname[1024];
   snprintf(fname, 1024, "_app_cuda_version_XXXXXX");
   int fd = mkstemp(fname);
@@ -3254,6 +3262,56 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyBatchAsync(void *const *dsts, const voi
   return g_last_cudaError = cudaSuccess;
 }
 
+// yasai: runtime functions that PyTorch 2.14 links. Graph memory is not modeled (attributes
+// read as 0 and writes are accepted); graph construction answers not supported because the
+// simulator never captures; an event record with flags is an ordinary event record.
+__host__ cudaError_t CUDARTAPI cudaDeviceGetGraphMemAttribute(int, enum cudaGraphMemAttributeType,
+                                                               void *value) {
+  if (value) *static_cast<unsigned long long *>(value) = 0;
+  return g_last_cudaError = cudaSuccess;
+}
+
+// yasai: see cudaDeviceGetGraphMemAttribute.
+__host__ cudaError_t CUDARTAPI cudaDeviceSetGraphMemAttribute(int, enum cudaGraphMemAttributeType,
+                                                               void *) {
+  return g_last_cudaError = cudaSuccess;
+}
+
+__host__ cudaError_t CUDARTAPI cudaEventRecord(cudaEvent_t event, cudaStream_t stream);
+
+// yasai: see cudaDeviceGetGraphMemAttribute.
+__host__ cudaError_t CUDARTAPI cudaEventRecordWithFlags(cudaEvent_t event, cudaStream_t stream,
+                                                        unsigned int) {
+  return cudaEventRecord(event, stream);
+}
+
+// yasai: see cudaDeviceGetGraphMemAttribute.
+__host__ cudaError_t CUDARTAPI cudaGraphAddNode(cudaGraphNode_t *, cudaGraph_t,
+                                                const cudaGraphNode_t *, const cudaGraphEdgeData *,
+                                                size_t, struct cudaGraphNodeParams *) {
+  return g_last_cudaError = cudaErrorNotSupported;
+}
+
+// yasai: see cudaDeviceGetGraphMemAttribute.
+__host__ cudaError_t CUDARTAPI cudaGraphConditionalHandleCreate(cudaGraphConditionalHandle *,
+                                                                cudaGraph_t, unsigned int,
+                                                                unsigned int) {
+  return g_last_cudaError = cudaErrorNotSupported;
+}
+
+// yasai: see cudaDeviceGetGraphMemAttribute.
+__host__ cudaError_t CUDARTAPI cudaStreamBeginCaptureToGraph(cudaStream_t, cudaGraph_t,
+                                                             const cudaGraphNode_t *,
+                                                             const cudaGraphEdgeData *, size_t,
+                                                             enum cudaStreamCaptureMode) {
+  return g_last_cudaError = cudaErrorNotSupported;
+}
+
+// yasai: see cudaDeviceGetGraphMemAttribute.
+__host__ cudaError_t CUDARTAPI cudaUserObjectRelease(cudaUserObject_t, unsigned int) {
+  return g_last_cudaError = cudaSuccess;
+}
+
 __host__ cudaError_t CUDARTAPI cudaIpcGetMemHandle(cudaIpcMemHandle_t *handle,
                                                    void *devPtr) {
   if (g_debug_execution >= 3) {
@@ -3692,19 +3750,21 @@ void cuda_runtime_api::extract_ptx_files_using_cuobjdump_internal(
     // based on the list above, dump ptx files individually. Format of dumped
     // ptx file is prog_name.unique_no.sm_<>.ptx
 
+    // yasai: one `cuobjdump -xptx all` pass writes the same files as one call per listed file.
+    // Each call scans the whole binary, so the per-file loop took about 15 s per file on
+    // libtorch_cuda.so (418 PTX files, 1.2 GB).
     std::ifstream infile(ptx_list_file_name);
     std::string line;
-    while (std::getline(infile, line)) {
-      // int pos = line.find(std::string(get_app_binary_name(app_binary)));
-      const char *ptx_file = line.c_str();
-      printf("Extracting specific PTX file named %s \n", ptx_file);
-      snprintf(command, 1000, "$CUDA_INSTALL_PATH/bin/cuobjdump -xptx %s %s",
-               ptx_file, app_binary.c_str());
+    while (std::getline(infile, line)) context->no_of_ptx++;
+    if (context->no_of_ptx) {
+      printf("Extracting all %d PTX files of %s\n", context->no_of_ptx, app_binary.c_str());
+      snprintf(command, sizeof(command),
+               "$CUDA_INSTALL_PATH/bin/cuobjdump -xptx all %s > /dev/null",
+               app_binary.c_str());
       if (system(command) != 0) {
         printf("ERROR: command: %s failed \n", command);
         exit(0);
       }
-      context->no_of_ptx++;
     }
   }
 

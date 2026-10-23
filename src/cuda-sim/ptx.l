@@ -131,6 +131,11 @@ cvt	TC; yylval->int_value = CVT_OP; return OPCODE;
 cvta	TC; yylval->int_value = CVTA_OP; return OPCODE;
 div	TC; yylval->int_value = DIV_OP; return OPCODE;
 dp4a	TC; yylval->int_value = DP4A_OP; return OPCODE;
+dp2a	TC; yylval->int_value = DP2A_OP; return OPCODE; /* yasai */
+copysign	TC; yylval->int_value = COPYSIGN_OP; return OPCODE; /* yasai */
+lop3	TC; yylval->int_value = LOP3_OP; return OPCODE; /* yasai */
+redux	TC; yylval->int_value = REDUX_OP; return OPCODE; /* yasai */
+bmsk	TC; yylval->int_value = BMSK_OP; return OPCODE; /* yasai */
 ex2	TC; yylval->int_value = EX2_OP; return OPCODE;
 exit	TC; yylval->int_value = EXIT_OP; return OPCODE;
 fma     TC; yylval->int_value = FMA_OP; return OPCODE;
@@ -375,7 +380,7 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.f16  TC;  return F16_TYPE;
 \.f16x2  TC;  return F16X2_TYPE;
 \.bf16  TC;  return BF16_TYPE;
-\.bf16x2  TC;  return F16X2_TYPE; /* yasai: same size as f16x2; only in never-executed multimem */
+\.bf16x2  TC;  return BF16X2_TYPE; /* yasai: stored as f16x2 plus the instruction's bf16x2 flag */
 \.tf32  TC;  return TF32_TYPE;
 \.e4m3  TC;  return E4M3_TYPE;
 \.e5m2  TC;  return E5M2_TYPE;
@@ -420,6 +425,8 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 
 \.satfinite	TC; return SATFINITE_OPTION;
 \.sat	TC; return SAT_OPTION;
+\.relu	TC; return RELU_OPTION; /* yasai: cvt/fma .relu */
+\.noftz	TC; return NOFTZ_OPTION; /* yasai: cp.reduce.async.bulk .noftz */
 
 \.l		TC; return LEFT_OPTION;
 \.r		TC; return RIGHT_OPTION;

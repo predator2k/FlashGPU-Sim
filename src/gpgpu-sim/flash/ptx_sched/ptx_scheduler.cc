@@ -1442,6 +1442,10 @@ inst_class_t classify_inst(const ptx_instruction *inst) {
   case CNOT_OP:
   case CVTA_OP:
   case DP4A_OP:
+  case DP2A_OP:     // yasai
+  case COPYSIGN_OP: // yasai
+  case LOP3_OP:     // yasai
+  case BMSK_OP:     // yasai
   case ISSPACEP_OP:
   case MAPA_OP:
   case MOV_OP:
@@ -1464,6 +1468,7 @@ inst_class_t classify_inst(const ptx_instruction *inst) {
   case SHR_OP:
   case SUBC_OP:
   case VOTE_OP:
+  case REDUX_OP: // yasai
   case ACTIVEMASK_OP:
   case XOR_OP:
   case ELECT_OP:

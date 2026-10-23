@@ -184,6 +184,9 @@ class ptx_recognizer;
 %token GEOM_MODIFIER_2D
 %token GEOM_MODIFIER_3D
 %token SAT_OPTION
+%token RELU_OPTION
+%token NOFTZ_OPTION
+%token BF16X2_TYPE
 %token SATFINITE_OPTION
 %token FTZ_OPTION
 %token NEG_OPTION
@@ -551,6 +554,7 @@ scalar_type: S8_TYPE { recognizer->add_scalar_type_spec( S8_TYPE ); }
 	| U64_TYPE   { recognizer->add_scalar_type_spec( U64_TYPE ); }
 	| F16_TYPE   { recognizer->add_scalar_type_spec( F16_TYPE ); }
 	| F16X2_TYPE { recognizer->add_scalar_type_spec( F16X2_TYPE ); }
+	| BF16X2_TYPE { recognizer->add_scalar_type_spec( F16X2_TYPE ); recognizer->note_bf16x2(); }
 	| BF16_TYPE  { recognizer->add_scalar_type_spec( BF16_TYPE ); }
 	| TF32_TYPE  { recognizer->add_scalar_type_spec( TF32_TYPE ); }
 	| E4M3_TYPE  { recognizer->add_scalar_type_spec( E4M3_TYPE ); }
@@ -677,6 +681,8 @@ option: type_spec
 	| GEOM_MODIFIER_2D { recognizer->add_option(GEOM_MODIFIER_2D); }
 	| GEOM_MODIFIER_3D { recognizer->add_option(GEOM_MODIFIER_3D); }
 	| SAT_OPTION { recognizer->add_option(SAT_OPTION); }
+	| RELU_OPTION { recognizer->add_option(RELU_OPTION); }
+	| NOFTZ_OPTION { recognizer->add_option(NOFTZ_OPTION); }
 	| SATFINITE_OPTION { recognizer->add_option(SATFINITE_OPTION); recognizer->add_wgmma_option(SATFINITE_OPTION); }
 	| WGMMA_SHAPE { recognizer->add_wgmma_option($1); }
 	| FTZ_OPTION { recognizer->add_option(FTZ_OPTION); }

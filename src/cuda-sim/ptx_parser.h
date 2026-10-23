@@ -122,6 +122,9 @@ class ptx_recognizer {
   // member function list
   void init_directive_state();
   void init_instruction_state();
+  // yasai: marks the current instruction as bf16x2 (the type itself is stored as f16x2); no
+  // effect outside an instruction (a .reg .bf16x2 declaration).
+  void note_bf16x2();
   void start_function(int entry_point);
   void add_function_name(const char *fname);
   void add_directive();
