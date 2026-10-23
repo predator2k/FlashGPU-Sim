@@ -514,6 +514,20 @@ void gpgpu_context::gpgpu_ptx_info_load_from_filename(const char *filename,
       buff, sizeof(buff),
       "%s${PTXAS_CUDA_INSTALL_PATH:-$CUDA_INSTALL_PATH}/bin/ptxas %s -v %s --output-file  /dev/null 2> %s",
       ptxas_clean_env_prefix(), extra_flags, filename, ptxas_filename.c_str());
+  // yasai: YASAI_PTXINFO_CACHE=<dir> keeps the ptxas -v output per (PTX content, flags), so a
+  // process that loads the same PTX again (every rank of a job) skips ptxas, which takes most of
+  // the load time of a large module (FlashAttention-2: 42 s of 44 s).
+  const char *cache_dir = getenv("YASAI_PTXINFO_CACHE");
+  if (cache_dir != NULL && cache_dir[0] != 0) {
+    char cmd[8192];
+    snprintf(cmd, sizeof(cmd),
+             "k=$( (cat '%s'; echo '%s') | sha256sum | cut -c1-64); mkdir -p '%s'; "
+             "if [ -f '%s'/$k.ptxas ]; then cp '%s'/$k.ptxas '%s'; else %s && "
+             "cp '%s' '%s'/$k.ptxas.$$ && mv '%s'/$k.ptxas.$$ '%s'/$k.ptxas; fi",
+             filename, extra_flags, cache_dir, cache_dir, cache_dir, ptxas_filename.c_str(), buff,
+             ptxas_filename.c_str(), cache_dir, cache_dir, cache_dir);
+    snprintf(buff, sizeof(buff), "%s", cmd);
+  }
   int result = system(buff);
   if (result != 0) {
     if (!copy_ptxinfo_sidecar(filename, ptxas_filename)) {

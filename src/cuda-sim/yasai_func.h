@@ -16,6 +16,7 @@
 //                        yasai trace entry format (.yste).
 //   YASAI_TRACE_MAX_MB=n stop writing a kernel's trace after n MiB and mark it truncated.
 //   YASAI_MBAR_DEBUG=1   print every operation of the functional mbarrier model below.
+//   YASAI_TRACE_SRC=1    also write k<seq>.pcs.txt: executed PCs, counts and PTX source.
 //
 // Raw warp trace (.ywr), little-endian, one record per executed warp instruction:
 //   magic "YWR1"
@@ -107,6 +108,10 @@ struct WarpRecord {
 
 // Returns true when a trace is being written for the current kernel.
 bool tracing();
+
+// With YASAI_TRACE_SRC=1, records the PTX source line of pc; kernel_end writes the executed PCs
+// with their execution counts and source to k<seq>.pcs.txt next to the trace.
+void note_pc_source(uint32_t pc, unsigned line, const char *text);
 
 // Appends rec to the current kernel's trace (no-op unless tracing()).
 void emit(const WarpRecord &rec);

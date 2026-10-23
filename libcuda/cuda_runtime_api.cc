@@ -2597,6 +2597,10 @@ CUresult CUDAAPI cuLaunchKernelInternal(
   cudaConfigureCallInternal(dim3(gridDimX, gridDimY, gridDimZ),
                             dim3(blockDimX, blockDimY, blockDimZ),
                             sharedMemBytes, (cudaStream_t)hStream, ctx);
+  // yasai: copies of the parameters taken from an extra buffer. kernel_config::set_arg keeps
+  // only the pointer, and the parameters are read during cudaLaunchInternal, so the copies must
+  // live until the launch returns (they were loop locals, and the kernel then read freed memory).
+  std::vector<std::vector<unsigned char>> extra_args;
   if (extra != NULL) {
     // yasai: arguments packed in one buffer (CU_LAUNCH_PARAM_BUFFER_POINTER/SIZE), as NCCL
     // passes them. Each parameter is taken from its offset in the buffer; bytes past the end of
@@ -2608,9 +2612,11 @@ CUresult CUDAAPI cuLaunchKernelInternal(
       else if (extra[k] == CU_LAUNCH_PARAM_BUFFER_SIZE) buf_size = *(size_t *)extra[k + 1];
     }
     if (buf == NULL) return CUDA_ERROR_INVALID_VALUE;
+    extra_args.reserve(entry->num_args());
     for (unsigned i = 0; i < entry->num_args(); i++) {
       std::pair<size_t, unsigned> p = entry->get_param_config(i);
-      std::vector<unsigned char> arg(p.first, 0);
+      extra_args.emplace_back(p.first, 0);
+      std::vector<unsigned char> &arg = extra_args.back();
       if (p.second < buf_size) {
         size_t n = std::min(p.first, buf_size - p.second);
         memcpy(arg.data(), buf + p.second, n);

@@ -3732,6 +3732,7 @@ void functionalCoreSim::yasai_emit_warp(const warp_inst_t &inst, unsigned w) {
   const ptx_instruction *pI = m_gpu->gpgpu_ctx->pc_to_instruction(inst.pc);
   const int opc = pI->get_opcode();
   rec.ptx_opcode = uint16_t(opc);
+  yasai_func::note_pc_source(inst.pc, pI->source_line(), pI->get_source());
   const int space = (inst.is_load() || inst.is_store() || inst.isatomic() ||
                      opc == CP_ASYNC_OP)
                         ? int(inst.space.get_type())

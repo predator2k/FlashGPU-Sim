@@ -47,6 +47,9 @@ struct TraceState {
 TraceState g_trace;
 // Sequence number of the kernel launches of this process (names the trace files).
 uint64_t g_kernel_seq = 0;
+// Executed PCs of the current kernel with their count, PTX line and source (YASAI_TRACE_SRC).
+std::map<uint32_t, std::pair<uint64_t, std::string>> g_pc_src;
+
 // Kernel name and extents for the sidecar.
 std::string g_name;
 Dim3 g_grid, g_block;
@@ -132,6 +135,28 @@ void kernel_begin(const std::string &name, Dim3 grid, Dim3 block) {
 
 bool tracing() { return g_trace.file != nullptr && !g_trace.truncated; }
 
+namespace {
+
+// Writes the executed PCs recorded by note_pc_source to <trace base>.pcs.txt.
+void dump_pcs() {
+  if (g_pc_src.empty() || g_trace.base.empty()) return;
+  FILE *pcs = std::fopen((g_trace.base + ".pcs.txt").c_str(), "w");
+  if (!pcs) return;
+  for (const auto &kv : g_pc_src)
+    std::fprintf(pcs, "0x%x\t%llu\t%s\n", kv.first, (unsigned long long)kv.second.first,
+                 kv.second.second.c_str());
+  std::fclose(pcs);
+}
+
+}  // namespace
+
+void note_pc_source(uint32_t pc, unsigned line, const char *text) {
+  static const bool on = env_flag("YASAI_TRACE_SRC");
+  if (!on) return;
+  auto &e = g_pc_src[pc];
+  if (e.first++ == 0) e.second = std::to_string(line) + "\t" + (text ? text : "");
+}
+
 void emit(const WarpRecord &rec) {
   if (!tracing()) return;
   // Coalesce the active lanes of a global access into 128 B lines with 32 B sector masks.
@@ -182,7 +207,9 @@ void emit(const WarpRecord &rec) {
   if (g_trace.buf.size() >= (1u << 22)) flush_trace();
   if (config().trace_max_bytes && g_trace.bytes + g_trace.buf.size() >= config().trace_max_bytes) {
     flush_trace();
+    std::fflush(g_trace.file);
     g_trace.truncated = true;
+    dump_pcs();  // a kernel that never ends still leaves its executed PCs
   }
 }
 
@@ -286,7 +313,9 @@ void kernel_end(const std::string &name, Dim3 g, Dim3 b) {
       std::fclose(meta);
     }
     g_trace.file = nullptr;
+    dump_pcs();
   }
+  g_pc_src.clear();
   if (!config().stats) return;
   const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                                     g_counters.start)
