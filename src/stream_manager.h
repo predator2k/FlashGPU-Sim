@@ -233,6 +233,8 @@ struct CUstream_st {
   stream_operation &front() { return m_operations.front(); }
   void print(FILE *fp);
   unsigned get_uid() const { return m_uid; }
+  // yasai: a forked child inherits the lock in whatever state the parent's threads left it.
+  void reset_lock_after_fork() { pthread_mutex_init(&m_lock, NULL); }
 
  private:
   unsigned m_uid;
@@ -262,6 +264,12 @@ class stream_manager {
   bool operation(bool *sim);
   void stop_all_running_kernels();
   unsigned size() { return m_streams.size(); };
+  // yasai: reinitializes the manager's and every stream's lock in a forked child.
+  void reset_locks_after_fork() {
+    pthread_mutex_init(&m_lock, NULL);
+    m_stream_zero.reset_lock_after_fork();
+    for (CUstream_st *s : m_streams) s->reset_lock_after_fork();
+  }
   bool is_blocking() { return m_cuda_launch_blocking; };
 
  private:

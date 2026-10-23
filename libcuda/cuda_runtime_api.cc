@@ -122,6 +122,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <vector>
+#include <memory>
 #ifdef OPENGL_SUPPORT
 #define GL_GLEXT_PROTOTYPES
 #ifdef __APPLE__
@@ -1646,10 +1647,31 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyAsyncInternal(
     announce_call(__my_func__);
   }
   struct CUstream_st *s = (struct CUstream_st *)stream;
+  // yasai: a host source that is not pinned (not a registered host window) is pageable
+  // memory. CUDA copies pageable data before cudaMemcpyAsync returns, so the caller may reuse
+  // the buffer at once (NCCL passes stack variables), while the stream operation here reads the
+  // source only when it executes. The data are therefore copied into a snapshot buffer now.
+  // Snapshots are kept until process exit (NCCL's are small; larger copies are rare here).
+  auto snapshot = [&](const void *p) -> const void * {
+    if (host_window::contains((unsigned long long)p, 1)) return p;
+    static std::vector<std::unique_ptr<unsigned char[]>> keep;
+    keep.emplace_back(new unsigned char[count ? count : 1]);
+    memcpy(keep.back().get(), p, count);
+    return keep.back().get();
+  };
+  if (kind == cudaMemcpyDefault) {
+    gpgpu_t *gpu = GPGPUSim_Context(ctx)->get_device()->get_gpgpu();
+    auto is_dev = [&](const void *p) {
+      const unsigned long long a = (unsigned long long)p;
+      return (a >= GLOBAL_HEAP_START && a < gpu->dev_malloc_top()) ||
+             host_window::contains(a, 1);
+    };
+    if (!is_dev(src) && is_dev(dst)) kind = cudaMemcpyHostToDevice;
+  }
   switch (kind) {
     case cudaMemcpyHostToDevice:
       ctx->the_gpgpusim->g_stream_manager->push(
-          stream_operation(src, (size_t)dst, count, s));
+          stream_operation(snapshot(src), (size_t)dst, count, s));
       break;
     case cudaMemcpyDeviceToHost:
       ctx->the_gpgpusim->g_stream_manager->push(

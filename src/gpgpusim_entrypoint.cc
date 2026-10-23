@@ -354,7 +354,29 @@ gpgpu_sim *gpgpu_context::gpgpu_ptx_sim_init_perf() {
   return the_gpgpusim->g_the_gpu;
 }
 
+// yasai: context whose simulation thread is restarted in a forked child (load-then-fork: a
+// parent parses the PTX once and forks one process per rank; fork copies only the calling
+// thread, so without this the child's kernels would wait forever for a simulation thread).
+static gpgpu_context *g_yasai_fork_ctx = NULL;
+
+// yasai: pthread_atfork child handler: fresh locks and a new concurrent simulation thread.
+static void yasai_restart_sim_thread_in_child() {
+  gpgpu_context *ctx = g_yasai_fork_ctx;
+  if (ctx == NULL || ctx->the_gpgpusim == NULL) return;
+  pthread_mutex_init(&(ctx->the_gpgpusim->g_sim_lock), NULL);
+  if (ctx->the_gpgpusim->g_stream_manager)
+    ctx->the_gpgpusim->g_stream_manager->reset_locks_after_fork();
+  ctx->the_gpgpusim->g_sim_active = false;
+  ctx->the_gpgpusim->g_sim_done = false;
+  pthread_create(&(ctx->the_gpgpusim->g_simulation_thread), NULL,
+                 gpgpu_sim_thread_concurrent, (void *)ctx);
+}
+
 void gpgpu_context::start_sim_thread(int api) {
+  if (api == 1 && g_yasai_fork_ctx == NULL) {
+    g_yasai_fork_ctx = this;
+    pthread_atfork(NULL, NULL, yasai_restart_sim_thread_in_child);
+  }
   if (the_gpgpusim->g_sim_done) {
     the_gpgpusim->g_sim_done = false;
     if (the_gpgpusim->g_the_gpu_config->is_SST_mode()) {
