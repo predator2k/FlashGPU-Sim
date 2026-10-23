@@ -8571,9 +8571,24 @@ extern "C" __host__ cudaError_t CUDARTAPI cudaStreamGetCaptureInfo(
   return g_last_cudaError = cudaSuccess;
 }
 
+// yasai: layout of CUlaunchConfig in CUDA 13's cuda.h (CUlaunchConfig_st), which the headers
+// bundled with this simulator do not declare.
+struct yasai_CUlaunchConfig {
+  unsigned int gridDimX;        ///< Grid width in blocks.
+  unsigned int gridDimY;        ///< Grid height in blocks.
+  unsigned int gridDimZ;        ///< Grid depth in blocks.
+  unsigned int blockDimX;       ///< Block x dimension.
+  unsigned int blockDimY;       ///< Block y dimension.
+  unsigned int blockDimZ;       ///< Block z dimension.
+  unsigned int sharedMemBytes;  ///< Dynamic shared memory per block in bytes.
+  CUstream hStream;             ///< Stream.
+  void *attrs;                  ///< Launch attributes (ignored).
+  unsigned int numAttrs;        ///< Number of attributes (ignored).
+};
+
 // yasai: cuLaunchKernelEx without attribute support (cluster, memory-sync domain and other
 // attributes are ignored); grid, block, shared memory and stream come from the config.
-extern "C" CUresult CUDAAPI cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f,
+extern "C" CUresult CUDAAPI cuLaunchKernelEx(const yasai_CUlaunchConfig *config, CUfunction f,
                                              void **kernelParams, void **extra) {
   if (config == NULL) return CUDA_ERROR_INVALID_VALUE;
   return cuLaunchKernelInternal(f, config->gridDimX, config->gridDimY, config->gridDimZ,
