@@ -48,11 +48,9 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #define LINEBUF_SIZE (4*1024)
 #define TC recognizer->col+=strlen(yytext);
-#define CHECK_UNSIGNED \
-	if( yytext[strlen(yytext)-1]=='U' ) { \
-		printf("GPGPU-Sim: ERROR ** U modifier not implemented\n"); \
-		abort(); \
-	}
+/* yasai: the U suffix of an integer literal only marks it unsigned; strtoull/strtoll stop at
+   the suffix and return the right value, so nothing else is needed. */
+#define CHECK_UNSIGNED
 #define YY_DECL int ptx_lex \
 	       (YYSTYPE * yylval_param , yyscan_t yyscanner, ptx_recognizer* recognizer)
 int ptx_error( yyscan_t yyscanner, ptx_recognizer* recognizer, const char *s );
