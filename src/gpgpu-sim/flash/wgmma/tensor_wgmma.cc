@@ -429,15 +429,18 @@ unsigned wgmma_gmma_k_major_smem_addr(uint64_t desc, int col, int k,
         wgmma_apply_gmma_swizzle(base, offset, swizzle_mode));
   }
 
-  unsigned contiguous_k = stride == 0
-                              ? default_contiguous_k
-                              : static_cast<unsigned>(stride / element_size);
-  if (contiguous_k == 0)
-    contiguous_k = default_contiguous_k;
-
-  return static_cast<unsigned>(base + (k / contiguous_k) * leading +
-                               col * stride +
-                               (k % contiguous_k) * element_size);
+  // yasai: K-major without swizzling (the interleaved canonical layout of the
+  // PTX ISA): 8x16 B core matrices of 8 rows x (16 / element_size) elements,
+  // stored row by row; the core matrices of one 8-row group follow one another
+  // along K at the leading byte offset, and the 8-row groups along M/N are the
+  // stride byte offset apart. The old formula treated every row as stride bytes
+  // long, so FlashMLA's sparse FP8 decode (K tile in Layout_INTER) computed
+  // wrong Q.K scores.
+  (void)default_contiguous_k;
+  const unsigned elements_per_16b = 16 / element_size;
+  return static_cast<unsigned>(base + (col / 8) * stride + (col % 8) * 16 +
+                               (k / elements_per_16b) * leading +
+                               (k % elements_per_16b) * element_size);
 }
 
 unsigned wgmma_gmma_mn_major_smem_addr(uint64_t desc, int row, int k,

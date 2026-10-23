@@ -109,6 +109,12 @@ class ptx_recognizer;
 %token  BF16_TYPE
 %token  TF32_TYPE
 %token  E4M3_TYPE
+%token  E4M3X2_TYPE
+%token  E5M2X2_TYPE
+%token  E2M1X2_TYPE
+%token  E2M3X2_TYPE
+%token  E3M2X2_TYPE
+%token  UE8M0X2_TYPE
 %token  E5M2_TYPE
 %token  F32_TYPE
 %token  F32X2_TYPE
@@ -227,7 +233,7 @@ class ptx_recognizer;
 %token  ALL_OPTION
 %token  BALLOT_OPTION
 %token  GLOBAL_OPTION
-%token  CTA_OPTION
+%token <int_value> CTA_OPTION
 %token  SYS_OPTION
 %token  EXIT_OPTION
 %token  ABS_OPTION
@@ -290,7 +296,7 @@ class ptx_recognizer;
 %token	TENSORMAP_OPTION;
 %token	READ_OPTION;
 %token	BULK_GROUP_OPTION;
-%token	CLUSTER_OPTION;
+%token <int_value> CLUSTER_OPTION
 %token	INVAL_OPTION;
 %token	MBARRIER_INIT_OPTION;
 %token	M8N8_OPTION;
@@ -373,9 +379,9 @@ block_spec: MAXNTID_DIRECTIVE INT_OPERAND COMMA INT_OPERAND COMMA INT_OPERAND {r
 										recognizer->maxnt_id($2, $4, 1);}
 	| MINNCTAPERSM_DIRECTIVE INT_OPERAND { recognizer->func_header_info_int(".minnctapersm", $2); printf("GPGPU-Sim PTX: Warning: .minnctapersm ignored. \n"); }
 	| MAXCLUSTERRANK_DIRECTIVE INT_OPERAND { /* yasai: cluster launch hint, ignored */ }
-	| REQNCTAPERCLUSTER_DIRECTIVE INT_OPERAND { /* yasai */ }
-	| REQNCTAPERCLUSTER_DIRECTIVE INT_OPERAND COMMA INT_OPERAND { /* yasai */ }
-	| REQNCTAPERCLUSTER_DIRECTIVE INT_OPERAND COMMA INT_OPERAND COMMA INT_OPERAND { /* yasai */ }
+	| REQNCTAPERCLUSTER_DIRECTIVE INT_OPERAND { /* yasai: compile-time cluster shape */ recognizer->req_ncta_per_cluster($2, 1, 1); }
+	| REQNCTAPERCLUSTER_DIRECTIVE INT_OPERAND COMMA INT_OPERAND { /* yasai */ recognizer->req_ncta_per_cluster($2, $4, 1); }
+	| REQNCTAPERCLUSTER_DIRECTIVE INT_OPERAND COMMA INT_OPERAND COMMA INT_OPERAND { /* yasai */ recognizer->req_ncta_per_cluster($2, $4, $6); }
 	| EXPLICITCLUSTER_DIRECTIVE { /* yasai */ }
 	| MAXNCTAPERSM_DIRECTIVE INT_OPERAND { recognizer->func_header_info_int(".maxnctapersm", $2); printf("GPGPU-Sim PTX: Warning: .maxnctapersm ignored. \n"); }
 	| REQNTID_DIRECTIVE INT_OPERAND { recognizer->func_header_info_int(".reqntid", $2); printf("GPGPU-Sim PTX: Warning: .reqntid ignored. \n"); }
@@ -558,6 +564,12 @@ scalar_type: S8_TYPE { recognizer->add_scalar_type_spec( S8_TYPE ); }
 	| BF16_TYPE  { recognizer->add_scalar_type_spec( BF16_TYPE ); }
 	| TF32_TYPE  { recognizer->add_scalar_type_spec( TF32_TYPE ); }
 	| E4M3_TYPE  { recognizer->add_scalar_type_spec( E4M3_TYPE ); }
+	| E4M3X2_TYPE { recognizer->add_scalar_type_spec( B16_TYPE ); recognizer->note_packed_minifloat(E4M3X2_TYPE); }
+	| E5M2X2_TYPE { recognizer->add_scalar_type_spec( B16_TYPE ); recognizer->note_packed_minifloat(E5M2X2_TYPE); }
+	| E2M3X2_TYPE { recognizer->add_scalar_type_spec( B16_TYPE ); recognizer->note_packed_minifloat(E2M3X2_TYPE); }
+	| E3M2X2_TYPE { recognizer->add_scalar_type_spec( B16_TYPE ); recognizer->note_packed_minifloat(E3M2X2_TYPE); }
+	| UE8M0X2_TYPE { recognizer->add_scalar_type_spec( B16_TYPE ); recognizer->note_packed_minifloat(UE8M0X2_TYPE); }
+	| E2M1X2_TYPE { recognizer->add_scalar_type_spec( B8_TYPE ); recognizer->note_packed_minifloat(E2M1X2_TYPE); }
 	| E5M2_TYPE  { recognizer->add_scalar_type_spec( E5M2_TYPE ); }
 	| F32_TYPE   { recognizer->add_scalar_type_spec( F32_TYPE ); }
 	| F32X2_TYPE { recognizer->add_scalar_type_spec( F32X2_TYPE ); }
@@ -675,7 +687,7 @@ option: type_spec
 	| ALL_OPTION { recognizer->add_option(ALL_OPTION); }
 	| BALLOT_OPTION { recognizer->add_option(BALLOT_OPTION); }
 	| GLOBAL_OPTION { recognizer->add_option(GLOBAL_OPTION); }
-	| CTA_OPTION { recognizer->add_option(CTA_OPTION); }
+	| CTA_OPTION { recognizer->add_option(CTA_OPTION); if ($1) recognizer->shared_window_space(); }
 	| SYS_OPTION { recognizer->add_option(SYS_OPTION); }
 	| GEOM_MODIFIER_1D { recognizer->add_option(GEOM_MODIFIER_1D); }
 	| GEOM_MODIFIER_2D { recognizer->add_option(GEOM_MODIFIER_2D); }
@@ -750,7 +762,7 @@ option: type_spec
 	| TENSORMAP_OPTION { recognizer->add_option(TENSORMAP_OPTION); }
 	| READ_OPTION { recognizer->add_option(READ_OPTION); }
 	| BULK_GROUP_OPTION { recognizer->add_option(BULK_GROUP_OPTION); }
-	| CLUSTER_OPTION { recognizer->add_option(CLUSTER_OPTION); }
+	| CLUSTER_OPTION { recognizer->add_option(CLUSTER_OPTION); if ($1) recognizer->shared_window_space(); }
 	| INVAL_OPTION { recognizer->add_option(INVAL_OPTION); }
 	| MBARRIER_INIT_OPTION { recognizer->add_option(MBARRIER_INIT_OPTION); }
 	| M8N8_OPTION { recognizer->add_option(M8N8_OPTION); }

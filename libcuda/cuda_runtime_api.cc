@@ -123,6 +123,7 @@
 #include <sys/stat.h>
 #include <vector>
 #include <memory>
+#include <unordered_map>
 #ifdef OPENGL_SUPPORT
 #define GL_GLEXT_PROTOTYPES
 #ifdef __APPLE__
@@ -497,6 +498,10 @@ char *get_app_binary_name(std::string abs_path) {
   printf("self exe links to: %s\n", self_exe_path);
   return self_exe_path;
 }
+
+// yasai: cluster shape of the next launch, set from cudaLaunchKernelExC / cuLaunchKernelEx
+// attributes and consumed (reset to 1,1,1) when the launch creates its kernel_info_t.
+static dim3 g_yasai_pending_cluster(1, 1, 1);
 
 static int get_app_cuda_version_internal(std::string app_binary) {
   int app_cuda_version = 0;
@@ -1191,6 +1196,22 @@ cudaError_t cudaLaunchInternal(const char *hostFun,
   kernel_info_t *grid = ctx->api->gpgpu_cuda_ptx_sim_init_grid(
       hostFun, config.get_args(), config.grid_dim(), config.block_dim(),
       context);
+  // yasai: cluster shape from the launch attribute, else from .reqnctapercluster.
+  {
+    dim3 cd = g_yasai_pending_cluster;
+    g_yasai_pending_cluster = dim3(1, 1, 1);
+    const function_info *e = grid->entry();
+    if (cd.x * cd.y * cd.z <= 1 && e->req_cluster_dim(0) > 0)
+      cd = dim3(e->req_cluster_dim(0), e->req_cluster_dim(1) ? e->req_cluster_dim(1) : 1,
+                e->req_cluster_dim(2) ? e->req_cluster_dim(2) : 1);
+    if (cd.x == 0) cd.x = 1;
+    if (cd.y == 0) cd.y = 1;
+    if (cd.z == 0) cd.z = 1;
+    grid->set_cluster_dim(cd);
+    if (cd.x * cd.y * cd.z > 1)
+      printf("GPGPU-Sim PTX: cluster shape (%u,%u,%u) for '%s'\n", cd.x, cd.y, cd.z,
+             grid->name().c_str());
+  }
 
   // Handle dynamic shared memory for extern shared symbols and record the
   // per-launch dynamic shared memory size on the kernel grid object
@@ -4258,6 +4279,91 @@ void cuda_runtime_api::cuobjdumpInit() {
 }
 
 //! Either submit PTX for simulation or convert SASS to PTXPlus and submit it
+
+// ---- yasai: lazy PTX loading ---------------------------------------------------------------
+// A fat binary with many PTX files (libtorch_cuda.so: 418 files, 1.3 GB) used to be parsed in
+// full at registration; the parsed form took about 100 bytes per byte of PTX, so a PyTorch
+// process passed 58 GB before reaching its first kernel. With lazy loading (YASAI_LAZY_PTX,
+// default 1, for fat binaries with more than one selected file) registration only indexes the
+// .entry and file-scope .global/.const names of each file; a file is parsed, assembled and its
+// ptxas information loaded when one of its kernels is first launched or one of its variables
+// is first accessed. PTX files of non-relocatable code are self-contained, so one file holds
+// everything its kernels use.
+namespace {
+// Index of the lazily loaded PTX files of one fat binary.
+struct yasai_lazy_ptx_t {
+  unsigned handle = 0;                          // fat binary handle the files belong to
+  std::vector<std::string> files;               // PTX file paths
+  std::vector<std::string> archs;               // "sm_XX" of each file (ptxas target)
+  std::vector<bool> loaded;                     // file parsed already
+  std::unordered_map<std::string, int> owner;   // kernel or variable name -> file index
+};
+std::vector<yasai_lazy_ptx_t> g_yasai_lazy;     // every lazily registered fat binary
+
+// True when lazy loading is enabled (YASAI_LAZY_PTX unset or nonzero).
+bool yasai_lazy_enabled() {
+  const char *e = getenv("YASAI_LAZY_PTX");
+  return e == NULL || atoi(e) != 0;
+}
+
+// Name declared by a file-scope PTX line (".entry", ".global" or ".const" definition), or "".
+std::string yasai_ptx_decl_name(const std::string &line) {
+  size_t p = 0;
+  auto word = [&](const char *w) {
+    const size_t n = strlen(w);
+    if (line.compare(p, n, w) == 0 && (p + n >= line.size() || isspace((unsigned char)line[p + n]))) {
+      p += n;
+      while (p < line.size() && isspace((unsigned char)line[p])) ++p;
+      return true;
+    }
+    return false;
+  };
+  if (line.empty() || line[0] != '.') return "";
+  if (word(".extern")) return "";
+  word(".visible") || word(".weak");
+  const bool entry = word(".entry");
+  if (!entry && !(word(".global") || word(".const"))) return "";
+  if (entry) {
+    size_t e = p;
+    while (e < line.size() && (isalnum((unsigned char)line[e]) || line[e] == '_' || line[e] == '$')) ++e;
+    return line.substr(p, e - p);
+  }
+  // variable: the last identifier before '[', '=' or ';'
+  size_t end = line.find_first_of("[=;", p);
+  if (end == std::string::npos) end = line.size();
+  size_t e = end;
+  while (e > p && isspace((unsigned char)line[e - 1])) --e;
+  size_t b = e;
+  while (b > p && (isalnum((unsigned char)line[b - 1]) || line[b - 1] == '_' || line[b - 1] == '$')) --b;
+  return line.substr(b, e - b);
+}
+
+// Parses file i of L and makes its kernels and variables available.
+void yasai_lazy_load_file(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i) {
+  if (L.loaded[i]) return;
+  L.loaded[i] = true;
+  CUctx_st *context = GPGPUSim_Context(ctx);
+  printf("GPGPU-Sim PTX: lazily parsing %s\n", L.files[i].c_str());
+  symbol_table *symtab = ctx->gpgpu_ptx_sim_load_ptx_from_filename(L.files[i].c_str());
+  context->add_binary(symtab, L.handle);
+  ctx->api->load_static_globals(symtab, STATIC_ALLOC_LIMIT, context->get_device()->get_gpgpu());
+  ctx->api->load_constants(symtab, STATIC_ALLOC_LIMIT, context->get_device()->get_gpgpu());
+  ctx->gpgpu_ptx_info_load_from_filename(L.files[i].c_str(), L.archs[i].c_str());
+}
+
+// yasai_func::g_lazy_load_name: loads the file that defines name.
+bool yasai_lazy_load_name(const char *name) {
+  for (yasai_lazy_ptx_t &L : g_yasai_lazy) {
+    auto it = L.owner.find(name);
+    if (it != L.owner.end() && !L.loaded[it->second]) {
+      yasai_lazy_load_file(GPGPU_Context(), L, it->second);
+      return true;
+    }
+  }
+  return false;
+}
+}  // namespace
+
 void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
   CUctx_st *context = GPGPUSim_Context(this);
   if (api->fatbin_registered[handle]) return;
@@ -4373,6 +4479,36 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
                    "PTX load: selected_files[%zu]=%s\n", i,
                    selected_files[i].c_str());
     }
+  }
+
+  // yasai: lazy loading (see yasai_lazy_ptx_t): index the files and parse none of them now.
+  if (!use_selected_ptx_override && selected_files.size() > 1 && yasai_lazy_enabled()) {
+    yasai_lazy_ptx_t L;
+    L.handle = handle;
+    for (auto &f : selected_files) {
+      const int idx = int(L.files.size());
+      L.files.push_back(f);
+      std::string arch = "";
+      size_t sm_pos = f.find("sm_");
+      if (sm_pos != std::string::npos) arch = f.substr(sm_pos, f.find('.', sm_pos) - sm_pos);
+      L.archs.push_back(arch);
+      L.loaded.push_back(false);
+      std::ifstream in(f);
+      std::string line;
+      while (std::getline(in, line)) {
+        const std::string n = yasai_ptx_decl_name(line);
+        if (!n.empty()) L.owner.emplace(n, idx);
+      }
+    }
+    printf("GPGPU-Sim PTX: lazy PTX loading: %zu files, %zu kernels and variables indexed\n",
+           L.files.size(), L.owner.size());
+    g_yasai_lazy.push_back(std::move(L));
+    yasai_func::g_lazy_load_name = yasai_lazy_load_name;
+    symtab = gpgpu_ptx_sim_load_ptx_from_string(
+        ".version 8.0\n.target sm_90\n.address_size 64\n", 900000 + handle);
+    api->name_symtab[fname] = symtab;
+    context->add_binary(symtab, handle);
+    return;
   }
 
   for (auto &ptx_filename : selected_files) {
@@ -8733,6 +8869,12 @@ __host__ cudaError_t CUDARTAPI cudaLaunchKernelExC(
   if (config == NULL || func == NULL) {
     return g_last_cudaError = cudaErrorInvalidValue;
   }
+  // yasai: the cluster shape attribute applies to this launch (see g_yasai_pending_cluster).
+  for (unsigned i = 0; i < config->numAttrs; ++i)
+    if (config->attrs[i].id == cudaLaunchAttributeClusterDimension)
+      g_yasai_pending_cluster = dim3(config->attrs[i].val.clusterDim.x,
+                                     config->attrs[i].val.clusterDim.y,
+                                     config->attrs[i].val.clusterDim.z);
 
   cudaConfigureCallInternal(config->gridDim, config->blockDim,
                             config->dynamicSmemBytes, config->stream);
@@ -8806,15 +8948,28 @@ struct yasai_CUlaunchConfig {
   unsigned int blockDimZ;       ///< Block z dimension.
   unsigned int sharedMemBytes;  ///< Dynamic shared memory per block in bytes.
   CUstream hStream;             ///< Stream.
-  void *attrs;                  ///< Launch attributes (ignored).
-  unsigned int numAttrs;        ///< Number of attributes (ignored).
+  void *attrs;                  ///< Launch attributes (yasai_CUlaunchAttribute array).
+  unsigned int numAttrs;        ///< Number of attributes.
 };
 
-// yasai: cuLaunchKernelEx without attribute support (cluster, memory-sync domain and other
-// attributes are ignored); grid, block, shared memory and stream come from the config.
+// yasai: layout of CUlaunchAttribute (id, padding to 8 bytes, 64-byte value union).
+struct yasai_CUlaunchAttribute {
+  int id;              ///< CUlaunchAttributeID; 4 is CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION.
+  char pad[4];         ///< Padding of the id to 8 bytes.
+  unsigned value[16];  ///< Value union; the cluster shape is value[0..2].
+};
+
+// yasai: cuLaunchKernelEx; the cluster shape attribute is honored, the other attributes
+// (memory-sync domain, priority and so on) are ignored; grid, block, shared memory and stream
+// come from the config.
 extern "C" CUresult CUDAAPI cuLaunchKernelEx(const yasai_CUlaunchConfig *config, CUfunction f,
                                              void **kernelParams, void **extra) {
   if (config == NULL) return CUDA_ERROR_INVALID_VALUE;
+  // yasai: the cluster shape attribute applies to this launch.
+  const yasai_CUlaunchAttribute *attrs = (const yasai_CUlaunchAttribute *)config->attrs;
+  for (unsigned i = 0; attrs != NULL && i < config->numAttrs; ++i)
+    if (attrs[i].id == 4)
+      g_yasai_pending_cluster = dim3(attrs[i].value[0], attrs[i].value[1], attrs[i].value[2]);
   return cuLaunchKernelInternal(f, config->gridDimX, config->gridDimY, config->gridDimZ,
                                 config->blockDimX, config->blockDimY, config->blockDimZ,
                                 config->sharedMemBytes, config->hStream, kernelParams, extra);

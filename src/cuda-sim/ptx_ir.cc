@@ -1525,7 +1525,8 @@ ptx_instruction::ptx_instruction(
       case WAIT_GROUP_OPTION:
       case LAUNCH_DEPENDENTS_OPTION:
       case WAIT_OPTION: {
-        // Do nothing for now... need to be implemented later.
+        // yasai: barrier.cluster.wait
+        if (last_ptx_inst_option == WAIT_OPTION && opcode == BAR_OP) m_barrier_op = WAIT_OPTION;
         break;
       }
       case EQU_OPTION:
@@ -1557,6 +1558,14 @@ ptx_instruction::ptx_instruction(
         break;
       case BF16X2_TYPE:  // yasai: marker from ptx_recognizer::note_bf16x2
         m_bf16x2 = true;
+        break;
+      case E4M3X2_TYPE:  // yasai: markers from ptx_recognizer::note_packed_minifloat
+      case E5M2X2_TYPE:
+      case E2M1X2_TYPE:
+      case E2M3X2_TYPE:
+      case E3M2X2_TYPE:
+      case UE8M0X2_TYPE:
+        m_yasai_packed_kind = last_ptx_inst_option;
         break;
       case NOFTZ_OPTION:  // yasai: no denormal flushing is modeled anyway
         break;
@@ -1734,7 +1743,12 @@ ptx_instruction::ptx_instruction(
       case TENSORMAP_OPTION:
       case READ_OPTION:
       case BULK_GROUP_OPTION:
+        break;
       case CLUSTER_OPTION:
+        // yasai: see has_cluster_scope(); its own case, so the options listed above it do not
+        // fall into it (barrier.sync.aligned was taken for barrier.cluster).
+        m_yasai_cluster_scope = true;
+        break;
       case M8N8_OPTION:
       case MBARRIER_INIT_OPTION:
       case TRANS_OPTION:

@@ -62,6 +62,11 @@ enum special_regs {
   WARPID_REG,
   CLUSTER_CTAID_REG,
   CLUSTER_CTA_RANK_REG,
+  CLUSTER_NCTAID_REG,        // yasai: %cluster_nctaid
+  CLUSTER_NCTA_RANK_REG,     // yasai: %cluster_nctarank
+  CLUSTERID_REG,             // yasai: %clusterid
+  NCLUSTERID_REG,            // yasai: %nclusterid
+  IS_EXPLICIT_CLUSTER_REG,   // yasai: %is_explicit_cluster
   WARPSZ_REG
 };
 enum wmma_type {

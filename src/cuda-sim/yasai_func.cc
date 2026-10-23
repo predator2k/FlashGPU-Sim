@@ -3,6 +3,7 @@
 #include "yasai_func.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -432,7 +433,135 @@ void mbar_try_advance(MbarState &m) {
 
 }  // namespace
 
+namespace {
+ClusterState *g_cluster = nullptr;  // see cluster()
+}  // namespace
+
+ClusterState *cluster() { return g_cluster; }
+
+bool (*g_lazy_load_name)(const char *name) = nullptr;
+
+namespace {
+unsigned g_current_rank = 0;  // see current_rank()
+}  // namespace
+
+unsigned current_rank() { return g_current_rank; }
+
+void set_current_rank(unsigned rank) { g_current_rank = rank; }
+
+namespace {
+// Exponent bits, mantissa bits, bias and largest finite value of a format.
+struct MiniFloatSpec {
+  int ebits, mbits, bias;
+  float maxv;
+  bool has_sign;
+};
+MiniFloatSpec spec(MiniFloat f) {
+  switch (f) {
+    case kE4M3: return {4, 3, 7, 448.0f, true};
+    case kE5M2: return {5, 2, 15, 57344.0f, true};
+    case kE2M1: return {2, 1, 1, 6.0f, true};
+    case kE2M3: return {2, 3, 1, 7.5f, true};
+    case kE3M2: return {3, 2, 3, 28.0f, true};
+    default: return {8, 0, 127, 0.0f, false};
+  }
+}
+}  // namespace
+
+float minifloat_decode(MiniFloat f, unsigned bits) {
+  if (f == kUE8M0) {
+    bits &= 0xFF;
+    if (bits == 0xFF) return std::nanf("");
+    return std::ldexp(1.0f, int(bits) - 127);
+  }
+  const MiniFloatSpec s = spec(f);
+  const unsigned width = 1 + s.ebits + s.mbits;
+  bits &= (1u << width) - 1;
+  const bool neg = (bits >> (width - 1)) & 1u;
+  const unsigned e = (bits >> s.mbits) & ((1u << s.ebits) - 1);
+  const unsigned m = bits & ((1u << s.mbits) - 1);
+  float v;
+  if (f == kE4M3 && e == 15 && m == 7) return std::nanf("");
+  if (f == kE5M2 && e == 31) return m ? std::nanf("") : (neg ? -INFINITY : INFINITY);
+  if (e == 0)
+    v = std::ldexp(float(m), 1 - s.bias - s.mbits);
+  else
+    v = std::ldexp(1.0f + float(m) / float(1u << s.mbits), int(e) - s.bias);
+  return neg ? -v : v;
+}
+
+unsigned minifloat_encode(MiniFloat f, float x, bool satfinite, bool toward_zero, bool round_up) {
+  if (f == kUE8M0) {
+    if (std::isnan(x) || x <= 0.0f) return std::isnan(x) ? 0xFF : 0;
+    int e;
+    const float m = std::frexp(x, &e);  // x = m * 2^e, m in [0.5, 1)
+    int exp2 = e - 1;                    // x = (2m) * 2^(e-1), 2m in [1, 2)
+    if (round_up && m != 0.5f) exp2 += 1;
+    if (!round_up && !toward_zero && 2.0f * m >= 1.5f) exp2 += 1;
+    int code = exp2 + 127;
+    if (code < 0) code = 0;
+    if (code > 254) code = satfinite ? 254 : 0xFF;
+    return unsigned(code);
+  }
+  const MiniFloatSpec s = spec(f);
+  const unsigned width = 1 + s.ebits + s.mbits;
+  const unsigned sign = std::signbit(x) ? 1u << (width - 1) : 0u;
+  if (std::isnan(x)) {
+    if (f == kE4M3) return 0x7F;
+    if (f == kE5M2) return 0x7F;
+    return 0;
+  }
+  float a = std::fabs(x);
+  const int min_exp = 1 - s.bias;  // exponent of the smallest normal
+  // value on the grid: quantum of a's binade
+  int e = a > 0.0f ? int(std::floor(std::log2(a))) : min_exp;
+  if (e < min_exp) e = min_exp;
+  const float q = std::ldexp(1.0f, e - s.mbits);
+  float n = a / q;
+  float r = toward_zero ? std::floor(n) : std::nearbyint(n);  // nearbyint: ties to even
+  float v = r * q;
+  if (v > s.maxv || std::isinf(a)) {
+    if (satfinite || f == kE2M1 || f == kE2M3 || f == kE3M2) v = s.maxv;
+    else if (f == kE5M2) return sign | 0x7C;  // infinity
+    else return sign | 0x7F;                  // e4m3: NaN
+  }
+  if (v == 0.0f) return sign;
+  int ve;
+  std::frexp(v, &ve);
+  ve -= 1;  // v = 1.xxx * 2^ve
+  unsigned code;
+  if (ve < min_exp) {
+    code = unsigned(std::lround(v / std::ldexp(1.0f, min_exp - s.mbits)));
+  } else {
+    const unsigned E = unsigned(ve + s.bias);
+    const unsigned M = unsigned(std::lround((v / std::ldexp(1.0f, ve) - 1.0f) * float(1u << s.mbits)));
+    code = (E << s.mbits) | M;
+  }
+  return sign | code;
+}
+
+
+void set_cluster(ClusterState *state) { g_cluster = state; }
+
+int cluster_rank_of(uint64_t cta_key) {
+  if (g_cluster == nullptr) return -1;
+  for (unsigned r = 0; r < g_cluster->cta_key.size(); ++r)
+    if (g_cluster->cta_key[r] == cta_key) return int(r);
+  return -1;
+}
+
+void mbar_canonical(uint64_t &cta_key, uint32_t &addr) {
+  unsigned rank;
+  uint64_t off;
+  if (!dsmem_decode(addr, rank, off)) return;
+  if (g_cluster != nullptr && rank < g_cluster->cta_key.size()) {
+    cta_key = g_cluster->cta_key[rank];
+  }
+  addr = uint32_t(off);
+}
+
 void mbar_init(uint64_t cta_key, uint32_t addr, uint32_t count) {
+  mbar_canonical(cta_key, addr);
   MbarState &m = g_mbars[{cta_key, addr}];
   m = MbarState();
   m.expected = count;
@@ -441,6 +570,7 @@ void mbar_init(uint64_t cta_key, uint32_t addr, uint32_t count) {
 }
 
 void mbar_arrive(uint64_t cta_key, uint32_t addr, uint32_t count) {
+  mbar_canonical(cta_key, addr);
   auto it = g_mbars.find({cta_key, addr});
   if (it == g_mbars.end()) {
     mbar_log("arrive", cta_key, addr, count, nullptr);
@@ -452,6 +582,7 @@ void mbar_arrive(uint64_t cta_key, uint32_t addr, uint32_t count) {
 }
 
 void mbar_expect_tx(uint64_t cta_key, uint32_t addr, int64_t bytes) {
+  mbar_canonical(cta_key, addr);
   auto it = g_mbars.find({cta_key, addr});
   if (it == g_mbars.end()) {
     mbar_log("expect_tx", cta_key, addr, bytes, nullptr);
@@ -462,6 +593,7 @@ void mbar_expect_tx(uint64_t cta_key, uint32_t addr, int64_t bytes) {
 }
 
 void mbar_complete_tx(uint64_t cta_key, uint32_t addr, int64_t bytes) {
+  mbar_canonical(cta_key, addr);
   auto it = g_mbars.find({cta_key, addr});
   if (it == g_mbars.end()) {
     mbar_log("complete_tx", cta_key, addr, bytes, nullptr);
@@ -473,6 +605,7 @@ void mbar_complete_tx(uint64_t cta_key, uint32_t addr, int64_t bytes) {
 }
 
 bool mbar_phase_done(uint64_t cta_key, uint32_t addr, uint32_t parity) {
+  mbar_canonical(cta_key, addr);
   auto it = g_mbars.find({cta_key, addr});
   if (it == g_mbars.end()) {
     static bool warned = false;
@@ -487,7 +620,7 @@ bool mbar_phase_done(uint64_t cta_key, uint32_t addr, uint32_t parity) {
   return done;
 }
 
-void mbar_inval(uint64_t cta_key, uint32_t addr) { g_mbars.erase({cta_key, addr}); }
+void mbar_inval(uint64_t cta_key, uint32_t addr) { mbar_canonical(cta_key, addr); g_mbars.erase({cta_key, addr}); }
 
 namespace {
 

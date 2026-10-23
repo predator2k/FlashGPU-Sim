@@ -1,6 +1,7 @@
 #ifndef __cuda_api_object_h__
 #define __cuda_api_object_h__
 
+#include "../src/cuda-sim/yasai_func.h"
 #include <functional>
 #include <list>
 #include <map>
@@ -125,8 +126,11 @@ struct CUctx_st {
         auto [new_iter, success] = m_kernel_lookup.emplace(hostFun, f);
         assert(success);
       } else {
-        printf("Warning: cannot find deviceFun %s\n", deviceFun);
+        // yasai: with lazy PTX loading the kernel's file is parsed at its first launch.
+        if (yasai_func::g_lazy_load_name == nullptr)
+          printf("Warning: cannot find deviceFun %s\n", deviceFun);
         m_kernel_lookup[hostFun] = NULL;
+        m_yasai_pending_kernel[hostFun] = deviceFun;
       }
       //		assert( s != NULL );
       //		function_info *f = s->get_pc();
@@ -147,6 +151,20 @@ struct CUctx_st {
       printf("Warning: cannot find hostFun %p\n", hostFun);
       abort();
     }
+    // yasai: a kernel registered before its PTX file was loaded (lazy loading).
+    if (i->second == NULL) {
+      auto p = m_yasai_pending_kernel.find(hostFun);
+      if (p != m_yasai_pending_kernel.end() && yasai_func::g_lazy_load_name != nullptr &&
+          yasai_func::g_lazy_load_name(p->second.c_str())) {
+        symbol *s = NULL;
+        for (size_t k = m_all_code.size(); s == NULL && k > 0; --k)
+          s = m_all_code[k - 1]->lookup(p->second.c_str());
+        if (s != NULL && s->get_pc() != NULL) {
+          i->second = s->get_pc();
+          m_yasai_pending_kernel.erase(p);
+        }
+      }
+    }
     return i->second;
   }
 
@@ -166,6 +184,8 @@ struct CUctx_st {
       m_code;  // fat binary handle => global symbol table
   unsigned m_last_fat_cubin_handle;
   std::vector<symbol_table *> m_all_code;  // yasai: every module table, in load order
+  // yasai: host stub -> device kernel name of kernels whose PTX was not loaded at registration.
+  std::map<const void *, std::string> m_yasai_pending_kernel;
   std::map<const void *, function_info *>
       m_kernel_lookup;  // unique id (CUDA app function address) => kernel entry
                         // point

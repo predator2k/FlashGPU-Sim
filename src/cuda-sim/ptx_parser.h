@@ -122,9 +122,16 @@ class ptx_recognizer {
   // member function list
   void init_directive_state();
   void init_instruction_state();
+  // yasai: .shared::cta / .shared::cluster on ld, st, atom and red name the shared state space
+  // (the lexer returns them as CTA_OPTION / CLUSTER_OPTION, which set no space).
+  void shared_window_space();
+  // yasai: records the function's .reqnctapercluster shape.
+  void req_ncta_per_cluster(int x, int y, int z);
   // yasai: marks the current instruction as bf16x2 (the type itself is stored as f16x2); no
   // effect outside an instruction (a .reg .bf16x2 declaration).
   void note_bf16x2();
+  // yasai: marks the current instruction's packed small-float format (E4M3X2_TYPE and so on).
+  void note_packed_minifloat(int kind);
   void start_function(int entry_point);
   void add_function_name(const char *fname);
   void add_directive();

@@ -354,6 +354,11 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 "%warpid"  TC; yylval->int_value = WARPID_REG; return SPECIAL_REGISTER;
 "%cluster_ctaid" TC; yylval->int_value = CLUSTER_CTAID_REG; return SPECIAL_REGISTER;
 "%cluster_ctarank" TC; yylval->int_value = CLUSTER_CTA_RANK_REG; return SPECIAL_REGISTER;
+"%cluster_nctaid" TC; yylval->int_value = CLUSTER_NCTAID_REG; return SPECIAL_REGISTER; /* yasai */
+"%cluster_nctarank" TC; yylval->int_value = CLUSTER_NCTA_RANK_REG; return SPECIAL_REGISTER; /* yasai */
+"%clusterid" TC; yylval->int_value = CLUSTERID_REG; return SPECIAL_REGISTER; /* yasai */
+"%nclusterid" TC; yylval->int_value = NCLUSTERID_REG; return SPECIAL_REGISTER; /* yasai */
+"%is_explicit_cluster" TC; yylval->int_value = IS_EXPLICIT_CLUSTER_REG; return SPECIAL_REGISTER; /* yasai */
 "WARP_SZ"  TC; yylval->int_value = WARPSZ_REG; return SPECIAL_REGISTER;
 
 [a-zA-Z_][a-zA-Z0-9_$]*  TC; yylval->string_value = strdup(yytext); return IDENTIFIER;
@@ -384,10 +389,14 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.tf32  TC;  return TF32_TYPE;
 \.e4m3  TC;  return E4M3_TYPE;
 \.e5m2  TC;  return E5M2_TYPE;
-	/* yasai: packed fp8 pairs lex as the same-size b16 so NCCL's fp8 helpers parse; their
-	   conversions are only in fp8 reduction code, which f32 runs do not execute. */
-\.e4m3x2  TC;  return B16_TYPE;
-\.e5m2x2  TC;  return B16_TYPE;
+	/* yasai: packed small floats are stored as b16 (b8 for e2m1x2); the instruction records
+	   the format (ptx_instruction::packed_minifloat) for cvt. */
+\.e4m3x2  TC;  return E4M3X2_TYPE;
+\.e5m2x2  TC;  return E5M2X2_TYPE;
+\.e2m1x2  TC;  return E2M1X2_TYPE;
+\.e2m3x2  TC;  return E2M3X2_TYPE;
+\.e3m2x2  TC;  return E3M2X2_TYPE;
+\.ue8m0x2  TC;  return UE8M0X2_TYPE;
 \.f32x2  TC;  return F32X2_TYPE;
 \.f32  TC;  return F32_TYPE;
 \.f64  TC;  return F64_TYPE;
@@ -482,7 +491,7 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.all	TC; return ALL_OPTION;
 \.ballot	TC; return BALLOT_OPTION;
 \.gl    TC; return GLOBAL_OPTION;
-\.cta   TC; return CTA_OPTION;
+\.cta   TC; yylval->int_value = 0; return CTA_OPTION;
 \.sys   TC; return SYS_OPTION;
 
 \.exit   TC; return EXIT_OPTION;
@@ -536,9 +545,9 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.wait TC; return WAIT_OPTION;
 \.parity TC; return PARITY_OPTION;
 \.mbarrier_init TC; return MBARRIER_INIT_OPTION;
-\.shared::cta TC; return CTA_OPTION;
-\.shared::cluster TC; return CLUSTER_OPTION;
-\.cluster TC; return CLUSTER_OPTION;
+\.shared::cta TC; yylval->int_value = 1; return CTA_OPTION; /* yasai: 1 = state space form */
+\.shared::cluster TC; yylval->int_value = 1; return CLUSTER_OPTION; /* yasai: 1 = state space form */
+\.cluster TC; yylval->int_value = 0; return CLUSTER_OPTION;
 \.tensor TC; return TENSOR_OPTION;
 \.1d	TC; return DIM_1D_OPTION;
 \.2d	TC; return DIM_2D_OPTION;

@@ -30,6 +30,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 class ptx_instruction;
 class symbol;
@@ -159,6 +160,84 @@ bool mbar_phase_done(uint64_t cta_key, uint32_t addr, uint32_t parity);
 
 // mbarrier.inval: forget the state.
 void mbar_inval(uint64_t cta_key, uint32_t addr);
+
+// ---- Thread-block clusters in the functional mode ----------------------------------------------
+// A launch with a cluster shape larger than one CTA runs cluster by cluster: all CTAs of a
+// cluster are resident together and their warps are interleaved (cuda-sim.cc), so distributed
+// shared memory, remote mbarriers, cluster barriers and multicast copies see one another.
+//
+// Shared-memory addresses of another CTA of the cluster (the .shared::cluster window) carry the
+// target rank in bits 24 and up: rank r is encoded as (r + 1) << 24 | offset, which is what
+// mapa.shared::cluster returns. A plain address (bits 24 and up zero) is the CTA's own shared
+// memory. Generic addresses of the window are SHARED_GENERIC_START + (smid + r + 1) * 1 MiB +
+// offset (cuda-sim.cc shared_to_generic / generic_to_shared).
+
+// Encoded .shared::cluster address of offset in the CTA of rank rank.
+inline uint64_t dsmem_encode(unsigned rank, uint64_t offset) {
+  return (uint64_t(rank + 1) << 24) | (offset & 0xFFFFFFull);
+}
+
+// True when addr carries a cluster rank; then rank and offset receive it.
+inline bool dsmem_decode(uint64_t addr, unsigned &rank, uint64_t &offset) {
+  const uint64_t k = (addr >> 24) & 0xFFull;
+  if (k == 0) return false;
+  rank = unsigned(k - 1);
+  offset = addr & 0xFFFFFFull;
+  return true;
+}
+
+// Generic addresses follow the hardware layout: while a cluster executes, the generic shared
+// window of rank r is SHARED_GENERIC_START + (r << 24), so code that derives a peer address by
+// flipping bit 24 of a generic address (FlashMLA's get_peer_addr) reaches the peer CTA.
+
+// Rank of the CTA whose warps execute now (set by the cluster executor before each CTA's round).
+unsigned current_rank();
+void set_current_rank(unsigned rank);
+
+// State of the cluster that the functional executor runs; one cluster at a time.
+struct ClusterState {
+  unsigned size = 0;                   // CTAs in the cluster
+  std::vector<void *> smem;            // rank -> the CTA's own shared memory (memory_space *)
+  std::vector<uint64_t> cta_key;       // rank -> the CTA's uid (functional mbarrier key)
+  std::vector<void *> cores;           // rank -> the CTA's functionalCoreSim
+  unsigned threads_total = 0;          // live threads of the cluster (cluster barrier count)
+  unsigned barrier_arrived = 0;        // threads arrived in the current barrier.cluster phase
+  unsigned barrier_phase = 0;          // completed barrier.cluster phases
+};
+
+// The executing cluster, or null when the launch has no cluster (or between clusters).
+ClusterState *cluster();
+
+// Starts (state non-null) or ends (null) the execution of a cluster.
+void set_cluster(ClusterState *state);
+
+// Rank of the CTA whose functional mbarrier key is cta_key in the executing cluster, or -1.
+int cluster_rank_of(uint64_t cta_key);
+
+// Rewrites (cta_key, addr) of an mbarrier in another CTA of the cluster (addr carries a rank)
+// to the owner's key and plain offset; other addresses are left unchanged.
+void mbar_canonical(uint64_t &cta_key, uint32_t &addr);
+
+// ---- Small floating-point formats (FP8, FP6, FP4, E8M0 scales) -------------------------------
+// Formats of the OCP microscaling specification and of PTX: e4m3 (no infinity, NaN 0x7F, max
+// 448), e5m2 (IEEE-like, max 57344), e2m3 and e3m2 (FP6, max 7.5 and 28), e2m1 (FP4, max 6),
+// ue8m0 (unsigned power of two 2^(e-127), NaN 0xFF).
+enum MiniFloat { kE4M3, kE5M2, kE2M1, kE2M3, kE3M2, kUE8M0 };
+
+// Value of the bit pattern bits in format f.
+float minifloat_decode(MiniFloat f, unsigned bits);
+
+// Bit pattern of x in format f. Round to nearest even unless toward_zero (or, for ue8m0,
+// round_up toward +infinity). satfinite clamps out-of-range values to the largest finite value
+// (e5m2 otherwise gives infinity, e4m3 NaN); NaN gives the format's NaN (0 for the FP4/FP6
+// formats, which have none).
+unsigned minifloat_encode(MiniFloat f, float x, bool satfinite, bool toward_zero = false,
+                          bool round_up = false);
+
+// Lazy PTX loading (libcuda/cuda_runtime_api.cc): loads the PTX file that defines the kernel or
+// global variable name and returns true, or returns false when no unloaded file defines it.
+// Null until a fat binary is registered lazily.
+extern bool (*g_lazy_load_name)(const char *name);
 
 // Function handles for function addresses held in data (indirect calls through a table, as in
 // NCCL's ncclDevFuncTable). A handle is kFunctionHandleTag | index; the index is the order in

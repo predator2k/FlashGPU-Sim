@@ -1296,8 +1296,15 @@ class ptx_instruction : public warp_inst_t {
   bool is_hi() const { return m_hi; }
   // yasai: .relu on cvt/fma (negative results become +0, NaN becomes the canonical NaN).
   bool is_relu() const { return m_relu; }
+  // yasai: barrier.cluster.arrive / barrier.cluster.wait (bar_type ARRIVE / SYNC).
+  bool is_cluster_barrier() const { return m_opcode == BAR_OP && m_yasai_cluster_scope; }
+  // yasai: the instruction carries .cluster or .shared::cluster.
+  bool has_cluster_scope() const { return m_yasai_cluster_scope; }
   // yasai: the packed 16-bit type is bf16x2 (get_type() still answers F16X2_TYPE).
   bool is_bf16x2() const { return m_bf16x2; }
+  // yasai: packed small-float format of the instruction (E4M3X2_TYPE, E5M2X2_TYPE, E2M1X2_TYPE,
+  // E2M3X2_TYPE, E3M2X2_TYPE, UE8M0X2_TYPE), or 0.
+  int packed_minifloat() const { return m_yasai_packed_kind; }
   bool is_lo() const { return m_lo; }
   bool is_wide() const { return m_wide; }
   bool is_uni() const { return m_uni; }
@@ -1407,7 +1414,9 @@ class ptx_instruction : public warp_inst_t {
   unsigned m_saturation_mode;
   unsigned m_clamp_mode;
   bool m_relu = false;    // yasai: see is_relu()
+  bool m_yasai_cluster_scope = false;  // yasai: see has_cluster_scope()
   bool m_bf16x2 = false;  // yasai: see is_bf16x2()
+  int m_yasai_packed_kind = 0;  // yasai: see packed_minifloat()
   unsigned m_left_mode;
   unsigned m_barrier_op;
   bool m_parity_op = false;
@@ -1629,6 +1638,14 @@ class function_info {
   }
 
   void set_maxnt_id(unsigned maxthreads) { maxnt_id = maxthreads; }
+  // yasai: cluster shape required by .reqnctapercluster (0,0,0 when the kernel has none).
+  void set_req_cluster_dim(unsigned x, unsigned y, unsigned z) {
+    m_yasai_req_cluster[0] = x;
+    m_yasai_req_cluster[1] = y;
+    m_yasai_req_cluster[2] = z;
+  }
+  // yasai: component i (0..2) of the required cluster shape.
+  unsigned req_cluster_dim(int i) const { return m_yasai_req_cluster[i]; }
   unsigned get_maxnt_id() { return maxnt_id; }
   const symbol *canonicalize_register(const symbol *reg) const {
     if (m_reg_alloc_aliases.empty()) return reg;
@@ -1726,6 +1743,7 @@ class function_info {
   std::vector<basic_block_t *> m_basic_blocks;
   std::list<std::pair<unsigned, unsigned> > m_back_edges;
   std::unordered_map<const symbol *, const symbol *> m_reg_alloc_aliases;
+  unsigned m_yasai_req_cluster[3] = {0, 0, 0};  // yasai: see set_req_cluster_dim
   // Strict compiler-removed register views.  The key is a 32-bit logical
   // register and the value is {source register, 32-bit lane}.  PTX reorder
   // only installs entries after proving a single-definition, same-region

@@ -276,21 +276,21 @@ unsigned ptx_thread_info::get_builtin(int builtin_id, unsigned dim_mod) {
       return m_gridid;
     case LANEID_REG:
       return get_hw_tid() % m_core->get_warp_size();
+    // yasai: lane masks relative to %laneid (they returned 0 with a warning).
     case LANEMASK_EQ_REG:
-      feature_not_implemented("%lanemask_eq");
-      return 0;
     case LANEMASK_LE_REG:
-      feature_not_implemented("%lanemask_le");
-      return 0;
     case LANEMASK_LT_REG:
-      feature_not_implemented("%lanemask_lt");
-      return 0;
     case LANEMASK_GE_REG:
-      feature_not_implemented("%lanemask_ge");
-      return 0;
-    case LANEMASK_GT_REG:
-      feature_not_implemented("%lanemask_gt");
-      return 0;
+    case LANEMASK_GT_REG: {
+      const unsigned lane = get_hw_tid() % m_core->get_warp_size();
+      const unsigned long long eq = 1ull << lane;
+      const int b = builtin_id & 0xFFFF;
+      if (b == LANEMASK_EQ_REG) return unsigned(eq);
+      if (b == LANEMASK_LT_REG) return unsigned(eq - 1);
+      if (b == LANEMASK_LE_REG) return unsigned((eq << 1) - 1);
+      if (b == LANEMASK_GE_REG) return unsigned(~(eq - 1));
+      return unsigned(~((eq << 1) - 1));
+    }
     case NCTAID_REG:
       assert(dim_mod < 3);
       if (dim_mod == 0) return m_nctaid.x;
@@ -320,21 +320,29 @@ unsigned ptx_thread_info::get_builtin(int builtin_id, unsigned dim_mod) {
       if (dim_mod == 2) return m_tid.z;
       abort();
       break;
+    // yasai: cluster registers from the launch's cluster shape (kernel_info_t::get_cluster_dim);
+    // %cluster_ctaid used to return %ctaid and %cluster_ctarank always 0.
     case CLUSTER_CTAID_REG:
+    case CLUSTER_NCTAID_REG:
+    case CLUSTERID_REG:
+    case NCLUSTERID_REG:
+    case CLUSTER_CTA_RANK_REG:
+    case CLUSTER_NCTA_RANK_REG:
+    case IS_EXPLICIT_CLUSTER_REG: {
+      const dim3 cd = get_core()->get_kernel_info()->get_cluster_dim();
+      const unsigned c[3] = {cd.x, cd.y, cd.z};
+      const unsigned id[3] = {m_ctaid.x, m_ctaid.y, m_ctaid.z};
+      const unsigned n[3] = {m_nctaid.x, m_nctaid.y, m_nctaid.z};
+      const int b = builtin_id & 0xFFFF;
+      if (b == CLUSTER_CTA_RANK_REG)
+        return id[0] % c[0] + c[0] * (id[1] % c[1] + c[1] * (id[2] % c[2]));
+      if (b == CLUSTER_NCTA_RANK_REG) return c[0] * c[1] * c[2];
+      if (b == IS_EXPLICIT_CLUSTER_REG) return c[0] * c[1] * c[2] > 1 ? 1 : 0;
       assert(dim_mod < 3);
-      if (dim_mod == 0) return m_ctaid.x;
-      if (dim_mod == 1) return m_ctaid.y;
-      if (dim_mod == 2) return m_ctaid.z;
-      abort();
-      break;
-    case CLUSTER_CTA_RANK_REG: {
-      static bool warned_cluster_ctarank = false;
-      if (!warned_cluster_ctarank) {
-        printf("GPGPU-Sim PTX: Warning - special register %%cluster_ctarank "
-               "is not modeled; returning 0.\n");
-        warned_cluster_ctarank = true;
-      }
-      return 0;
+      if (b == CLUSTER_CTAID_REG) return id[dim_mod] % c[dim_mod];
+      if (b == CLUSTER_NCTAID_REG) return c[dim_mod];
+      if (b == CLUSTERID_REG) return id[dim_mod] / c[dim_mod];
+      return (n[dim_mod] + c[dim_mod] - 1) / c[dim_mod];
     }
     case WARPSZ_REG:
       return m_core->get_warp_size();

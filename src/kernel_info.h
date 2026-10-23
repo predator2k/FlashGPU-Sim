@@ -209,6 +209,33 @@ public:
   // Dynamic shared memory per CTA (specified at launch)
   void set_dynamic_smem(unsigned bytes) { m_dynamic_smem = bytes; }
   unsigned get_dynamic_smem() const { return m_dynamic_smem; }
+  // yasai: thread-block cluster shape of this launch (1,1,1 when the kernel uses no cluster);
+  // set from the launch attribute or the kernel's .reqnctapercluster directive.
+  void set_cluster_dim(dim3 d) { m_yasai_cluster_dim = d; }
+  dim3 get_cluster_dim() const { return m_yasai_cluster_dim; }
+  // yasai: number of CTAs in one cluster.
+  unsigned cluster_size() const {
+    return m_yasai_cluster_dim.x * m_yasai_cluster_dim.y * m_yasai_cluster_dim.z;
+  }
+  // yasai: makes ctaid the next CTA to initialize (the functional cluster executor creates the
+  // CTAs of a cluster in cluster order rather than in linear grid order).
+  void set_next_cta_id(dim3 ctaid) {
+    m_next_cta = ctaid;
+    m_next_tid.x = 0;
+    m_next_tid.y = 0;
+    m_next_tid.z = 0;
+  }
+  // yasai: marks every CTA as issued (after the cluster executor has run them all).
+  void set_all_ctas_issued() {
+    m_next_cta.x = 0;
+    m_next_cta.y = 0;
+    m_next_cta.z = m_grid_dim.z;
+  }
+
+private:
+  dim3 m_yasai_cluster_dim = dim3(1, 1, 1);  // yasai: see set_cluster_dim
+
+public:
 };
 
 #endif // #ifndef KERNEL_INFO_INCLUDED

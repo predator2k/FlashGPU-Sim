@@ -734,6 +734,19 @@ void function_info::ptx_assemble() {
 }
 
 addr_t shared_to_generic(unsigned smid, addr_t addr) {
+  // yasai: a .shared::cluster address of rank r (see yasai_func::dsmem_encode) maps to the
+  // window smid + r + 1.
+  // While a cluster executes, rank r's window is SHARED_GENERIC_START + (r << 24) (the hardware
+  // layout); own addresses use the executing CTA's rank.
+  if (yasai_func::cluster() != nullptr) {
+    unsigned rank;
+    uint64_t off;
+    if (!yasai_func::dsmem_decode(addr, rank, off)) {
+      rank = yasai_func::current_rank();
+      off = addr;
+    }
+    return SHARED_GENERIC_START + (uint64_t(rank) << 24) + off;
+  }
   assert(addr < SHARED_MEM_SIZE_MAX);
   return SHARED_GENERIC_START + smid * SHARED_MEM_SIZE_MAX + addr;
 }
@@ -741,6 +754,9 @@ addr_t shared_to_generic(unsigned smid, addr_t addr) {
 addr_t global_to_generic(addr_t addr) { return addr; }
 
 bool isspace_shared(unsigned smid, addr_t addr) {
+  // yasai: while a cluster executes, the windows of all its ranks are shared memory.
+  if (yasai_func::cluster() != nullptr)
+    return addr >= SHARED_GENERIC_START && addr < SHARED_GENERIC_START + (uint64_t(16) << 24);
   addr_t start = SHARED_GENERIC_START + smid * SHARED_MEM_SIZE_MAX;
   addr_t end = SHARED_GENERIC_START + (smid + 1) * SHARED_MEM_SIZE_MAX;
   if ((addr >= end) || (addr < start)) return false;
@@ -762,9 +778,69 @@ memory_space_t whichspace(addr_t addr) {
 }
 
 addr_t generic_to_shared(unsigned smid, addr_t addr) {
+  // yasai: inverse of shared_to_generic; another rank's window gives a .shared::cluster address.
+  if (yasai_func::cluster() != nullptr) {
+    const addr_t rel = addr - SHARED_GENERIC_START;
+    const unsigned rank = unsigned(rel >> 24);
+    const addr_t off = rel & 0xFFFFFF;
+    if (rank == yasai_func::current_rank()) return off;
+    return yasai_func::dsmem_encode(rank, off);
+  }
+  const addr_t base = SHARED_GENERIC_START + smid * SHARED_MEM_SIZE_MAX;
   assert(isspace_shared(smid, addr));
-  return addr - (SHARED_GENERIC_START + smid * SHARED_MEM_SIZE_MAX);
+  return addr - base;
 }
+
+// yasai: shared memory of one CTA of an executing cluster. Plain addresses go to the CTA's own
+// shared memory; addresses with a cluster rank (yasai_func::dsmem_encode) go to the shared
+// memory of that rank, so every access path (ld/st/atom, TMA, cp.async, wgmma operands) reaches
+// distributed shared memory without change.
+class yasai_cluster_smem_view : public memory_space {
+ public:
+  // View of the CTA of rank rank in state.
+  yasai_cluster_smem_view(yasai_func::ClusterState *state, unsigned rank)
+      : m_state(state), m_rank(rank) {}
+  // Writes length bytes at addr (own or remote shared memory).
+  void write(mem_addr_t addr, size_t length, const void *data, ptx_thread_info *thd,
+             const ptx_instruction *pI) override {
+    uint64_t off;
+    target(addr, off)->write(off, length, data, thd, pI);
+  }
+  // Block-level write, forwarded to the own shared memory.
+  void write_only(mem_addr_t index, mem_addr_t offset, size_t length,
+                  const void *data) override {
+    own()->write_only(index, offset, length, data);
+  }
+  // Reads length bytes at addr (own or remote shared memory).
+  void read(mem_addr_t addr, size_t length, void *data) const override {
+    uint64_t off;
+    target(addr, off)->read(off, length, data);
+  }
+  // Prints the own shared memory.
+  void print(const char *format, FILE *fout) const override { own()->print(format, fout); }
+  // Sets a watchpoint in the own shared memory.
+  void set_watch(addr_t addr, unsigned watchpoint) override { own()->set_watch(addr, watchpoint); }
+
+ private:
+  // The shared memory of this CTA.
+  memory_space *own() const { return (memory_space *)m_state->smem[m_rank]; }
+  // The shared memory addr refers to, and the offset in it.
+  memory_space *target(mem_addr_t addr, uint64_t &off) const {
+    unsigned rank;
+    if (yasai_func::dsmem_decode(addr, rank, off)) {
+      if (rank >= m_state->size) {
+        fprintf(stderr, "GPGPU-Sim PTX: ERROR: shared address 0x%llx names cluster rank %u of %u\n",
+               (unsigned long long)addr, rank, m_state->size);
+        abort();
+      }
+      return (memory_space *)m_state->smem[rank];
+    }
+    off = addr;
+    return own();
+  }
+  yasai_func::ClusterState *m_state;  // the executing cluster
+  unsigned m_rank;                    // rank of this CTA
+};
 
 addr_t local_to_generic(unsigned smid, unsigned hwtid, addr_t addr) {
   assert(addr < LOCAL_MEM_SIZE_MAX);
@@ -1110,6 +1186,10 @@ void ptx_instruction::set_mul_div_or_other_archop() {
 }
 
 void ptx_instruction::set_bar_type() {
+  if (is_cluster_barrier()) {  // yasai: barrier.cluster.arrive / .wait
+    bar_type = m_barrier_op == ARRIVE_OPTION ? ARRIVE : SYNC;
+    return;
+  }
   if (m_opcode == BAR_OP) {
     switch (m_barrier_op) {
       case SYNC_OPTION:
@@ -3289,6 +3369,10 @@ void cuda_sim::gpgpu_ptx_sim_memcpy_symbol(const char *hostVar, const void *src,
 
   std::map<std::string, symbol_table *>::iterator st =
       gpgpu_ctx->ptx_parser->g_sym_name_to_symbol_table.find(sym_name.c_str());
+  // yasai: the variable may live in a PTX file that is not loaded yet (lazy loading).
+  if (st == gpgpu_ctx->ptx_parser->g_sym_name_to_symbol_table.end() &&
+      yasai_func::g_lazy_load_name != nullptr && yasai_func::g_lazy_load_name(sym_name.c_str()))
+    st = gpgpu_ctx->ptx_parser->g_sym_name_to_symbol_table.find(sym_name.c_str());
   assert(st != gpgpu_ctx->ptx_parser->g_sym_name_to_symbol_table.end());
   symbol_table *symtab = st->second;
 
@@ -3488,6 +3572,64 @@ void cuda_sim::gpgpu_cuda_ptx_sim_main_func(kernel_info_t &kernel,
   const std::string yasai_name = kernel.name();
   yasai_func::kernel_begin(yasai_name, yasai_g, yasai_b);
 
+  // yasai: a launch with a cluster shape runs cluster by cluster. The CTAs of one cluster are
+  // created together, each with its own hardware CTA slot and therefore its own shared memory,
+  // joined to a yasai_func::ClusterState (distributed shared memory, remote mbarriers,
+  // barrier.cluster), and their warps are interleaved one round at a time until all exit.
+  // CTA sampling then selects whole clusters: a cluster runs when its cluster coordinates are
+  // representative in the grid of clusters.
+  const dim3 yasai_cd = kernel.get_cluster_dim();
+  if (kernel.cluster_size() > 1 && cp_op == 0) {
+    const unsigned warp_size =
+        gpgpu_ctx->the_gpgpusim->g_the_gpu->getShaderCoreConfig()->warp_size;
+    const yasai_func::Dim3 ncl{(yasai_grid.x + yasai_cd.x - 1) / yasai_cd.x,
+                               (yasai_grid.y + yasai_cd.y - 1) / yasai_cd.y,
+                               (yasai_grid.z + yasai_cd.z - 1) / yasai_cd.z};
+    const unsigned csize = kernel.cluster_size();
+    for (unsigned cz = 0; cz < ncl.z; cz++)
+      for (unsigned cy = 0; cy < ncl.y; cy++)
+        for (unsigned cx = 0; cx < ncl.x; cx++) {
+          const unsigned cl_linear = cx + ncl.x * (cy + ncl.y * cz);
+          if (!yasai_func::cta_is_representative(ncl, cl_linear)) {
+            for (unsigned r = 0; r < csize; r++) yasai_func::count_cta(true);
+            continue;
+          }
+          yasai_func::ClusterState state;
+          state.size = csize;
+          std::vector<functionalCoreSim *> ctas;
+          for (unsigned r = 0; r < csize; r++) {
+            const dim3 cta(cx * yasai_cd.x + r % yasai_cd.x,
+                           cy * yasai_cd.y + (r / yasai_cd.x) % yasai_cd.y,
+                           cz * yasai_cd.z + r / (yasai_cd.x * yasai_cd.y));
+            kernel.set_next_cta_id(cta);
+            const unsigned linear = cta.x + yasai_grid.x * (cta.y + yasai_grid.y * cta.z);
+            functionalCoreSim *core =
+                new functionalCoreSim(&kernel, gpgpu_ctx->the_gpgpusim->g_the_gpu, warp_size);
+            core->yasai_init(linear, r);
+            ctas.push_back(core);
+            state.smem.push_back(core->yasai_shared_memory());
+            state.cta_key.push_back(core->yasai_cta_key());
+            state.cores.push_back(core);
+            yasai_func::count_cta(false);
+          }
+          for (unsigned r = 0; r < csize; r++) ctas[r]->yasai_join_cluster(&state, r);
+          yasai_func::set_cluster(&state);
+          bool live = true;
+          while (live) {
+            live = false;
+            for (unsigned r = 0; r < csize; r++) {
+              yasai_func::set_current_rank(r);
+              live = ctas[r]->yasai_round() || live;
+            }
+          }
+          yasai_func::set_cluster(nullptr);
+          yasai_func::set_current_rank(0);
+          for (functionalCoreSim *core : ctas) delete core;
+          cta_launched += csize;
+        }
+    kernel.set_all_ctas_issued();
+  }
+
   // we excute the kernel one CTA (Block) at the time, as synchronization
   // functions work block wise
   while (!kernel.no_more_ctas_to_run()) {
@@ -3590,7 +3732,7 @@ void functionalCoreSim::initializeCTA(unsigned ctaid_cp) {
   for (unsigned i = 0; i < m_kernel->threads_per_cta(); i++) {
     ptx_sim_init_thread(*m_kernel, &m_thread[i], 0, i,
                         m_kernel->threads_per_cta() - i,
-                        m_kernel->threads_per_cta(), this, 0, i / m_warp_size,
+                        m_kernel->threads_per_cta(), this, m_yasai_hw_cta, i / m_warp_size,
                         (gpgpu_t *)m_gpu, true);
     assert(m_thread[i] != NULL && !m_thread[i]->is_done());
     char fname[2048];
@@ -3656,9 +3798,10 @@ void functionalCoreSim::execute(int inst_count, unsigned ctaid_cp) {
       break;
     }
     if (!someOneLive) break;
+    yasai_release_cluster_waiters();
     if (allAtBarrier) {
       for (unsigned i = 0; i < m_warp_count; i++)
-        if (i >= m_yasai_wait_bar.size() || m_yasai_wait_bar[i] < 0)
+        if (i >= m_yasai_wait_bar.size() || m_yasai_wait_bar[i] == -1)
           m_warpAtBarrier[i] = false;
     }
   }
@@ -3703,6 +3846,101 @@ void functionalCoreSim::execute(int inst_count, unsigned ctaid_cp) {
       fclose(fp);
     }
   }
+}
+
+
+void functionalCoreSim::yasai_init(unsigned ctaid_cp, unsigned hw_cta_id) {
+  m_yasai_hw_cta = hw_cta_id;
+  initializeCTA(ctaid_cp);
+}
+
+bool functionalCoreSim::yasai_round() {
+  bool someOneLive = false;
+  bool allAtBarrier = true;
+  for (unsigned i = 0; i < m_warp_count; i++) executeWarp(i, allAtBarrier, someOneLive);
+  if (!someOneLive) return false;
+  yasai_release_cluster_waiters();
+  if (allAtBarrier) {
+    for (unsigned i = 0; i < m_warp_count; i++)
+      if (i >= m_yasai_wait_bar.size() || m_yasai_wait_bar[i] == -1) m_warpAtBarrier[i] = false;
+  }
+  return true;
+}
+
+memory_space *functionalCoreSim::yasai_shared_memory() const {
+  for (unsigned i = 0; i < m_warp_count * m_warp_size; i++)
+    if (m_thread[i] != NULL) return m_thread[i]->m_shared_mem;
+  return NULL;
+}
+
+uint64_t functionalCoreSim::yasai_cta_key() const {
+  for (unsigned i = 0; i < m_warp_count * m_warp_size; i++)
+    if (m_thread[i] != NULL) return m_thread[i]->get_cta_uid();
+  return 0;
+}
+
+void functionalCoreSim::yasai_join_cluster(yasai_func::ClusterState *cluster, unsigned rank) {
+  m_yasai_cluster = cluster;
+  m_yasai_rank = rank;
+  memory_space *view = new yasai_cluster_smem_view(cluster, rank);
+  m_yasai_views.push_back(view);
+  for (unsigned i = 0; i < m_warp_count * m_warp_size; i++)
+    if (m_thread[i] != NULL) m_thread[i]->m_shared_mem = view;
+}
+
+unsigned functionalCoreSim::yasai_live_threads() const {
+  unsigned n = 0;
+  for (unsigned w = 0; w < m_warp_count; w++) n += m_liveThreadCount[w];
+  return n;
+}
+
+void functionalCoreSim::yasai_free_views() {
+  for (memory_space *v : m_yasai_views) delete v;
+  m_yasai_views.clear();
+}
+
+// yasai: barrier.cluster.arrive counts the warp's active threads in the current phase of the
+// cluster barrier; the phase completes when every live thread of the cluster (of the CTA when
+// the launch has no cluster) has arrived. barrier.cluster.wait blocks the warp until the phase
+// it arrived in has completed.
+void functionalCoreSim::yasai_cluster_barrier(const warp_inst_t &inst, unsigned w, bool arrive) {
+  yasai_func::ClusterState *c = m_yasai_cluster ? m_yasai_cluster : &m_yasai_own_cluster;
+  if (m_yasai_cbar_phase.size() != m_warp_count) {
+    m_yasai_cbar_phase.assign(m_warp_count, 0);
+    m_yasai_cbar_arrived.assign(m_warp_count, 0);
+  }
+  if (m_yasai_wait_bar.size() != m_warp_count) m_yasai_wait_bar.assign(m_warp_count, -1);
+  if (arrive || !m_yasai_cbar_arrived[w]) {
+    unsigned total = 0;
+    if (m_yasai_cluster) {
+      for (void *core : c->cores) total += ((functionalCoreSim *)core)->yasai_live_threads();
+    } else {
+      total = yasai_live_threads();
+    }
+    m_yasai_cbar_phase[w] = c->barrier_phase;
+    m_yasai_cbar_arrived[w] = 1;
+    c->barrier_arrived += inst.active_count();
+    if (c->barrier_arrived >= total) {
+      c->barrier_arrived = 0;
+      c->barrier_phase++;
+    }
+  }
+  if (arrive) return;
+  m_yasai_cbar_arrived[w] = 0;
+  if (c->barrier_phase > m_yasai_cbar_phase[w]) return;
+  m_warpAtBarrier[w] = true;
+  m_yasai_wait_bar[w] = -2;
+}
+
+void functionalCoreSim::yasai_release_cluster_waiters() {
+  if (m_yasai_cbar_phase.empty()) return;
+  yasai_func::ClusterState *c = m_yasai_cluster ? m_yasai_cluster : &m_yasai_own_cluster;
+  for (unsigned w = 0; w < m_warp_count; w++)
+    if (w < m_yasai_wait_bar.size() && m_yasai_wait_bar[w] == -2 &&
+        c->barrier_phase > m_yasai_cbar_phase[w]) {
+      m_yasai_wait_bar[w] = -1;
+      m_warpAtBarrier[w] = false;
+    }
 }
 
 // yasai: adds the PTX register symbols of operand op (a register, a vector of registers or the
@@ -3830,6 +4068,10 @@ void functionalCoreSim::yasai_barrier(const warp_inst_t &inst, unsigned w) {
   // Before, a named barrier whose count equaled the CTA size (FlashMLA's 256-thread barriers
   // between its two warpgroups) took the CTA-wide path, which releases when every warp waits
   // at any barrier, so a warpgroup passed a barrier the other one had not reached.
+  if (pb->is_cluster_barrier()) {
+    yasai_cluster_barrier(inst, w, pb->bar_type == ARRIVE);
+    return;
+  }
   const bool counted = count != (unsigned)-1 || id != 0;
   if (pb->bar_type != ARRIVE && !counted) {
     m_warpAtBarrier[w] = true;

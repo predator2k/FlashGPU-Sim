@@ -31,6 +31,7 @@
 
 #include <stdlib.h>
 #include <map>
+#include "yasai_func.h"
 #include <string>
 #include <vector>
 #include "../abstract_hardware_model.h"
@@ -71,12 +72,27 @@ class functionalCoreSim : public core_t {
     m_liveThreadCount = new unsigned[m_warp_count];
   }
   virtual ~functionalCoreSim() {
+    yasai_free_views();
     warp_exit(0);
     delete[] m_liveThreadCount;
     delete[] m_warpAtBarrier;
   }
   //! executes all warps till completion
   void execute(int inst_count, unsigned ctaid_cp);
+  // yasai: cluster execution (cuda_sim::gpgpu_cuda_ptx_sim_main_func). yasai_init creates the
+  // threads of the next CTA with hardware CTA slot hw_cta_id (each CTA of a cluster has its own
+  // slot, hence its own shared memory); yasai_round executes every warp once, releases warps
+  // whose barrier completed, and returns true while a thread of the CTA is live.
+  void yasai_init(unsigned ctaid_cp, unsigned hw_cta_id);
+  bool yasai_round();
+  // yasai: joins the CTA to the executing cluster as rank rank; its threads then address shared
+  // memory through a cluster view (distributed shared memory).
+  void yasai_join_cluster(yasai_func::ClusterState *cluster, unsigned rank);
+  // yasai: live threads of the CTA.
+  unsigned yasai_live_threads() const;
+  // yasai: the CTA's own shared memory (before joining a cluster) and the uid of its CTA.
+  memory_space *yasai_shared_memory() const;
+  uint64_t yasai_cta_key() const;
   virtual void warp_exit(unsigned warp_id);
   virtual bool warp_waiting_at_barrier(unsigned warp_id) const {
     return (m_warpAtBarrier[warp_id] || !(m_liveThreadCount[warp_id] > 0));
@@ -91,6 +107,19 @@ class functionalCoreSim : public core_t {
   // yasai: barrier id a warp waits on (-1 when none), and threads arrived per barrier id.
   std::vector<int> m_yasai_wait_bar;
   std::map<unsigned, unsigned> m_yasai_bar_arrived;
+  // yasai: barrier.cluster arrive/wait of warp w (inst); see yasai_barrier.
+  void yasai_cluster_barrier(const warp_inst_t &inst, unsigned w, bool arrive);
+  // yasai: deletes the cluster shared-memory views.
+  void yasai_free_views();
+  // yasai: releases warps waiting on barrier.cluster whose phase completed.
+  void yasai_release_cluster_waiters();
+  unsigned m_yasai_hw_cta = 0;                          // hardware CTA slot (yasai_init)
+  yasai_func::ClusterState *m_yasai_cluster = nullptr;  // executing cluster, or null
+  unsigned m_yasai_rank = 0;                            // rank in the cluster
+  yasai_func::ClusterState m_yasai_own_cluster;         // barrier.cluster state without a cluster
+  std::vector<unsigned> m_yasai_cbar_phase;  // per warp: barrier.cluster phase it arrived in
+  std::vector<char> m_yasai_cbar_arrived;    // per warp: arrived and not yet waited
+  std::vector<memory_space *> m_yasai_views; // cluster shared-memory views (owned)
   // initializes threads in the CTA block which we are executing
   void initializeCTA(unsigned ctaid_cp);
   virtual void checkExecutionStatusAndUpdate(warp_inst_t &inst, unsigned t,

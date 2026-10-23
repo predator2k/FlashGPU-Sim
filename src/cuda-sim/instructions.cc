@@ -266,10 +266,8 @@ static inline uint16_t bf16_bits_from_f32(float f, unsigned rounding_mode) {
 // to +0, NaN to the canonical NaN 0x7FFF) applied when relu is set.
 static inline uint16_t packed_half_from_f32(float f, bool bf16, bool relu,
                                             unsigned rounding_mode) {
-  if (relu) {
-    if (std::isnan(f)) return 0x7FFF;
-    if (f < 0.0f) f = 0.0f;
-  }
+  if (std::isnan(f)) return 0x7FFF;  // canonical NaN of f16 and bf16 results
+  if (relu && f < 0.0f) f = 0.0f;
   return bf16 ? bf16_bits_from_f32(f, rounding_mode) : f16_bits_from_f32(f, rounding_mode);
 }
 
@@ -1180,7 +1178,42 @@ void addp_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   thread->set_operand_value(dst, data, i_type, thread, pI, overflow, carry);
 }
 
+
+// yasai: packed two-way f16x2 / bf16x2 arithmetic (add, sub, mul, min, max). Each half is
+// computed in f32 and rounded once (.rn unless .rz); .sat clamps to [0, 1], .relu applies to the
+// result. min/max follow PTX: a NaN operand yields the other operand (.NaN variants are not
+// distinguished here).
+static bool yasai_packed_binop(const ptx_instruction *pI, ptx_thread_info *thread, char op) {
+  if (pI->get_type() != F16X2_TYPE) return false;
+  const operand_info &dst = pI->dst();
+  const uint32_t a = thread->get_operand_value(pI->src1(), dst, B32_TYPE, thread, 1).u32;
+  const uint32_t b = thread->get_operand_value(pI->src2(), dst, B32_TYPE, thread, 1).u32;
+  const bool bf16 = pI->is_bf16x2();
+  const unsigned rm = pI->rounding_mode() == RZ_OPTION ? RZ_OPTION : RN_OPTION;
+  uint32_t r = 0;
+  for (int h = 0; h < 2; ++h) {
+    const float x = packed_half_to_f32(uint16_t(a >> (16 * h)), bf16);
+    const float y = packed_half_to_f32(uint16_t(b >> (16 * h)), bf16);
+    float v = 0.0f;
+    switch (op) {
+      case '+': v = x + y; break;
+      case '-': v = x - y; break;
+      case '*': v = x * y; break;
+      case 'm': v = std::isnan(x) ? y : (std::isnan(y) ? x : std::fmin(x, y)); break;
+      case 'M': v = std::isnan(x) ? y : (std::isnan(y) ? x : std::fmax(x, y)); break;
+    }
+    if (pI->saturation_mode()) v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    r |= uint32_t(packed_half_from_f32(v, bf16, pI->is_relu(), rm)) << (16 * h);
+  }
+  ptx_reg_t d;
+  d.u64 = 0;
+  d.u32 = r;
+  thread->set_operand_value(dst, d, F16X2_TYPE, thread, pI);
+  return true;
+}
+
 void add_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  if (yasai_packed_binop(pI, thread, '+')) return;
   ptx_reg_t src1_data, src2_data, data;
   int overflow = 0;
   int carry = 0;
@@ -1756,6 +1789,10 @@ void bar_impl(const ptx_instruction *pIin, ptx_thread_info *thread) {
   unsigned bar_op = pI->barrier_op();
   unsigned red_op = pI->get_atomic();
   unsigned ctaid = thread->get_cta_uid();
+
+  // yasai: barrier.cluster.arrive / .wait have no operands; functionalCoreSim::yasai_barrier
+  // implements them.
+  if (pI->is_cluster_barrier()) return;
 
   switch (bar_op) {
     case SYNC_OPTION: {
@@ -3539,6 +3576,60 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     return;
   }
 
+  // yasai: conversions with a packed small-float format (FP8, FP6, FP4 pairs, E8M0 scales):
+  //   cvt.{f16x2,bf16x2}.<fmt>x2 d, a        unpack two values (a: b16, b8 for e2m1x2)
+  //   cvt.rn{.satfinite}{.relu}.<fmt>x2.f32 d, a, b   d.hi = a, d.lo = b
+  //   cvt.rn{.satfinite}{.relu}.<fmt>x2.{f16x2,bf16x2} d, a
+  if (pI->packed_minifloat()) {
+    yasai_func::MiniFloat fmt = yasai_func::kE4M3;
+    unsigned width = 8;
+    switch (pI->packed_minifloat()) {
+      case E5M2X2_TYPE: fmt = yasai_func::kE5M2; break;
+      case E2M1X2_TYPE: fmt = yasai_func::kE2M1; width = 4; break;
+      case E2M3X2_TYPE: fmt = yasai_func::kE2M3; break;
+      case E3M2X2_TYPE: fmt = yasai_func::kE3M2; break;
+      case UE8M0X2_TYPE: fmt = yasai_func::kUE8M0; break;
+      default: break;
+    }
+    const unsigned mask = (1u << width) - 1;
+    const bool bf16 = pI->is_bf16x2();
+    const bool rz = rounding_mode == RZ_OPTION || rounding_mode == RZI_OPTION;
+    const bool rp = rounding_mode == RP_OPTION || rounding_mode == RPI_OPTION;
+    ptx_reg_t out;
+    out.u64 = 0;
+    if (to_type == F16X2_TYPE) {  // unpack (the packed operand is the source)
+      const uint32_t in = thread->get_operand_value(src1, dst, B32_TYPE, thread, 1).u32;
+      uint32_t r = 0;
+      for (int h = 0; h < 2; ++h) {
+        float v = yasai_func::minifloat_decode(fmt, (in >> (width * h)) & mask);
+        r |= uint32_t(packed_half_from_f32(v, bf16, pI->is_relu(), RN_OPTION)) << (16 * h);
+      }
+      out.u32 = r;
+    } else {  // pack (the packed operand is the destination)
+      float v[2];  // v[0] low half, v[1] high half
+      if (from_type == F32_TYPE) {
+        const std::vector<operand_info> &ops = pI->get_operands();
+        v[1] = thread->get_operand_value(ops[1], dst, F32_TYPE, thread, 1).f32;
+        v[0] = thread->get_operand_value(ops[2], dst, F32_TYPE, thread, 1).f32;
+      } else {
+        const uint32_t in = thread->get_operand_value(src1, dst, B32_TYPE, thread, 1).u32;
+        for (int h = 0; h < 2; ++h) v[h] = packed_half_to_f32(uint16_t(in >> (16 * h)), bf16);
+      }
+      uint32_t r = 0;
+      for (int h = 0; h < 2; ++h) {
+        float x = v[h];
+        if (pI->is_relu() && !std::isnan(x) && x < 0.0f) x = 0.0f;
+        r |= (yasai_func::minifloat_encode(fmt, x, saturation_mode != 0, rz, rp) & mask)
+             << (width * h);
+      }
+      out.u32 = r;
+    }
+    thread->set_operand_value(dst, out,
+                              to_type == F16X2_TYPE ? F16X2_TYPE : (width == 4 ? B8_TYPE : B16_TYPE),
+                              thread, pI);
+    return;
+  }
+
   // Abort for other unimplemented conversions involving F16X2_TYPE
   if (to_type == F16X2_TYPE || from_type == F16X2_TYPE) {
     printf("GPGPU-Sim PTX: ERROR ** Unsupported cvt conversion involving f16x2\n");
@@ -4582,11 +4673,33 @@ void madc_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   mad_def(pI, thread, true);
 }
 
+// yasai: mapa d, a, rank maps the shared-memory address a of the executing CTA to the address
+// of the same variable in the CTA of the given rank of the cluster. The .shared::cluster form
+// (.u32) returns yasai_func::dsmem_encode(rank, a); the generic form (.u64) returns the generic
+// address of that window (shared_to_generic). Without an executing cluster (a launch without a
+// cluster shape) the only rank is 0 and the address is returned unchanged.
 void mapa_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   const operand_info &dst = pI->dst();
   const operand_info &src1 = pI->src1();
   unsigned i_type = pI->get_type();
   ptx_reg_t data = thread->get_operand_value(src1, dst, i_type, thread, 1);
+  const unsigned rank =
+      thread->get_operand_value(pI->src2(), dst, U32_TYPE, thread, 1).u32;
+  if (yasai_func::cluster() != nullptr) {
+    const unsigned smid = thread->get_hw_sid();
+    unsigned old_rank;
+    uint64_t off;
+    if (i_type == U64_TYPE || i_type == B64_TYPE || i_type == S64_TYPE) {
+      // generic address: own window or a window that already names a rank
+      addr_t shared = generic_to_shared(smid, data.u64);
+      if (!yasai_func::dsmem_decode(shared, old_rank, off)) off = shared;
+      data.u64 = shared_to_generic(smid, yasai_func::dsmem_encode(rank, off));
+    } else {
+      if (!yasai_func::dsmem_decode(data.u32, old_rank, off)) off = data.u32;
+      data.u64 = 0;
+      data.u32 = uint32_t(yasai_func::dsmem_encode(rank, off));
+    }
+  }
   thread->set_operand_value(dst, data, i_type, thread, pI);
 }
 
@@ -4845,6 +4958,7 @@ static ptx_reg_t minmax_f32_pair(ptx_reg_t a, ptx_reg_t b, bool maximum) {
 }
 
 void max_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  if (yasai_packed_binop(pI, thread, 'M')) return;  // yasai
   ptx_reg_t a, b, d;
   const operand_info &dst = pI->dst();
   const operand_info &src1 = pI->src1();
@@ -4899,6 +5013,7 @@ void membar_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 }
 
 void min_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  if (yasai_packed_binop(pI, thread, 'm')) return;  // yasai
   ptx_reg_t a, b, d;
   const operand_info &dst = pI->dst();
   const operand_info &src1 = pI->src1();
@@ -5120,6 +5235,7 @@ void mul24_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 }
 
 void mul_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  if (yasai_packed_binop(pI, thread, '*')) return;  // yasai
   ptx_reg_t data;
 
   const operand_info &dst = pI->dst();
@@ -6823,11 +6939,29 @@ void st_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       delete[] ptx_regs;
     }
   }
+  // yasai: st.async ... .mbarrier::complete_tx::bytes [addr], value, [mbar]: the store completes
+  // its byte count on the mbarrier (in the CTA that owns the destination, by its
+  // .shared::cluster address).
+  if (pI->get_num_operands() >= 3 && pI->operand_lookup(pI->get_num_operands() - 1).is_memory_operand() &&
+      thread->isInFunctionalSimulationMode()) {
+    const operand_info &mbar = pI->operand_lookup(pI->get_num_operands() - 1);
+    const uint32_t mbar_addr = thread->get_operand_value(mbar, mbar, U32_TYPE, thread, 1).u32;
+    unsigned nelem = 1;
+    switch (vector_spec) {
+      case V2_TYPE: nelem = 2; break;
+      case V3_TYPE: nelem = 3; break;
+      case V4_TYPE: nelem = 4; break;
+      case V8_TYPE: nelem = 8; break;
+      default: break;
+    }
+    yasai_func::mbar_complete_tx(thread->get_cta_uid(), mbar_addr, int64_t(nelem * size / 8));
+  }
   thread->m_last_effective_address = addr;
   thread->m_last_memory_space = space;
 }
 
 void sub_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  if (yasai_packed_binop(pI, thread, '-')) return;  // yasai
   ptx_reg_t data;
   int overflow = 0;
   int carry = 0;
