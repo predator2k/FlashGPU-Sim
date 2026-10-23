@@ -10,6 +10,7 @@
 
 class ptx_recognizer;
 typedef void *yyscan_t;
+#include "../../cuda-sim/yasai_func.h"
 #include "../../trace.h"
 #include "ptx.tab.h"
 
@@ -384,6 +385,50 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
     info.bar_time_hint_ns = time_hint_ns;
     pI->set_mbarrier_info(laneid, info);
   };
+
+  // yasai: in the pure functional mode the timing model's barrier_set_t does
+  // not run, so the mbarrier state is kept by yasai_func and try_wait writes
+  // its predicate here. The per-lane info below is still recorded unchanged.
+  if (thread->isInFunctionalSimulationMode()) {
+    const uint64_t cta_key = ctaid;
+    if (bar_op == INIT_OPTION) {
+      yasai_func::mbar_init(cta_key, get_u32_value(pI->dst()),
+                            get_u32_value(pI->src1()));
+    } else if (bar_op == TRY_WAIT_OPTION) {
+      const bool done = yasai_func::mbar_phase_done(
+          cta_key, get_u32_value(pI->src1()), get_u32_value(pI->src2()) & 1u);
+      ptx_reg_t p;
+      p.u64 = 0;
+      p.pred = done ? 1 : 0;
+      thread->set_reg(pI->dst().get_symbol(), p);
+      if (std::getenv("YASAI_MBAR_DEBUG") && laneid == 0)
+        printf(
+            "yasai-mbar try_wait_pred pc=0x%x sym=%s uid=%u wrote=%u read=%u\n",
+            (unsigned)thread->get_pc(), pI->dst().get_symbol()->name().c_str(),
+            pI->dst().get_symbol()->uid(), (unsigned)p.pred,
+            (unsigned)thread->get_reg(pI->dst().get_symbol()).pred);
+    } else if (bar_op == COMPLETE_TX_OPTION) {
+      yasai_func::mbar_complete_tx(cta_key, get_u32_value(pI->dst()),
+                                   get_u32_value(pI->src1()));
+    } else if (bar_op == ARRIVE_OPTION || bar_op == EXPECT_TX_OPTION) {
+      auto [is_arrive, is_expect_tx] =
+          parse_mbarrier_arrive_expect_tx_options(pI);
+      if (is_arrive && is_expect_tx) {
+        const uint32_t a = get_u32_value(pI->src1());
+        yasai_func::mbar_expect_tx(cta_key, a, get_u32_value(pI->src2()));
+        yasai_func::mbar_arrive(cta_key, a, 1);
+      } else if (is_arrive) {
+        const uint32_t n =
+            pI->get_num_operands() == 3 ? get_u32_value(pI->src2()) : 1;
+        yasai_func::mbar_arrive(cta_key, get_u32_value(pI->src1()), n);
+      } else {
+        yasai_func::mbar_expect_tx(cta_key, get_u32_value(pI->dst()),
+                                   get_u32_value(pI->src1()));
+      }
+    } else if (bar_op == INVAL_OPTION) {
+      yasai_func::mbar_inval(cta_key, get_u32_value(pI->dst()));
+    }
+  }
 
   if (bar_op == INIT_OPTION) {
     assert(pI->get_num_operands() == 2);

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -359,5 +360,104 @@ bool cta_is_representative(Dim3 g, unsigned cta_linear_id) {
   return coord_is_representative(x, g.x) && coord_is_representative(y, g.y) &&
          coord_is_representative(z, g.z);
 }
+
+namespace {
+
+// State of one functional mbarrier.
+struct MbarState {
+  uint32_t expected = 0;   // arrivals per phase (from mbarrier.init)
+  int64_t pending = 0;     // arrivals still missing in the current phase
+  int64_t tx = 0;          // transaction bytes still missing in the current phase
+  uint32_t phase = 0;      // current phase number
+};
+
+// All functional mbarriers, keyed by (CTA key, shared-memory address).
+std::map<std::pair<uint64_t, uint32_t>, MbarState> g_mbars;
+
+// True when YASAI_MBAR_DEBUG is set: every functional mbarrier operation is printed.
+bool mbar_debug() {
+  static const bool on = env_flag("YASAI_MBAR_DEBUG");
+  return on;
+}
+
+// Prints one functional mbarrier operation when mbar_debug() is on.
+void mbar_log(const char *what, uint64_t cta_key, uint32_t addr, int64_t value,
+              const MbarState *m) {
+  if (!mbar_debug()) return;
+  if (m)
+    std::printf("yasai-mbar %s cta=%llu addr=0x%x value=%lld pending=%lld tx=%lld phase=%u\n",
+                what, (unsigned long long)cta_key, addr, (long long)value, (long long)m->pending,
+                (long long)m->tx, m->phase);
+  else
+    std::printf("yasai-mbar %s cta=%llu addr=0x%x value=%lld unknown\n", what,
+                (unsigned long long)cta_key, addr, (long long)value);
+}
+
+// Completes the current phase of m when nothing is pending.
+void mbar_try_advance(MbarState &m) {
+  if (m.pending <= 0 && m.tx == 0) {
+    m.phase++;
+    m.pending = m.expected;
+  }
+}
+
+}  // namespace
+
+void mbar_init(uint64_t cta_key, uint32_t addr, uint32_t count) {
+  MbarState &m = g_mbars[{cta_key, addr}];
+  m = MbarState();
+  m.expected = count;
+  m.pending = count;
+  mbar_log("init", cta_key, addr, count, &m);
+}
+
+void mbar_arrive(uint64_t cta_key, uint32_t addr, uint32_t count) {
+  auto it = g_mbars.find({cta_key, addr});
+  if (it == g_mbars.end()) {
+    mbar_log("arrive", cta_key, addr, count, nullptr);
+    return;
+  }
+  it->second.pending -= count;
+  mbar_try_advance(it->second);
+  mbar_log("arrive", cta_key, addr, count, &it->second);
+}
+
+void mbar_expect_tx(uint64_t cta_key, uint32_t addr, int64_t bytes) {
+  auto it = g_mbars.find({cta_key, addr});
+  if (it == g_mbars.end()) {
+    mbar_log("expect_tx", cta_key, addr, bytes, nullptr);
+    return;
+  }
+  it->second.tx += bytes;
+  mbar_log("expect_tx", cta_key, addr, bytes, &it->second);
+}
+
+void mbar_complete_tx(uint64_t cta_key, uint32_t addr, int64_t bytes) {
+  auto it = g_mbars.find({cta_key, addr});
+  if (it == g_mbars.end()) {
+    mbar_log("complete_tx", cta_key, addr, bytes, nullptr);
+    return;
+  }
+  it->second.tx -= bytes;
+  mbar_try_advance(it->second);
+  mbar_log("complete_tx", cta_key, addr, bytes, &it->second);
+}
+
+bool mbar_phase_done(uint64_t cta_key, uint32_t addr, uint32_t parity) {
+  auto it = g_mbars.find({cta_key, addr});
+  if (it == g_mbars.end()) {
+    static bool warned = false;
+    if (!warned) {
+      std::printf("yasai-func: mbarrier wait on 0x%x without init; treated as complete\n", addr);
+      warned = true;
+    }
+    return true;
+  }
+  const bool done = (it->second.phase & 1u) != (parity & 1u);
+  if (mbar_debug()) mbar_log(done ? "wait_true" : "wait_false", cta_key, addr, parity, &it->second);
+  return done;
+}
+
+void mbar_inval(uint64_t cta_key, uint32_t addr) { g_mbars.erase({cta_key, addr}); }
 
 }  // namespace yasai_func

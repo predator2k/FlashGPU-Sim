@@ -15,6 +15,7 @@
 //                        JSON sidecar (k<seq>.json); convert/func_to_yste.py turns it into the
 //                        yasai trace entry format (.yste).
 //   YASAI_TRACE_MAX_MB=n stop writing a kernel's trace after n MiB and mark it truncated.
+//   YASAI_MBAR_DEBUG=1   print every operation of the functional mbarrier model below.
 //
 // Raw warp trace (.ywr), little-endian, one record per executed warp instruction:
 //   magic "YWR1"
@@ -124,6 +125,34 @@ bool skip_fp_value(const ptx_instruction *pI, unsigned lane_id);
 // equals the lowest interior index (2). The second index in each dimension gives the per-
 // dimension address stride used by the synthesis. Without YASAI_CTA_SAMPLE every CTA runs.
 bool cta_is_representative(Dim3 grid, unsigned cta_linear_id);
+
+// Functional mbarrier model. FlashGPU-Sim keeps mbarrier state only in the timing model
+// (barrier_set_t), so in PTX_SIM_MODE_FUNC=1 an mbarrier.try_wait never succeeds and every kernel
+// that waits on an mbarrier (TMA pipelines, warp-specialized SM90/SM100 kernels) spins forever.
+// These functions hold the state per (CTA key, shared-memory address): expected arrival count,
+// pending arrivals, transaction bytes and the current phase. A phase completes when the pending
+// arrivals and the transaction bytes both reach zero; the pending count then resets to the
+// expected count and the phase parity flips.
+
+// mbarrier.init: expected arrival count count, phase 0.
+void mbar_init(uint64_t cta_key, uint32_t addr, uint32_t count);
+
+// mbarrier.arrive (and cp.async.mbarrier.arrive, tcgen05.commit): count arrivals.
+void mbar_arrive(uint64_t cta_key, uint32_t addr, uint32_t count);
+
+// mbarrier.expect_tx: bytes more transaction bytes are expected in the current phase.
+void mbar_expect_tx(uint64_t cta_key, uint32_t addr, int64_t bytes);
+
+// mbarrier.complete_tx and the completion of a TMA load: bytes transaction bytes arrived.
+void mbar_complete_tx(uint64_t cta_key, uint32_t addr, int64_t bytes);
+
+// mbarrier.try_wait.parity / test_wait.parity: true when the phase with parity parity has
+// completed, i.e. the current phase parity differs from parity. An address without state counts
+// as completed (warned once), so a missed init cannot hang the simulation.
+bool mbar_phase_done(uint64_t cta_key, uint32_t addr, uint32_t parity);
+
+// mbarrier.inval: forget the state.
+void mbar_inval(uint64_t cta_key, uint32_t addr);
 
 }  // namespace yasai_func
 

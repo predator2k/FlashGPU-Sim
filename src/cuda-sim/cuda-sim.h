@@ -86,6 +86,11 @@ class functionalCoreSim : public core_t {
   void executeWarp(unsigned, bool &, bool &);
   // yasai: writes the trace record of the warp instruction inst of warp w (YASAI_TRACE_DIR).
   void yasai_emit_warp(const warp_inst_t &inst, unsigned w);
+  // yasai: CTA-wide and named-barrier handling of a bar instruction of warp w.
+  void yasai_barrier(const warp_inst_t &inst, unsigned w);
+  // yasai: barrier id a warp waits on (-1 when none), and threads arrived per barrier id.
+  std::vector<int> m_yasai_wait_bar;
+  std::map<unsigned, unsigned> m_yasai_bar_arrived;
   // initializes threads in the CTA block which we are executing
   void initializeCTA(unsigned ctaid_cp);
   virtual void checkExecutionStatusAndUpdate(warp_inst_t &inst, unsigned t,

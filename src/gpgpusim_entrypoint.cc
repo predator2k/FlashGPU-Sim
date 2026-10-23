@@ -27,6 +27,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "gpgpusim_entrypoint.h"
+#include <unistd.h>
 #include <stdio.h>
 
 #include "../libcuda/gpgpu_context.h"
@@ -99,8 +100,16 @@ void *gpgpu_sim_thread_concurrent(void *ctx_ptr) {
           "work ***\n");
       fflush(stdout);
     }
-    while (ctx->the_gpgpusim->g_stream_manager->empty_protected() &&
-           !ctx->the_gpgpusim->g_sim_done);
+    // yasai: wait for work with a growing sleep (50 us up to 1 ms) instead of a busy loop, so an
+    // idle process (a rank between launches, or during PTX loading) does not occupy a core.
+    {
+      unsigned idle_us = 50;
+      while (ctx->the_gpgpusim->g_stream_manager->empty_protected() &&
+             !ctx->the_gpgpusim->g_sim_done) {
+        usleep(idle_us);
+        if (idle_us < 1000) idle_us *= 2;
+      }
+    }
     if (g_debug_execution >= 3) {
       printf("GPGPU-Sim: ** START simulation thread (detected work) **\n");
       ctx->the_gpgpusim->g_stream_manager->print(stdout);

@@ -3646,7 +3646,9 @@ void functionalCoreSim::execute(int inst_count, unsigned ctaid_cp) {
     }
     if (!someOneLive) break;
     if (allAtBarrier) {
-      for (unsigned i = 0; i < m_warp_count; i++) m_warpAtBarrier[i] = false;
+      for (unsigned i = 0; i < m_warp_count; i++)
+        if (i >= m_yasai_wait_bar.size() || m_yasai_wait_bar[i] < 0)
+          m_warpAtBarrier[i] = false;
     }
   }
 
@@ -3777,12 +3779,62 @@ void functionalCoreSim::executeWarp(unsigned i, bool &allAtBarrier,
     yasai_func::count_warp_inst(inst.active_count());
     if (yasai_func::tracing()) yasai_emit_warp(inst, i);
     if (inst.isatomic()) inst.do_atomic(true);
-    if (inst.op == BARRIER_OP || inst.op == MEMORY_BARRIER_OP)
-      m_warpAtBarrier[i] = true;
+    // yasai: membar does not stop the warp (the functional memory is sequentially consistent;
+    // blocking it until every warp reaches a barrier deadlocks warps that spin on a flag), and
+    // bar.sync / bar.arrive with a thread count below the CTA size are named barriers that
+    // involve only the warps that use them.
+    if (inst.op == BARRIER_OP) yasai_barrier(inst, i);
     updateSIMTStack(i, &inst);
   }
   if (m_liveThreadCount[i] > 0) someOneLive = true;
   if (!m_warpAtBarrier[i] && m_liveThreadCount[i] > 0) allAtBarrier = false;
+}
+
+// yasai: handles a bar instruction of warp w. A barrier whose thread count is absent or covers
+// the whole CTA keeps the original CTA-wide behavior (the warp waits until every live warp is at
+// a barrier). A named barrier (count below the CTA's threads, or bar.arrive) counts 32 threads
+// per arriving warp; bar.sync warps wait on that barrier id, and when the count is reached all
+// warps waiting on the id continue.
+void functionalCoreSim::yasai_barrier(const warp_inst_t &inst, unsigned w) {
+  const ptx_instruction *pb = m_gpu->gpgpu_ctx->pc_to_instruction(inst.pc);
+  const unsigned cta_threads =
+      ((m_kernel->threads_per_cta() + m_warp_size - 1) / m_warp_size) * m_warp_size;
+  // The id and count are evaluated here from the first active lane: bar_impl stores them on the
+  // dynamic instruction object, not on the static one returned by pc_to_instruction.
+  ptx_thread_info *t0 = NULL;
+  for (unsigned l = 0; l < m_warp_size && t0 == NULL; l++)
+    if (inst.active(l)) t0 = m_thread[w * m_warp_size + l];
+  unsigned id = 0;
+  unsigned count = (unsigned)-1;
+  if (t0 != NULL && pb->get_num_operands() >= 1) {
+    const operand_info &op0 = pb->dst();
+    id = t0->get_operand_value(op0, op0, U32_TYPE, t0, 1).u32;
+    if (pb->get_num_operands() >= 2) {
+      const operand_info &op1 = pb->src1();
+      count = t0->get_operand_value(op1, op1, U32_TYPE, t0, 1).u32;
+    }
+  }
+  const bool counted = count != (unsigned)-1 && count < cta_threads;
+  if (pb->bar_type != ARRIVE && !counted) {
+    m_warpAtBarrier[w] = true;
+    return;
+  }
+  if (m_yasai_wait_bar.size() != m_warp_count) m_yasai_wait_bar.assign(m_warp_count, -1);
+  const unsigned need = count == (unsigned)-1 ? cta_threads : count;
+  unsigned &arrived = m_yasai_bar_arrived[id];
+  arrived += m_warp_size;
+  if (pb->bar_type != ARRIVE) {
+    m_warpAtBarrier[w] = true;
+    m_yasai_wait_bar[w] = int(id);
+  }
+  if (arrived >= need) {
+    arrived = 0;
+    for (unsigned k = 0; k < m_warp_count; k++)
+      if (m_yasai_wait_bar[k] == int(id)) {
+        m_yasai_wait_bar[k] = -1;
+        m_warpAtBarrier[k] = false;
+      }
+  }
 }
 
 unsigned gpgpu_context::translate_pc_to_ptxlineno(unsigned pc) {

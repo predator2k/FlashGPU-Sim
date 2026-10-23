@@ -32,6 +32,7 @@
 
 #include <cstring>
 #include "instructions.h"
+#include "yasai_func.h"
 #include "../gpgpu-sim/flash/mma/mma_trace.h"
 #include "../gpgpu-sim/flash/mma/tensor_mma.h"
 #include "half.h"
@@ -1908,6 +1909,10 @@ void cp_async_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     info.bar_id = addr;
     const_cast<ptx_instruction *>(pI)->set_mbarrier_info(
         thread->get_laneid(), info);
+    // yasai: functional cp.async copies complete at issue, so the arrive happens now (.noinc
+    // does not change the expected count, which the functional model does not track per phase).
+    if (thread->isInFunctionalSimulationMode())
+      yasai_func::mbar_arrive(thread->get_cta_uid(), addr, 1);
     return;
   }
 

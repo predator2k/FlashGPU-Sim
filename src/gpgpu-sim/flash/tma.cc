@@ -1,4 +1,5 @@
 #include "tma.h"
+#include "../../cuda-sim/yasai_func.h"
 #include "tensormap.h"
 #include "tma_opaque_tensormap.h"
 #include "tma_reduction.h"
@@ -2495,6 +2496,10 @@ static void handle_tma_copy(ptx_instruction *pI, ptx_thread_info *thread) {
 
     copy_mem(global_mem, src_addr, shared_mem, dst_addr, size_in_bytes, thread,
              pI);
+    // yasai: in the pure functional mode the transfer is complete now.
+    if (thread->isInFunctionalSimulationMode())
+      yasai_func::mbar_complete_tx(thread->get_cta_uid(), mbar_addr,
+                                   size_in_bytes);
 
     GPPRINTF_THREAD_CORE(TMA, thread,
                          "Functional Sim: "
@@ -2714,6 +2719,10 @@ static void handle_tma_tensor(ptx_instruction *pI, ptx_thread_info *thread) {
 
     do_tma_transfer(tensormap, coords, shared_mem, global_mem, dst_addr, thread,
                     pI, true);
+    // yasai: in the pure functional mode the transfer is complete now.
+    if (thread->isInFunctionalSimulationMode())
+      yasai_func::mbar_complete_tx(thread->get_cta_uid(), mbar_addr,
+                                   size_in_bytes);
 
   } else if (dst_option == GLOBAL_OPTION && src_option == CTA_OPTION) {
     // Tensor store: global <- shared
