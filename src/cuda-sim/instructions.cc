@@ -2520,6 +2520,9 @@ void call_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     // yasai: indirect call through a register that holds a function handle.
     const ptx_reg_t v = thread->get_operand_value(target, target, U64_TYPE, thread, 1);
     func_addr = yasai_func::function_of(v.u64);
+    if (getenv("YASAI_CALL_DEBUG") && thread->get_laneid() == 0)
+      printf("yasai-call indirect target=0x%llx func=%s\n", (unsigned long long)v.u64,
+             func_addr ? func_addr->name().c_str() : "(none)");
     if (func_addr == NULL) {
       printf("GPGPU-Sim PTX: ERROR ** indirect call to 0x%llx, which is not a function handle\n",
              (unsigned long long)v.u64);

@@ -8737,6 +8737,11 @@ extern "C" CUresult CUDAAPI cuDeviceGetUuid(CUuuid *uuid, CUdevice dev) {
   if (uuid == NULL) return CUDA_ERROR_INVALID_VALUE;
   memset(uuid->bytes, 0, sizeof(uuid->bytes));
   uuid->bytes[0] = 0x59;  // 'Y'
+  // yasai: the UUID carries the device's PCI bus (YASAI_PCI_BUS_BASE + dev, as in
+  // cudaDeviceGetPCIBusId), so ranks on one host that set different bases have different GPUs.
+  const char *base_env = getenv("YASAI_PCI_BUS_BASE");
+  const unsigned base = base_env ? unsigned(strtoul(base_env, NULL, 0)) : 0xd0u;
+  uuid->bytes[14] = (char)((base + dev) & 0xff);
   uuid->bytes[15] = (char)(dev & 0xff);
   return CUDA_SUCCESS;
 }
