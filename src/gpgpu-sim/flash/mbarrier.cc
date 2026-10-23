@@ -403,6 +403,8 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
           done ? 0
                : 1; // FlashGPU-Sim stores predicates inverted (0 means true)
       thread->set_reg(pI->dst().get_symbol(), p);
+      if (!done)
+        yasai_func::g_wait_failed = true;
       if (std::getenv("YASAI_MBAR_DEBUG") && laneid == 0)
         printf(
             "yasai-mbar try_wait_pred pc=0x%x sym=%s uid=%u wrote=%u read=%u\n",

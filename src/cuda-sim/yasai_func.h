@@ -237,6 +237,15 @@ float minifloat_decode(MiniFloat f, unsigned bits);
 unsigned minifloat_encode(MiniFloat f, float x, bool satfinite, bool toward_zero = false,
                           bool round_up = false);
 
+// Set when an mbarrier wait of the executing warp found its phase incomplete; the functional
+// core then lets a diverged warp run its other path (simt_stack::yasai_yield).
+extern thread_local bool g_wait_failed;
+
+// Forgets every mbarrier (functional mode, after each CTA or cluster: CTA keys repeat in the
+// next kernel launch, and a stale completed phase let a wait pass before the new launch's
+// mbarrier.init; FlashMLA SM100 decode launched twice for h_q 128).
+void mbar_reset_all();
+
 // f32 to f16 bits, round to nearest even (overflow to infinity).
 uint16_t minifloat_encode_f16(float x);
 

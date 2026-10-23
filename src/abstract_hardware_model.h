@@ -294,6 +294,13 @@ class simt_stack {
   void get_pdom_stack_top_info(unsigned *pc, unsigned *rpc) const;
   unsigned get_rp() const;
   void print(FILE *fp) const;
+  // yasai: lets the other side of the innermost divergence run first (swaps the two top
+  // entries when they are sibling paths with the same reconvergence point). Called when the
+  // active path spins on an mbarrier that a lane of the other path must complete, which real
+  // GPUs resolve by independent thread scheduling. Returns true when it swapped.
+  bool yasai_yield();
+  // yasai: true when yasai_yield would swap.
+  bool yasai_can_yield() const;
   void resume(char *fname);
   void print_checkpoint(FILE *fout) const;
 

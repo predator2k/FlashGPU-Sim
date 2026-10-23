@@ -1776,6 +1776,10 @@ class function_info {
 
   // Localized dynamic shared memory symbol
   symbol *m_local_dyn_shared_mem_symbol = nullptr;
+  // yasai: address and reserved size of the dynamic shared memory region (alloc_dyn_shared_mem).
+  bool m_yasai_dyn_smem_placed = false;
+  addr_t m_yasai_dyn_smem_addr = 0;
+  unsigned m_yasai_dyn_smem_reserved = 0;
 
   // parameter size for device kernels
   int m_args_aligned_size;

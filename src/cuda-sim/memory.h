@@ -121,6 +121,9 @@ class memory_space_impl : public memory_space {
   virtual void print(const char *format, FILE *fout) const;
 
   virtual void set_watch(addr_t addr, unsigned watchpoint);
+  // yasai: drops all contents (the functional mode clears a reused CTA slot's shared memory).
+  // Not virtual, so the memory_space layout seen by other objects stays unchanged.
+  void yasai_clear() { m_data.clear(); }
 
  private:
   void read_single_block(mem_addr_t blk_idx, mem_addr_t addr, size_t length,

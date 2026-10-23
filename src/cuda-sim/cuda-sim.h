@@ -110,6 +110,9 @@ class functionalCoreSim : public core_t {
   // yasai: barrier id a warp waits on (-1 when none), and threads arrived per barrier id.
   std::vector<int> m_yasai_wait_bar;
   std::map<unsigned, unsigned> m_yasai_bar_arrived;
+  // yasai: lanes of each warp that reached a named barrier while other lanes of the warp were
+  // on another divergent path (see yasai_barrier).
+  std::vector<uint32_t> m_yasai_bar_lanes;
   // yasai: barrier.cluster arrive/wait of warp w (inst); see yasai_barrier.
   void yasai_cluster_barrier(const warp_inst_t &inst, unsigned w, bool arrive);
   // yasai: deletes the cluster shared-memory views.

@@ -1190,15 +1190,19 @@ void addp_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 // computed in f32 and rounded once (.rn unless .rz); .sat clamps to [0, 1], .relu applies to the
 // result. min/max follow PTX: a NaN operand yields the other operand (.NaN variants are not
 // distinguished here).
+// Scalar .bf16 (add/sub/mul/min/max.bf16, FlashMLA SM100 decode) takes the same path with one
+// half.
 static bool yasai_packed_binop(const ptx_instruction *pI, ptx_thread_info *thread, char op) {
-  if (pI->get_type() != F16X2_TYPE) return false;
+  const bool scalar_bf16 = pI->get_type() == BF16_TYPE;
+  if (pI->get_type() != F16X2_TYPE && !scalar_bf16) return false;
   const operand_info &dst = pI->dst();
-  const uint32_t a = thread->get_operand_value(pI->src1(), dst, B32_TYPE, thread, 1).u32;
-  const uint32_t b = thread->get_operand_value(pI->src2(), dst, B32_TYPE, thread, 1).u32;
-  const bool bf16 = pI->is_bf16x2();
+  const unsigned in_type = scalar_bf16 ? B16_TYPE : B32_TYPE;
+  const uint32_t a = thread->get_operand_value(pI->src1(), dst, in_type, thread, 1).u32;
+  const uint32_t b = thread->get_operand_value(pI->src2(), dst, in_type, thread, 1).u32;
+  const bool bf16 = scalar_bf16 || pI->is_bf16x2();
   const unsigned rm = pI->rounding_mode() == RZ_OPTION ? RZ_OPTION : RN_OPTION;
   uint32_t r = 0;
-  for (int h = 0; h < 2; ++h) {
+  for (int h = 0; h < (scalar_bf16 ? 1 : 2); ++h) {
     const float x = packed_half_to_f32(uint16_t(a >> (16 * h)), bf16);
     const float y = packed_half_to_f32(uint16_t(b >> (16 * h)), bf16);
     float v = 0.0f;
@@ -1215,7 +1219,7 @@ static bool yasai_packed_binop(const ptx_instruction *pI, ptx_thread_info *threa
   ptx_reg_t d;
   d.u64 = 0;
   d.u32 = r;
-  thread->set_operand_value(dst, d, F16X2_TYPE, thread, pI);
+  thread->set_operand_value(dst, d, scalar_bf16 ? B16_TYPE : F16X2_TYPE, thread, pI);
   return true;
 }
 
@@ -5515,8 +5519,9 @@ void mul_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       break;
     }
     default:
-      assert(0);
-      break;
+      fprintf(stderr, "mul: unsupported type %s at %s:%u\n", decode_token(i_type),
+              pI->source_file(), pI->source_line());
+      abort();
   }
 
   thread->set_operand_value(dst, d, i_type, thread, pI);

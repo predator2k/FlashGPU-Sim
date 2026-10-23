@@ -1,5 +1,8 @@
 #include "tmem.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 #include <cassert>
 
 namespace flash_gpgpu_sim {
@@ -50,6 +53,9 @@ uint32_t tcgen05_tmem_manager_t::alloc(const tcgen05_tmem_scope_t &scope,
          "TCGen05 TMEM allocation address overflow");
 
   uint32_t base = state.next_base;
+  if (getenv("YASAI_UMMA_DEBUG"))
+    fprintf(stderr, "yasai-tmem alloc sm=%u cta=%u ncols=%u base=%u\n",
+            scope.sm_id, scope.cta_id, ncols, base);
   state.next_base += ncols;
   state.last_allocation_ncols = ncols;
   auto inserted = state.allocations.emplace(base, allocation_t{base, ncols});

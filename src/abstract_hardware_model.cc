@@ -866,6 +866,21 @@ unsigned simt_stack::get_rp() const {
   return m_stack.back().m_recvg_pc;
 }
 
+bool simt_stack::yasai_can_yield() const {
+  if (m_stack.size() < 2) return false;
+  const simt_stack_entry &top = m_stack.back();
+  const simt_stack_entry &below = m_stack[m_stack.size() - 2];
+  if (top.m_type != STACK_ENTRY_TYPE_NORMAL || below.m_type != STACK_ENTRY_TYPE_NORMAL)
+    return false;
+  return top.m_recvg_pc == below.m_recvg_pc && below.m_pc != below.m_recvg_pc;
+}
+
+bool simt_stack::yasai_yield() {
+  if (!yasai_can_yield()) return false;
+  std::swap(m_stack.back(), m_stack[m_stack.size() - 2]);
+  return true;
+}
+
 void simt_stack::print(FILE *fout) const {
   for (unsigned k = 0; k < m_stack.size(); k++) {
     simt_stack_entry stack_entry = m_stack[k];

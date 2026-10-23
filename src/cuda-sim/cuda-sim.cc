@@ -563,6 +563,18 @@ void function_info::alloc_dyn_shared_mem(int shared_mem_size) {
   symbol_table *symtab = get_symtab();
 
   if (m_local_dyn_shared_mem_symbol) {
+    // yasai: the dynamic region keeps the address of the first launch; a later launch only
+    // reserves more when it asks for more. Before, every launch allocated a new region after the
+    // previous one, so the second launch of a kernel saw its shared memory at another address
+    // (FlashMLA's SM100 decode, whose buffers then lost their 1024-byte swizzle alignment).
+    if (m_yasai_dyn_smem_placed) {
+      m_local_dyn_shared_mem_symbol->set_address(m_yasai_dyn_smem_addr);
+      if ((unsigned)shared_mem_size > m_yasai_dyn_smem_reserved) {
+        symtab->alloc_shared(shared_mem_size - m_yasai_dyn_smem_reserved);
+        m_yasai_dyn_smem_reserved = shared_mem_size;
+      }
+      return;
+    }
     addr_t addr = symtab->get_shared_next();
     // Simple address padding for alignment
     unsigned alignto = 128;
@@ -571,6 +583,9 @@ void function_info::alloc_dyn_shared_mem(int shared_mem_size) {
       alignto = shared_mem_size;
     }
     addr_t addr_pad = alignto ? ((alignto - (addr % alignto)) % alignto) : 0;
+    m_yasai_dyn_smem_placed = true;
+    m_yasai_dyn_smem_addr = addr + addr_pad;
+    m_yasai_dyn_smem_reserved = shared_mem_size;
         printf("GPGPU-Sim PTX: Allocating local dyn shared mem symbol %s from "
           "0x%llx to 0x%llx (size %d)\n",
            m_local_dyn_shared_mem_symbol->name().c_str(), addr + addr_pad,
@@ -3159,6 +3174,11 @@ unsigned ptx_sim_init_thread(kernel_info_t &kernel,
     sstarr_mem = sstarr_memory_lookup[sm_idx];
     cta_info = ptx_cta_lookup[sm_idx];
     cta_info->check_cta_thread_status_and_reset();
+    // yasai: the functional mode reuses a CTA slot's shared memory for the next CTA and the next
+    // launch; it is cleared when the slot's first thread is set up, so every CTA starts from
+    // the state the first one saw (a repeated launch of FlashMLA's SM100 decode gave NaN).
+    if (isInFunctionalSimulationMode && tid == 0)
+      if (auto *m = dynamic_cast<memory_space_impl<16 * 1024> *>(shared_mem)) m->yasai_clear();
   }
 
   std::map<unsigned, memory_space *> &local_mem_lookup =
@@ -3623,6 +3643,7 @@ void cuda_sim::gpgpu_cuda_ptx_sim_main_func(kernel_info_t &kernel,
           // yasai: functional mode runs one CTA or cluster at a time; its TMEM state (allocation
           // permit, words) must not leak into the next CTA that reuses the same CTA id.
           gpgpu_ctx->the_gpgpusim->g_the_gpu->get_tcgen05_tmem_manager().reset();
+          yasai_func::mbar_reset_all();
           cta_launched += csize;
         }
     kernel.set_all_ctas_issued();
@@ -3652,6 +3673,7 @@ void cuda_sim::gpgpu_cuda_ptx_sim_main_func(kernel_info_t &kernel,
           gpgpu_ctx->the_gpgpusim->g_the_gpu->getShaderCoreConfig()->warp_size);
       cta.execute(cp_count, temp);
       gpgpu_ctx->the_gpgpusim->g_the_gpu->get_tcgen05_tmem_manager().reset();  // yasai: see above
+      yasai_func::mbar_reset_all();
 
 #if (CUDART_VERSION >= 5000)
       gpgpu_ctx->device_runtime->launch_all_device_kernels();
@@ -3803,6 +3825,14 @@ void functionalCoreSim::execute(int inst_count, unsigned ctaid_cp) {
         if (i >= m_yasai_wait_bar.size() || m_yasai_wait_bar[i] == -1)
           m_warpAtBarrier[i] = false;
     }
+    // yasai: YASAI_HANG_ROUNDS, as for clusters (cuda_sim::gpgpu_cuda_ptx_sim_main_func).
+    static const unsigned long hang_rounds =
+        getenv("YASAI_HANG_ROUNDS") ? strtoul(getenv("YASAI_HANG_ROUNDS"), NULL, 10) : 0;
+    if (hang_rounds != 0 && (unsigned long)(count / m_warp_count) == hang_rounds) {
+      fprintf(stderr, "yasai: CTA %u still live after %lu rounds\n", ctaid_cp, hang_rounds);
+      yasai_dump_warps(stderr);
+      abort();
+    }
   }
 
   checkpoint *g_checkpoint;
@@ -3889,15 +3919,19 @@ void functionalCoreSim::yasai_join_cluster(yasai_func::ClusterState *cluster, un
 
 void functionalCoreSim::yasai_dump_warps(FILE *out) const {
   for (unsigned w = 0; w < m_warp_count; w++) {
+    std::map<unsigned, unsigned> lanes_at;  // PC -> live lanes there
     for (unsigned l = 0; l < m_warp_size; l++) {
       ptx_thread_info *t = m_thread[w * m_warp_size + l];
-      if (t == NULL || t->is_done()) continue;
-      const ptx_instruction *pI = t->get_inst();
-      fprintf(out, "  rank %u warp %u lane %u live %u: %s:%u %s\n", m_yasai_rank, w, l,
-              m_liveThreadCount[w], pI ? pI->source_file() : "?", pI ? pI->source_line() : 0,
-              pI ? pI->get_source() : "?");
-      break;
+      if (t != NULL && !t->is_done()) lanes_at[t->get_pc()]++;
     }
+    if (lanes_at.empty()) continue;
+    for (const auto &e : lanes_at) {
+      const ptx_instruction *pI = m_gpu->gpgpu_ctx->pc_to_instruction(e.first);
+      fprintf(out, "  rank %u warp %u: %u lanes at %s:%u %s\n", m_yasai_rank, w, e.second,
+              pI ? pI->source_file() : "?", pI ? pI->source_line() : 0,
+              pI ? pI->get_source() : "?");
+    }
+    m_simt_stack[w]->print(out);
   }
 }
 
@@ -4038,6 +4072,7 @@ void functionalCoreSim::executeWarp(unsigned i, bool &allAtBarrier,
                                     bool &someOneLive) {
   if (!m_warpAtBarrier[i] && m_liveThreadCount[i] != 0) {
     warp_inst_t inst = getExecuteWarp(i);
+    yasai_func::g_wait_failed = false;
     execute_warp_inst_t(inst, i);
     yasai_func::count_warp_inst(inst.active_count());
     if (yasai_func::tracing()) yasai_emit_warp(inst, i);
@@ -4048,6 +4083,10 @@ void functionalCoreSim::executeWarp(unsigned i, bool &allAtBarrier,
     // involve only the warps that use them.
     if (inst.op == BARRIER_OP) yasai_barrier(inst, i);
     updateSIMTStack(i, &inst);
+    // yasai: a diverged warp whose active path found an mbarrier phase incomplete lets its
+    // other path run (FlashMLA SM100 decode: 31 lanes wait for a barrier that the elected
+    // lane, parked on the other path, completes by issuing the TMA loads).
+    if (yasai_func::g_wait_failed) m_simt_stack[i]->yasai_yield();
   }
   if (m_liveThreadCount[i] > 0) someOneLive = true;
   if (!m_warpAtBarrier[i] && m_liveThreadCount[i] > 0) allAtBarrier = false;
@@ -4091,6 +4130,26 @@ void functionalCoreSim::yasai_barrier(const warp_inst_t &inst, unsigned w) {
     return;
   }
   if (m_yasai_wait_bar.size() != m_warp_count) m_yasai_wait_bar.assign(m_warp_count, -1);
+  if (m_yasai_bar_lanes.size() != m_warp_count) m_yasai_bar_lanes.assign(m_warp_count, 0);
+  // A diverged warp whose active lanes reach the barrier while its other live lanes are on
+  // another path (FlashMLA SM100 decode: 31 lanes at barrier.sync 12, 384 while the elected
+  // lane still has to issue the TMA loads that the other warps wait for) lets that path run,
+  // as independent thread scheduling does; the warp counts as arrived once all its live lanes
+  // have arrived.
+  {
+    uint32_t live = 0, act = 0;
+    for (unsigned l = 0; l < m_warp_size; l++) {
+      ptx_thread_info *t = m_thread[w * m_warp_size + l];
+      if (t != NULL && !t->is_done()) live |= 1u << l;
+      if (inst.active(l)) act |= 1u << l;
+    }
+    m_yasai_bar_lanes[w] |= act;
+    if ((m_yasai_bar_lanes[w] & live) != live && m_simt_stack[w]->yasai_can_yield()) {
+      yasai_func::g_wait_failed = true;  // executeWarp yields after the SIMT stack update
+      return;
+    }
+    m_yasai_bar_lanes[w] = 0;
+  }
   const unsigned need = count == (unsigned)-1 ? cta_threads : count;
   unsigned &arrived = m_yasai_bar_arrived[id];
   arrived += m_warp_size;

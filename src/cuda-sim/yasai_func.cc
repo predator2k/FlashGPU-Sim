@@ -492,6 +492,8 @@ float minifloat_decode(MiniFloat f, unsigned bits) {
   return neg ? -v : v;
 }
 
+thread_local bool g_wait_failed = false;
+
 uint16_t minifloat_encode_f16(float f) {
   uint32_t x;
   memcpy(&x, &f, 4);
@@ -583,6 +585,8 @@ void mbar_canonical(uint64_t &cta_key, uint32_t &addr) {
   if (rank < g_cluster->cta_key.size()) cta_key = g_cluster->cta_key[rank];
   addr = uint32_t(off);
 }
+
+void mbar_reset_all() { g_mbars.clear(); }
 
 void mbar_init(uint64_t cta_key, uint32_t addr, uint32_t count) {
   mbar_canonical(cta_key, addr);

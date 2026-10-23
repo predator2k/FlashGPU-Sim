@@ -467,12 +467,12 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
     snprintf(key, sizeof key,
              "kind=%d M=%u N=%u K=%u ws=%d pair=%d a_tmem=%d a_mn=%d b_mn=%d "
              "c=%u bs=%d nsf=%u "
-             "a_swz=%u b_swz=%u a_lane=%u d_lane=%u",
+             "a_swz=%u b_swz=%u a_lane=%u d_lane=%u d_col=%u",
              int(kind), M, N, K, int(ws), int(pair), int(a_tmem), int(a_mn),
              int(b_mn), c_format, int(block_scale), nsf,
              a_tmem ? 0u : unsigned(a_desc_v >> 61), unsigned(b_desc_v >> 61),
              a_tmem ? (a_tmem_addr >> 16) & 0xFFFF : 0u,
-             (d_addr >> 16) & 0xFFFF);
+             (d_addr >> 16) & 0xFFFF, d_addr & 0xFFFF);
     if (seen.insert(key).second)
       fprintf(stderr, "yasai-umma %s\n", key);
   }
