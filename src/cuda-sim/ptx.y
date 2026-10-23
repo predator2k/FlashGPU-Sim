@@ -705,6 +705,7 @@ option: type_spec
 	| ACQ_REL_OPTION { recognizer->add_option(ACQ_REL_OPTION); }
 	| SC_OPTION { recognizer->add_option(SC_OPTION); }
 	| IGNORED_OPTION { }
+	| WEAK_DIRECTIVE { } /* yasai: .weak memory order on ld/st (the default order) */
 	| GPU_OPTION { recognizer->add_option(GPU_OPTION); }
 	| L2_CACHE_HINT_OPTION { recognizer->add_option(L2_CACHE_HINT_OPTION); }
 	| L2_OPTION { recognizer->add_option(L2_OPTION); }
