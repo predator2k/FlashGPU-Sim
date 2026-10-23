@@ -112,7 +112,15 @@ void collect_inst_liveness_regs(const ptx_instruction *inst,
   const std::vector<operand_info> &operands = inst->get_operands();
   for (unsigned i = 0; i < operands.size(); ++i) {
     const operand_info &op = operands[i];
-    if (has_dst && i == 0) {
+    // yasai: a memory operand in the destination position ([addr] of cp.async,
+    // sst, sust and similar stores) reads its address registers; treating them
+    // as definitions ended the live range of a loop-carried address register
+    // inside the loop, so another register was aliased onto it and overwrote it
+    // (FlashMLA's sparse prefill copied K/V to a barrier address).
+    if (has_dst && i == 0 &&
+        (op.is_memory_operand() || op.is_memory_operand2())) {
+      collect_operand_liveness_regs(op, uses);
+    } else if (has_dst && i == 0) {
       collect_operand_liveness_regs(op, defs);
       if (dst_is_accumulator || op.get_operand_lohi() != 0 ||
           op.get_double_operand_type() != 0) {
@@ -426,6 +434,22 @@ void run_ptx_register_allocation(function_info *func) {
   const unsigned total_safe_physical = allocate_intervals(
       sorted, &linear_read_before_def, &group_stats, enable ? &aliases : NULL);
 
+  // yasai: YASAI_REGALLOC_DEBUG=<register name> prints the alias chosen for
+  // that register and every register aliased to it, with their live intervals.
+  if (const char *dbg = getenv("YASAI_REGALLOC_DEBUG")) {
+    for (const auto &a : aliases) {
+      if (a.first->name() == dbg || a.second->name() == dbg) {
+        const auto i1 = intervals.find(a.first), i2 = intervals.find(a.second);
+        printf("yasai-regalloc %s %s -> %s [%u,%u] [%u,%u]\n",
+               func->m_name.c_str(), a.first->name().c_str(),
+               a.second->name().c_str(),
+               i1 == intervals.end() ? 0 : i1->second.start,
+               i1 == intervals.end() ? 0 : i1->second.end,
+               i2 == intervals.end() ? 0 : i2->second.start,
+               i2 == intervals.end() ? 0 : i2->second.end);
+      }
+    }
+  }
   if (enable)
     func->m_reg_alloc_aliases.swap(aliases);
 

@@ -2009,6 +2009,15 @@ void cp_async_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   unsigned char buf[16] = {0};
   if (source_bytes > 0) gmem->read(gmem_addr, source_bytes, buf);
   smem->write(smem_addr, cp_size, buf, thread, pI);
+  // yasai: YASAI_CPASYNC_DEBUG=<n> prints the first n cp.async copies.
+  static const long cp_debug = getenv("YASAI_CPASYNC_DEBUG") ? atol(getenv("YASAI_CPASYNC_DEBUG")) : 0;
+  static long cp_printed = 0;
+  if (cp_printed < cp_debug) {
+    ++cp_printed;
+    printf("yasai-cpasync tid=%u smem=0x%llx gmem=0x%llx bytes=%u first=0x%02x%02x\n",
+           thread->get_hw_tid(), (unsigned long long)smem_addr, (unsigned long long)gmem_addr,
+           source_bytes, buf[1], buf[0]);
+  }
 
   thread->m_last_effective_address = gmem_addr;
   thread->m_last_memory_space = global_space;

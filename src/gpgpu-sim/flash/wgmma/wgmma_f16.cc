@@ -183,14 +183,14 @@ void wgmma_m64nXk16_16bit_impl(const ptx_instruction *pI, core_t *core,
     }
   }
 
-  // yasai: YASAI_WGMMA_DEBUG=2 prints, for the first 64 wgmma executions, the
+  // yasai: YASAI_WGMMA_DEBUG=2 prints, for the first 256 wgmma executions, the
   // shape, operand sources, the first thread's warp id and A rows 0 and 16 (k
   // 0..7); YASAI_WGMMA_DEBUG_N limits the output to one N.
   if (getenv("YASAI_WGMMA_DEBUG") && atoi(getenv("YASAI_WGMMA_DEBUG")) >= 2) {
     static int printed2 = 0;
     const int want_n =
         getenv("YASAI_WGMMA_DEBUG_N") ? atoi(getenv("YASAI_WGMMA_DEBUG_N")) : 0;
-    if ((want_n == 0 || want_n == N) && printed2++ < 64) {
+    if ((want_n == 0 || want_n == N) && printed2++ < 256) {
       printf(
           "yasai-wgmma2 N=%d K=%d a_reg=%d ma=%d mb=%d threads=%u tid0=%u A0:",
           N, K, (int)a_from_register, major_a, major_b, thread_count,

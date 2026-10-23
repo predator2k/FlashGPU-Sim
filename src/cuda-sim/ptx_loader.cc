@@ -28,6 +28,8 @@
 
 #include "ptx_loader.h"
 #include <dirent.h>
+#include <cctype>
+#include <string>
 #include <cerrno>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -319,6 +321,99 @@ std::string prepare_sass_ptxline_guide(gpgpu_context *ctx, const char *source,
 }
 }  // namespace
 
+
+namespace {
+// yasai: true when line (without leading/trailing blanks) is exactly "{" or "}".
+bool yasai_is_brace_line(const std::string &line, char brace) {
+  size_t b = line.find_first_not_of(" \t\r");
+  if (b == std::string::npos || line[b] != brace) return false;
+  size_t e = line.find_first_not_of(" \t\r", b + 1);
+  return e == std::string::npos;
+}
+
+// yasai: name of the label that line defines ("NAME:" at the start of the line), or "".
+std::string yasai_label_definition(const std::string &line) {
+  size_t b = line.find_first_not_of(" \t");
+  if (b == std::string::npos) return "";
+  size_t e = b;
+  while (e < line.size() && (isalnum((unsigned char)line[e]) || line[e] == '_' || line[e] == '$'))
+    ++e;
+  if (e == b || e >= line.size() || line[e] != ':') return "";
+  if (e + 1 < line.size() && line[e + 1] == ':') return "";  // "::" is a state space suffix
+  return line.substr(b, e - b);
+}
+
+// yasai: replaces whole-word occurrences of from by to in line.
+void yasai_replace_word(std::string &line, const std::string &from, const std::string &to) {
+  auto is_word = [](char c) { return isalnum((unsigned char)c) || c == '_' || c == '$'; };
+  size_t pos = 0;
+  while ((pos = line.find(from, pos)) != std::string::npos) {
+    const bool left_ok = pos == 0 || (!is_word(line[pos - 1]) && line[pos - 1] != '%');
+    const bool right_ok = pos + from.size() >= line.size() || !is_word(line[pos + from.size()]);
+    if (left_ok && right_ok) {
+      line.replace(pos, from.size(), to);
+      pos += to.size();
+    } else {
+      pos += from.size();
+    }
+  }
+}
+}  // namespace
+
+// yasai: PTX scopes labels by "{ }" blocks, and inline asm relies on it (libtorch_cuda and
+// FlashMLA repeat "LAB_WAIT:" / "DONE:" in one asm block per mbarrier wait). The parser keeps one
+// label namespace per function, so a branch went to another block's label of the same name and
+// skipped code (FlashMLA's sparse prefill copied only part of a K/V block). Labels defined inside
+// a block nested in a function body (depth 2 or more, on lines that hold only the brace) are
+// renamed to <name>__yb<k>, a name unique to the block, in every line of that block. The text
+// keeps its line count. Returns text unchanged (and *changed false) when no such label exists.
+std::string yasai_scope_block_labels(const std::string &text, bool *changed) {
+  *changed = false;
+  if (text.find("{\n") == std::string::npos) return text;
+  std::vector<std::string> lines;
+  {
+    size_t start = 0;
+    while (start <= text.size()) {
+      size_t nl = text.find('\n', start);
+      if (nl == std::string::npos) {
+        lines.push_back(text.substr(start));
+        break;
+      }
+      lines.push_back(text.substr(start, nl - start));
+      start = nl + 1;
+    }
+  }
+  std::vector<size_t> open;  // line index of each open block
+  unsigned next_block = 0;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    if (yasai_is_brace_line(lines[i], '{')) {
+      open.push_back(i);
+    } else if (yasai_is_brace_line(lines[i], '}') && !open.empty()) {
+      const size_t b = open.back();
+      open.pop_back();
+      if (open.empty()) continue;  // a function body: its labels are function-wide
+      std::vector<std::string> defs;
+      for (size_t j = b + 1; j < i; ++j) {
+        std::string d = yasai_label_definition(lines[j]);
+        if (!d.empty() && d.find("__yb") == std::string::npos) defs.push_back(d);
+      }
+      if (defs.empty()) continue;
+      const std::string suffix = "__yb" + std::to_string(next_block++);
+      for (const std::string &d : defs)
+        for (size_t j = b + 1; j < i; ++j) yasai_replace_word(lines[j], d, d + suffix);
+      *changed = true;
+    }
+  }
+  if (!*changed) return text;
+  std::string out;
+  out.reserve(text.size() + 64);
+  for (size_t i = 0; i < lines.size(); ++i) {
+    out += lines[i];
+    if (i + 1 < lines.size()) out += '\n';
+  }
+  return out;
+}
+
 symbol_table *gpgpu_context::gpgpu_ptx_sim_load_ptx_from_string(
     const char *p, unsigned source_num) {
   const std::string normalized = prepare_sass_ptxline_guide(this, p, nullptr);
@@ -331,6 +426,9 @@ symbol_table *gpgpu_context::gpgpu_ptx_sim_load_ptx_from_string(
     fclose(fp);
   }
   symbol_table *symtab = init_parser(buf);
+  bool yasai_changed = false;
+  const std::string yasai_scoped = yasai_scope_block_labels(p, &yasai_changed);
+  if (yasai_changed) p = yasai_scoped.c_str();
   ptx_lex_init(&(ptx_parser->scanner));
   ptx__scan_string(p, ptx_parser->scanner);
   int errors = ptx_parse(ptx_parser->scanner, ptx_parser);
@@ -361,8 +459,23 @@ symbol_table *gpgpu_context::gpgpu_ptx_sim_load_ptx_from_filename(
     const char *filename) {
   const std::string normalized =
       prepare_sass_ptxline_guide(this, nullptr, filename);
-  symbol_table *symtab =
-      init_parser(normalized.empty() ? filename : normalized.c_str());
+  std::string parse_path = normalized.empty() ? filename : normalized;
+  {
+    // yasai: block-scoped labels (see yasai_scope_block_labels) are renamed in a copy.
+    std::ifstream in(parse_path);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    bool changed = false;
+    const std::string scoped = yasai_scope_block_labels(ss.str(), &changed);
+    if (changed) {
+      std::string base = parse_path.substr(parse_path.find_last_of('/') + 1);
+      parse_path = base + ".yasai_scoped.ptx";
+      std::ofstream out(parse_path);
+      out << scoped;
+      printf("GPGPU-Sim PTX: block-scoped labels renamed in %s\n", parse_path.c_str());
+    }
+  }
+  symbol_table *symtab = init_parser(parse_path.c_str());
   printf("GPGPU-Sim PTX: finished parsing EMBEDDED .ptx file %s\n", filename);
   return symtab;
 }
