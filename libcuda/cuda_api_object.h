@@ -74,6 +74,12 @@ struct CUctx_st {
   void add_binary(symbol_table *symtab, unsigned fat_cubin_handle) {
     m_code[fat_cubin_handle] = symtab;
     m_last_fat_cubin_handle = fat_cubin_handle;
+    // yasai: one fat binary can hold many PTX modules (a library built with relocatable
+    // device code, e.g. NCCL); each module's table is kept so register_function finds its
+    // kernels, while m_code keeps the last table per handle as before.
+    bool known = false;
+    for (symbol_table *t : m_all_code) known = known || (t == symtab);
+    if (!known) m_all_code.push_back(symtab);
   }
 
   void add_ptxinfo(const char *deviceFun,
@@ -110,6 +116,9 @@ struct CUctx_st {
                          const char *deviceFun) {
     if (m_code.find(fat_cubin_handle) != m_code.end()) {
       symbol *s = m_code[fat_cubin_handle]->lookup(deviceFun);
+      // yasai: fall back to every loaded module (see add_binary).
+      for (size_t k = 0; s == NULL && k < m_all_code.size(); ++k)
+        s = m_all_code[k]->lookup(deviceFun);
       if (s != NULL) {
         function_info *f = s->get_pc();
         assert(f != NULL);
@@ -156,6 +165,7 @@ struct CUctx_st {
   std::map<unsigned, symbol_table *>
       m_code;  // fat binary handle => global symbol table
   unsigned m_last_fat_cubin_handle;
+  std::vector<symbol_table *> m_all_code;  // yasai: every module table, in load order
   std::map<const void *, function_info *>
       m_kernel_lookup;  // unique id (CUDA app function address) => kernel entry
                         // point
