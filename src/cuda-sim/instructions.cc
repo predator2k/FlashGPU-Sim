@@ -2110,12 +2110,15 @@ void bfi_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       assert(0);
       break;
   }
+  // yasai: bit operations in 64 bits; the 32-bit loop dropped every bit at position 32 or
+  // above of bfi.b64 (FlashMLA's combine kernel packs four bf16 values with bfi.b64).
   data = src2_data;
+  if (i_type == B32_TYPE) data.u64 &= 0xFFFFFFFFull;
   unsigned pos = src3_data.u32 & 0xFF;
   unsigned len = src4_data.u32 & 0xFF;
-  for (i = 0; i < len && pos + i < max; i++) {
-    data.u32 = (~((0x00000001) << (pos + i))) & data.u32;
-    data.u32 = data.u32 | ((src1_data.u32 & ((0x00000001) << (i))) << (pos));
+  for (i = 0; i < (int)len && pos + i < (unsigned)max; i++) {
+    const unsigned long long bit = 1ull << (pos + i);
+    data.u64 = (data.u64 & ~bit) | (((src1_data.u64 >> i) & 1ull) << (pos + i));
   }
   thread->set_operand_value(dst, data, i_type, thread, pI);
 }

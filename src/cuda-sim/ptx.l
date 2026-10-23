@@ -532,6 +532,7 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.before_thread_sync TC; return TCGEN05_BEFORE_THREAD_SYNC_OPTION;
 \.after_thread_sync TC; return TCGEN05_AFTER_THREAD_SYNC_OPTION;
 \.try_wait TC; return TRY_WAIT_OPTION;
+\.test_wait TC; return TRY_WAIT_OPTION; /* yasai: the non-blocking form; in the functional mode both report the phase state */
 \.wait TC; return WAIT_OPTION;
 \.parity TC; return PARITY_OPTION;
 \.mbarrier_init TC; return MBARRIER_INIT_OPTION;

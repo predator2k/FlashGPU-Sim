@@ -190,6 +190,15 @@ static void handle_ld_st_matrix_inst_impl(const ptx_instruction *pI,
           thread->m_shared_mem->write(address, transfer_size,
                                       reinterpret_cast<char *>(data.u16_2),
                                       thread, pI);
+          // yasai: YASAI_WGMMA_DEBUG=3 prints the first 64 stmatrix stores
+          // (lane 0 of each).
+          if (getenv("YASAI_WGMMA_DEBUG") &&
+              atoi(getenv("YASAI_WGMMA_DEBUG")) >= 3 && lane_id == 0) {
+            static int printed = 0;
+            if (printed++ < 64)
+              printf("yasai-stmatrix tid0=%u matrix=%d addr=0x%x data=0x%08x\n",
+                     tid_lane0, (int)matrix_id, address, data.u32);
+          }
         }
       } else {
         // Transpose: load non-contiguous elements from different rows

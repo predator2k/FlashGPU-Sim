@@ -183,6 +183,42 @@ void wgmma_m64nXk16_16bit_impl(const ptx_instruction *pI, core_t *core,
     }
   }
 
+  // yasai: YASAI_WGMMA_DEBUG=2 prints, for the first 64 wgmma executions, the
+  // shape, operand sources, the first thread's warp id and A rows 0 and 16 (k
+  // 0..7); YASAI_WGMMA_DEBUG_N limits the output to one N.
+  if (getenv("YASAI_WGMMA_DEBUG") && atoi(getenv("YASAI_WGMMA_DEBUG")) >= 2) {
+    static int printed2 = 0;
+    const int want_n =
+        getenv("YASAI_WGMMA_DEBUG_N") ? atoi(getenv("YASAI_WGMMA_DEBUG_N")) : 0;
+    if ((want_n == 0 || want_n == N) && printed2++ < 64) {
+      printf(
+          "yasai-wgmma2 N=%d K=%d a_reg=%d ma=%d mb=%d threads=%u tid0=%u A0:",
+          N, K, (int)a_from_register, major_a, major_b, thread_count,
+          wgmma_thread(core, inst, 0)->get_hw_tid());
+      for (int k = 0; k < 8; ++k)
+        printf(" %.4f", A_mat[k]);
+      printf(" A16:");
+      for (int k = 0; k < 8; ++k)
+        printf(" %.4f", A_mat[16 * K + k]);
+      printf(" B0:");
+      for (int k = 0; k < 4; ++k)
+        printf(" %.4f", B_mat[k]);
+      if (!a_from_register) {
+        const uint64_t a_desc =
+            representative_thread
+                ->get_operand_value(src_a, src_a, U64_TYPE,
+                                    representative_thread, 0)
+                .u64;
+        printf(" a_desc=0x%llx a(0,0)=0x%x a(1,0)=0x%x a(0,8)=0x%x",
+               (unsigned long long)a_desc,
+               wgmma_gmma_k_major_smem_addr(a_desc, 0, 0, 2, K),
+               wgmma_gmma_k_major_smem_addr(a_desc, 1, 0, 2, K),
+               wgmma_gmma_k_major_smem_addr(a_desc, 0, 8, 2, K));
+      }
+      printf(" b_desc=0x%llx\n", (unsigned long long)b_desc);
+    }
+  }
+
   for (unsigned thrd = 0; thrd < thread_count; ++thrd) {
     ptx_thread_info *thread = wgmma_thread(core, inst, thrd);
     unsigned lane = wgmma_lane(thread);

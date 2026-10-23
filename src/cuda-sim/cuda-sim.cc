@@ -946,6 +946,16 @@ void ptx_instruction::set_fp_or_int_archop() {
     } else
       oprnd_type = INT_OP;
 
+  } else if (m_scalar_type.empty()) {
+    // yasai: a typeless instruction that the list above does not name (FlashMLA's scheduler
+    // kernel has one) counts as integer instead of failing the type assertion.
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      printf("GPGPU-Sim PTX: note: typeless instruction '%s' treated as INT_OP\n",
+             m_source.c_str());
+    }
+    oprnd_type = INT_OP;
   } else {
     if (get_type() == F16_TYPE || get_type() == F32_TYPE ||
         get_type() == F32X2_TYPE ||
@@ -976,7 +986,8 @@ void ptx_instruction::set_mul_div_or_other_archop() {
       (m_opcode != TCGEN05_MMA_OP) && (m_opcode != TCGEN05_COMMIT_OP) &&
       (m_opcode != TCGEN05_LD_OP) && (m_opcode != TCGEN05_ST_OP) &&
       (m_opcode != TCGEN05_WAIT_OP) && (m_opcode != TCGEN05_CP_OP) &&
-      (m_opcode != TCGEN05_SHIFT_OP) && (m_opcode != TCGEN05_FENCE_OP)) {
+      (m_opcode != TCGEN05_SHIFT_OP) && (m_opcode != TCGEN05_FENCE_OP) &&
+      !m_scalar_type.empty()) {  // yasai: typeless instructions keep OTHER_OP
     if (get_type() == F64_TYPE || get_type() == FF64_TYPE) {
       switch (get_opcode()) {
         case MUL_OP:
@@ -3793,7 +3804,7 @@ void functionalCoreSim::executeWarp(unsigned i, bool &allAtBarrier,
 
 // yasai: handles a bar instruction of warp w. A barrier whose thread count is absent or covers
 // the whole CTA keeps the original CTA-wide behavior (the warp waits until every live warp is at
-// a barrier). A named barrier (count below the CTA's threads, or bar.arrive) counts 32 threads
+// a barrier). Any other barrier (an explicit thread count, a nonzero id, or bar.arrive) counts 32 threads
 // per arriving warp; bar.sync warps wait on that barrier id, and when the count is reached all
 // warps waiting on the id continue.
 void functionalCoreSim::yasai_barrier(const warp_inst_t &inst, unsigned w) {
@@ -3815,7 +3826,11 @@ void functionalCoreSim::yasai_barrier(const warp_inst_t &inst, unsigned w) {
       count = t0->get_operand_value(op1, op1, U32_TYPE, t0, 1).u32;
     }
   }
-  const bool counted = count != (unsigned)-1 && count < cta_threads;
+  // A barrier is counted per id unless it is the plain CTA-wide form (id 0, no thread count).
+  // Before, a named barrier whose count equaled the CTA size (FlashMLA's 256-thread barriers
+  // between its two warpgroups) took the CTA-wide path, which releases when every warp waits
+  // at any barrier, so a warpgroup passed a barrier the other one had not reached.
+  const bool counted = count != (unsigned)-1 || id != 0;
   if (pb->bar_type != ARRIVE && !counted) {
     m_warpAtBarrier[w] = true;
     return;
