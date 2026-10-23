@@ -460,4 +460,27 @@ bool mbar_phase_done(uint64_t cta_key, uint32_t addr, uint32_t parity) {
 
 void mbar_inval(uint64_t cta_key, uint32_t addr) { g_mbars.erase({cta_key, addr}); }
 
+namespace {
+
+// Registered function symbols in handle order, and the reverse map.
+std::vector<const symbol *> g_func_symbols;
+std::unordered_map<const symbol *, uint64_t> g_func_handles;
+
+}  // namespace
+
+uint64_t function_handle(const symbol *s) {
+  auto it = g_func_handles.find(s);
+  if (it != g_func_handles.end()) return it->second;
+  const uint64_t h = kFunctionHandleTag | uint64_t(g_func_symbols.size());
+  g_func_symbols.push_back(s);
+  g_func_handles.emplace(s, h);
+  return h;
+}
+
+const symbol *function_of(uint64_t value) {
+  if ((value & 0xffff000000000000ull) != kFunctionHandleTag) return nullptr;
+  const uint64_t idx = value & 0x0000ffffffffffffull;
+  return idx < g_func_symbols.size() ? g_func_symbols[idx] : nullptr;
+}
+
 }  // namespace yasai_func

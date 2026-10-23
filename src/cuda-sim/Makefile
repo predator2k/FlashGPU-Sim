@@ -138,6 +138,7 @@ endif
 
 $(OUTPUT_DIR)/instructions.o: $(OUTPUT_DIR)/instructions.h $(OUTPUT_DIR)/ptx.tab.c
 $(OUTPUT_DIR)/cuda_device_printf.o: $(OUTPUT_DIR)/ptx.tab.c
+$(OUTPUT_DIR)/yasai_func.o: $(OUTPUT_DIR)/ptx.tab.c
 $(OUTPUT_DIR)/ptx_ir.o: $(OUTPUT_DIR)/ptx.tab.c $(OUTPUT_DIR)/ptx_parser_decode.def
 $(OUTPUT_DIR)/ptx_loader.o: $(OUTPUT_DIR)/ptx.tab.c $(OUTPUT_DIR)/ptx_parser_decode.def
 $(OUTPUT_DIR)/ptx_parser.o: $(OUTPUT_DIR)/ptx.tab.c $(OUTPUT_DIR)/ptx_parser_decode.def

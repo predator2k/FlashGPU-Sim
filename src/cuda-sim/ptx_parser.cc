@@ -27,6 +27,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "ptx_parser.h"
+#include "yasai_func.h"
 #include "../../libcuda/gpgpu_context.h"
 #include "ptx_ir.h"
 
@@ -1118,6 +1119,24 @@ void ptx_recognizer::change_operand_neg() {
 void ptx_recognizer::add_literal_int(long long value) {
   PTX_PARSE_GPPRINTF("add_literal_int");
   g_operands.push_back(operand_info(value, gpgpu_ctx));
+}
+
+void ptx_recognizer::add_function_address_literal(const char *identifier) {
+  PTX_PARSE_GPPRINTF("add_function_address_literal");
+  const symbol *s = g_current_symbol_table->lookup(identifier);
+  if (s == NULL) {
+    printf("GPGPU-Sim PTX: ERROR ** initializer names unknown symbol '%s'\n", identifier);
+    abort();
+  }
+  g_operands.push_back(
+      operand_info((long long)yasai_func::function_handle(s), gpgpu_ctx));
+}
+
+void ptx_recognizer::add_indirect_call(int opcode, const char *target_reg) {
+  PTX_PARSE_GPPRINTF("add_indirect_call");
+  add_opcode(opcode);
+  add_scalar_operand(target_reg);
+  add_instruction();
 }
 
 void ptx_recognizer::add_literal_float(float value) {

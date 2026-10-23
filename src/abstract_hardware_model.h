@@ -457,6 +457,8 @@ class gpgpu_functional_sim_config {
 
 class gpgpu_t {
  public:
+  // yasai: first address above the simulated device heap (cudaMemcpyDefault direction).
+  unsigned long long dev_malloc_top() const { return m_dev_malloc; }
   gpgpu_t(const gpgpu_functional_sim_config &config, gpgpu_context *ctx);
   // backward pointer
   class gpgpu_context *gpgpu_ctx;

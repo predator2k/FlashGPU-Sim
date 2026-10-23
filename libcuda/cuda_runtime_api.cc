@@ -1451,24 +1451,26 @@ cudaMemcpyInternal(void *dst, const void *src, size_t count,
     ctx->the_gpgpusim->g_stream_manager->push(
         stream_operation((size_t)src, (size_t)dst, count, 0));
   else if (kind == cudaMemcpyDefault) {
-    if ((size_t)src >= GLOBAL_HEAP_START) {
-      if ((size_t)dst >= GLOBAL_HEAP_START)
-        ctx->the_gpgpusim->g_stream_manager->push(stream_operation(
-            (size_t)src, (size_t)dst, count, 0));  // device to device
-      else
-        ctx->the_gpgpusim->g_stream_manager->push(
-            stream_operation((size_t)src, dst, count, 0));  // device to host
-    } else {
-      if ((size_t)dst >= GLOBAL_HEAP_START)
-        ctx->the_gpgpusim->g_stream_manager->push(
-            stream_operation(src, (size_t)dst, count, 0));
-      else {
-        printf(
-            "GPGPU-Sim PTX: cudaMemcpy - ERROR : unsupported transfer: host to "
-            "host\n");
-        abort();
-      }
-    }
+    // yasai: infer the direction from the simulated heap and the registered host windows
+    // (host stack and heap addresses are also above GLOBAL_HEAP_START on x86-64).
+    gpgpu_t *gpu = GPGPUSim_Context(ctx)->get_device()->get_gpgpu();
+    auto is_dev = [&](const void *p) {
+      const unsigned long long a = (unsigned long long)p;
+      return (a >= GLOBAL_HEAP_START && a < gpu->dev_malloc_top()) ||
+             host_window::contains(a, 1);
+    };
+    const bool sd = is_dev(src), dd = is_dev(dst);
+    if (sd && dd)
+      ctx->the_gpgpusim->g_stream_manager->push(
+          stream_operation((size_t)src, (size_t)dst, count, 0));  // device to device
+    else if (sd)
+      ctx->the_gpgpusim->g_stream_manager->push(
+          stream_operation((size_t)src, dst, count, 0));  // device to host
+    else if (dd)
+      ctx->the_gpgpusim->g_stream_manager->push(
+          stream_operation(src, (size_t)dst, count, 0));  // host to device
+    else
+      memcpy(dst, src, count);  // host to host
   } else {
     printf("GPGPU-Sim PTX: cudaMemcpy - ERROR : unsupported cudaMemcpyKind\n");
     abort();
@@ -1657,6 +1659,28 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyAsyncInternal(
       ctx->the_gpgpusim->g_stream_manager->push(
           stream_operation((size_t)src, (size_t)dst, count, s));
       break;
+    case cudaMemcpyDefault: {
+      // yasai: infer the direction. An address is device memory when it lies in the
+      // simulated heap [GLOBAL_HEAP_START, top) or in a registered host window (which kernels
+      // and device copies access in place); other addresses are host memory.
+      gpgpu_t *gpu = GPGPUSim_Context(ctx)->get_device()->get_gpgpu();
+      auto is_dev = [&](const void *p) {
+        const unsigned long long a = (unsigned long long)p;
+        return (a >= GLOBAL_HEAP_START && a < gpu->dev_malloc_top()) ||
+               host_window::contains(a, 1);
+      };
+      const bool sd = is_dev(src), dd = is_dev(dst);
+      if (sd && dd)
+        ctx->the_gpgpusim->g_stream_manager->push(
+            stream_operation((size_t)src, (size_t)dst, count, s));
+      else if (sd)
+        ctx->the_gpgpusim->g_stream_manager->push(stream_operation((size_t)src, dst, count, s));
+      else if (dd)
+        ctx->the_gpgpusim->g_stream_manager->push(stream_operation(src, (size_t)dst, count, s));
+      else
+        memcpy(dst, src, count);  // host to host
+      break;
+    }
     default:
       abort();
   }
@@ -3118,9 +3142,87 @@ __host__ cudaError_t CUDARTAPI cudaStreamGetPriority(cudaStream_t hStream,
 
 __host__ cudaError_t CUDARTAPI cudaDeviceGetPCIBusId(char *pciBusId, int len,
                                                      int device) {
-  // yasai: a stable made-up bus id per simulated device (NCCL uses it for topology only).
+  // yasai: a stable made-up bus id per simulated device, bus = YASAI_PCI_BUS_BASE (default
+  // 0xd0) + device. The base must not be a bus of the host, because NCCL reads the device's
+  // sysfs entry when one exists (bus 1 is a real controller on the lab hosts).
   if (pciBusId == NULL || len <= 0) return g_last_cudaError = cudaErrorInvalidValue;
-  snprintf(pciBusId, len, "0000:%02x:00.0", (device + 1) & 0xff);
+  const char *base_env = getenv("YASAI_PCI_BUS_BASE");
+  const unsigned base = base_env ? unsigned(strtoul(base_env, NULL, 0)) : 0xd0u;
+  snprintf(pciBusId, len, "0000:%02x:00.0", (base + device) & 0xff);
+  return g_last_cudaError = cudaSuccess;
+}
+
+// yasai: inverse of cudaDeviceGetPCIBusId above (device = bus - YASAI_PCI_BUS_BASE).
+__host__ cudaError_t CUDARTAPI cudaDeviceGetByPCIBusId(int *device, const char *pciBusId) {
+  unsigned dom = 0, bus = 0, dev = 0, fn = 0;
+  const char *base_env = getenv("YASAI_PCI_BUS_BASE");
+  const unsigned base = base_env ? unsigned(strtoul(base_env, NULL, 0)) : 0xd0u;
+  if (device == NULL || pciBusId == NULL ||
+      sscanf(pciBusId, "%x:%x:%x.%x", &dom, &bus, &dev, &fn) != 4 || bus < base)
+    return g_last_cudaError = cudaErrorInvalidValue;
+  *device = int(bus - base);
+  return g_last_cudaError = cudaSuccess;
+}
+
+// yasai: graph construction calls that NCCL uses only while a stream is being captured; the
+// simulator never reports capturing (cudaStreamIsCapturing), so these are not reached.
+__host__ cudaError_t CUDARTAPI cudaGraphAddDependencies(cudaGraph_t, const cudaGraphNode_t *,
+                                                        const cudaGraphNode_t *,
+                                                        const cudaGraphEdgeData *, size_t) {
+  return g_last_cudaError = cudaErrorNotSupported;
+}
+
+// yasai: see cudaGraphAddDependencies.
+__host__ cudaError_t CUDARTAPI cudaGraphAddEventRecordNode(cudaGraphNode_t *, cudaGraph_t,
+                                                           const cudaGraphNode_t *, size_t,
+                                                           cudaEvent_t) {
+  return g_last_cudaError = cudaErrorNotSupported;
+}
+
+// yasai: see cudaGraphAddDependencies.
+__host__ cudaError_t CUDARTAPI cudaGraphRetainUserObject(cudaGraph_t, cudaUserObject_t,
+                                                         unsigned int, unsigned int) {
+  return g_last_cudaError = cudaErrorNotSupported;
+}
+
+// yasai: see cudaGraphAddDependencies.
+__host__ cudaError_t CUDARTAPI cudaStreamUpdateCaptureDependencies(cudaStream_t,
+                                                                   cudaGraphNode_t *,
+                                                                   const cudaGraphEdgeData *,
+                                                                   size_t, unsigned int) {
+  return g_last_cudaError = cudaErrorNotSupported;
+}
+
+// yasai: memory pools are not modeled; a pool is a token and allocations from it are ordinary
+// cudaMalloc allocations.
+__host__ cudaError_t CUDARTAPI cudaMemPoolCreate(cudaMemPool_t *memPool,
+                                                 const struct cudaMemPoolProps *) {
+  static uintptr_t next_pool = 1;
+  if (memPool == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  *memPool = reinterpret_cast<cudaMemPool_t>(next_pool++);
+  return g_last_cudaError = cudaSuccess;
+}
+
+// yasai: see cudaMemPoolCreate.
+__host__ cudaError_t CUDARTAPI cudaMemPoolDestroy(cudaMemPool_t) {
+  return g_last_cudaError = cudaSuccess;
+}
+
+// yasai: see cudaMemPoolCreate.
+__host__ cudaError_t CUDARTAPI cudaMallocFromPoolAsync(void **ptr, size_t size, cudaMemPool_t,
+                                                       cudaStream_t) {
+  return cudaMalloc(ptr, size);
+}
+
+// yasai: a batch of copies is issued as one cudaMemcpyAsync per entry with cudaMemcpyDefault.
+__host__ cudaError_t CUDARTAPI cudaMemcpyBatchAsync(void *const *dsts, const void *const *srcs,
+                                                   const size_t *sizes, size_t count,
+                                                   struct cudaMemcpyAttributes *, size_t *,
+                                                   size_t, cudaStream_t stream) {
+  for (size_t i = 0; i < count; i++) {
+    cudaError_t e = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault, stream);
+    if (e != cudaSuccess) return g_last_cudaError = e;
+  }
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -4154,6 +4256,9 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
   const char *selected_ptx_override = getenv("GPGPUSIM_SELECTED_PTX_OVERRIDE");
   const bool use_selected_ptx_override =
       selected_ptx_override != NULL && strlen(selected_ptx_override) != 0;
+  // yasai: the override file replaces all selected files together (for example the PTX of an
+  // rdc library merged into one module), so it is parsed once rather than once per file.
+  if (use_selected_ptx_override && selected_files.size() > 1) selected_files.resize(1);
   if (GPTRACE(PTX_IR)) {
     char cwd_buf[4096];
     [[maybe_unused]] const char *cwd =
@@ -8284,23 +8389,45 @@ __host__ cudaError_t CUDARTAPI cudaThreadExchangeStreamCaptureMode(enum cudaStre
 }
 
 __host__ cudaError_t CUDARTAPI cudaDeviceGetDefaultMemPool(cudaMemPool_t *memPool, int device) {
-  cuda_error_not_impl;
+  // yasai: pools are tokens (see cudaMemPoolCreate); the default pool is token 0x1000 + device.
+  if (memPool == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  *memPool = reinterpret_cast<cudaMemPool_t>(uintptr_t(0x1000 + device));
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI cudaMemPoolGetAttribute(cudaMemPool_t memPool, enum cudaMemPoolAttr attr, void *value ) {
-  cuda_error_not_impl;
+  // yasai: pool attributes are not modeled; every attribute reads as zero.
+  (void)memPool;
+  if (value == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  if (attr == cudaMemPoolReuseFollowEventDependencies || attr == cudaMemPoolReuseAllowOpportunistic ||
+      attr == cudaMemPoolReuseAllowInternalDependencies)
+    *static_cast<int *>(value) = 0;
+  else
+    *static_cast<unsigned long long *>(value) = 0;
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI cudaMemPoolSetAttribute(cudaMemPool_t memPool, enum cudaMemPoolAttr attr, void *value ) {
-  cuda_error_not_impl;
+  // yasai: pool attributes are not modeled; setting one is accepted and has no effect.
+  (void)memPool;
+  (void)attr;
+  (void)value;
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI cudaMemPoolSetAccess(cudaMemPool_t memPool, const struct cudaMemAccessDesc *descList, size_t count) {
-  cuda_error_not_impl;
+  // yasai: every allocation is accessible from the single simulated device.
+  (void)memPool;
+  (void)descList;
+  (void)count;
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI cudaMemPoolTrimTo(cudaMemPool_t memPool, size_t minBytesToKeep) {
-  cuda_error_not_impl;
+  // yasai: pools hold no cached memory, so there is nothing to trim.
+  (void)memPool;
+  (void)minBytesToKeep;
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI cudaStreamIsCapturing(cudaStream_t stream, enum cudaStreamCaptureStatus *pCaptureStatus) {
@@ -8311,7 +8438,9 @@ __host__ cudaError_t CUDARTAPI cudaStreamIsCapturing(cudaStream_t stream, enum c
 }
 
 __host__ cudaError_t CUDARTAPI cudaMallocAsync(void **devPtr, size_t size, cudaStream_t hStream) {
-  cuda_error_not_impl;
+  // yasai: stream-ordered allocation is an ordinary allocation.
+  (void)hStream;
+  return cudaMalloc(devPtr, size);
 }
 
 __host__ cudaError_t CUDARTAPI cudaMemcpyPeerAsync(void *dst, int dstDevice, const void *src, int srcDevice, size_t count, cudaStream_t stream __dv(0)) {
@@ -8319,7 +8448,9 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyPeerAsync(void *dst, int dstDevice, con
 }
 
 __host__ cudaError_t CUDARTAPI cudaFreeAsync(void *devPtr, cudaStream_t hStream) {
-  cuda_error_not_impl;
+  // yasai: stream-ordered free is an ordinary free.
+  (void)hStream;
+  return cudaFree(devPtr);
 }
 
 __host__ cudaError_t CUDARTAPI cudaIpcOpenEventHandle(cudaEvent_t *event, cudaIpcEventHandle_t handle) {

@@ -155,6 +155,12 @@ class ptx_recognizer {
   void add_builtin_operand(int builtin, int dim_modifier);
   void add_memory_operand();
   void add_literal_int(long long value);
+  // yasai: a function name in a global initializer list (for example NCCL's ncclDevFuncTable);
+  // the literal value is the function's handle from yasai_func::function_handle.
+  void add_function_address_literal(const char *identifier);
+  // yasai: an indirect call "call %reg, (), prototype;" with no arguments and no return value
+  // becomes a call instruction whose operand is the register holding a function handle.
+  void add_indirect_call(int opcode, const char *target_reg);
   void add_literal_float(float value);
   void add_literal_double(double value);
   void add_address_operand(const char *identifier, long long offset);

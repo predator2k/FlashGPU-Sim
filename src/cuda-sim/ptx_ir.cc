@@ -1764,6 +1764,7 @@ ptx_instruction::ptx_instruction(
       case TCGEN05_AFTER_THREAD_SYNC_OPTION:
       case TCGEN05_WAIT_LD_OPTION:
       case TCGEN05_WAIT_ST_OPTION:
+      case SHIFTAMT_OPTION:  // yasai: bfind.shiftamt, handled in bfind_impl
         break;
       default:
         printf("Error: Unsupported PTX instruction option (0x%x) for opcode %s\n",
@@ -1811,9 +1812,9 @@ ptx_instruction::ptx_instruction(
   m_source.erase(std::remove(m_source.begin(), m_source.end(), '\t'),
                  m_source.end());
 
-  if (opcode == CALL_OP) {
+  // yasai: an indirect call (register target) has no static callee to inspect.
+  if (opcode == CALL_OP && func_addr().is_function_address()) {
     const operand_info &target = func_addr();
-    assert(target.is_function_address());
     const symbol *func_addr = target.get_symbol();
     const function_info *target_func = func_addr->get_pc();
     std::string fname = target_func->get_name();

@@ -31,6 +31,7 @@
 #include <string>
 
 class ptx_instruction;
+class symbol;
 
 namespace yasai_func {
 
@@ -153,6 +154,17 @@ bool mbar_phase_done(uint64_t cta_key, uint32_t addr, uint32_t parity);
 
 // mbarrier.inval: forget the state.
 void mbar_inval(uint64_t cta_key, uint32_t addr);
+
+// Function handles for function addresses held in data (indirect calls through a table, as in
+// NCCL's ncclDevFuncTable). A handle is kFunctionHandleTag | index; the index is the order in
+// which the symbols were first seen.
+constexpr uint64_t kFunctionHandleTag = 0xfeed000000000000ull;
+
+// Returns the handle of function symbol s, registering it on first use.
+uint64_t function_handle(const symbol *s);
+
+// Returns the function symbol of a handle, or null when value is not a handle.
+const symbol *function_of(uint64_t value);
 
 }  // namespace yasai_func
 

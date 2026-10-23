@@ -214,6 +214,7 @@ class ptx_recognizer;
 %token  LEFT_PAREN
 %token  RIGHT_PAREN
 %token  APPROX_OPTION
+%token  SHIFTAMT_OPTION
 %token  FULL_OPTION
 %token  ANY_OPTION
 %token  ALL_OPTION
@@ -352,6 +353,14 @@ block_spec: MAXNTID_DIRECTIVE INT_OPERAND COMMA INT_OPERAND COMMA INT_OPERAND {r
 										recognizer->func_header_info_int(",", $4);
 										recognizer->func_header_info_int(",", $6);
                                                                                 recognizer->maxnt_id($2, $4, $6);}
+	| MAXNTID_DIRECTIVE INT_OPERAND { /* yasai: one-dimensional .maxntid */ recognizer->func_header_info_int(".maxntid", $2);
+										recognizer->func_header_info_int(",", 1);
+										recognizer->func_header_info_int(",", 1);
+										recognizer->maxnt_id($2, 1, 1);}
+	| MAXNTID_DIRECTIVE INT_OPERAND COMMA INT_OPERAND { /* yasai: two-dimensional .maxntid */ recognizer->func_header_info_int(".maxntid", $2);
+										recognizer->func_header_info_int(",", $4);
+										recognizer->func_header_info_int(",", 1);
+										recognizer->maxnt_id($2, $4, 1);}
 	| MINNCTAPERSM_DIRECTIVE INT_OPERAND { recognizer->func_header_info_int(".minnctapersm", $2); printf("GPGPU-Sim PTX: Warning: .minnctapersm ignored. \n"); }
 	| MAXNCTAPERSM_DIRECTIVE INT_OPERAND { recognizer->func_header_info_int(".maxnctapersm", $2); printf("GPGPU-Sim PTX: Warning: .maxnctapersm ignored. \n"); }
 	| REQNTID_DIRECTIVE INT_OPERAND { recognizer->func_header_info_int(".reqntid", $2); printf("GPGPU-Sim PTX: Warning: .reqntid ignored. \n"); }
@@ -403,6 +412,7 @@ statement_block: LEFT_BRACE statement_list RIGHT_BRACE
 
 statement_list: directive_statement { recognizer->add_directive(); }
     | statement_list prototype_block {printf("Prototype statement detected. WARNING: this is not supported yet on GPGPU-SIM\n"); }
+    | prototype_block { /* yasai: a block that starts with a call prototype (NCCL's indirect calls) */ }
 	| instruction_statement { recognizer->add_instruction(); }
 	| statement_list directive_statement { recognizer->add_directive(); }
 	| statement_list instruction_statement { recognizer->add_instruction(); }
@@ -553,7 +563,9 @@ initializer_list: LEFT_BRACE literal_list RIGHT_BRACE { recognizer->add_array_in
 	| LEFT_BRACE initializer_list RIGHT_BRACE { syntax_not_implemented(scanner, recognizer); }
 
 literal_list: literal_operand
-	| literal_list COMMA literal_operand;
+	| IDENTIFIER { recognizer->add_function_address_literal($1); }
+	| literal_list COMMA literal_operand
+	| literal_list COMMA IDENTIFIER { recognizer->add_function_address_literal($3); };
 
 // TODO: This is currently hardcoded to handle and ignore one specific case
 // that all prototype statements follow in the PTX from Pytorch. As a
@@ -567,6 +579,7 @@ prototype_decl: IDENTIFIER COLON CALLPROTOTYPE_DIRECTIVE LEFT_PAREN prototype_pa
 	      
 prototype_call: OPCODE LEFT_PAREN IDENTIFIER RIGHT_PAREN COMMA operand COMMA LEFT_PAREN IDENTIFIER RIGHT_PAREN COMMA IDENTIFIER SEMI_COLON
 	      | OPCODE IDENTIFIER COMMA LEFT_PAREN IDENTIFIER RIGHT_PAREN COMMA IDENTIFIER SEMI_COLON
+	      | OPCODE IDENTIFIER COMMA LEFT_PAREN RIGHT_PAREN COMMA IDENTIFIER SEMI_COLON { recognizer->add_indirect_call($1, $2); }
 
 prototype_param: /* empty */
 	       | PARAM_DIRECTIVE B64_TYPE IDENTIFIER
@@ -656,6 +669,7 @@ option: type_spec
 	| FTZ_OPTION { recognizer->add_option(FTZ_OPTION); }
 	| NEG_OPTION { recognizer->add_option(NEG_OPTION); }
 	| APPROX_OPTION { recognizer->add_option(APPROX_OPTION); }
+	| SHIFTAMT_OPTION { recognizer->add_option(SHIFTAMT_OPTION); }
 	| FULL_OPTION { recognizer->add_option(FULL_OPTION); }
 	| EXIT_OPTION { recognizer->add_option(EXIT_OPTION); }
 	| ABS_OPTION { recognizer->add_option(ABS_OPTION); }

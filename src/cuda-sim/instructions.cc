@@ -2093,7 +2093,7 @@ void bfind_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       thread->get_operand_value(src1, dst, i_type, thread, 1);
   const int msb = (i_type == U32_TYPE || i_type == S32_TYPE) ? 31 : 63;
 
-  unsigned long a = 0;
+  unsigned long long a = 0;
   switch (i_type) {
     case S32_TYPE:
       a = src1_data.s32;
@@ -2113,18 +2113,24 @@ void bfind_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   }
 
   // negate negative signed inputs
-  if ((i_type == S32_TYPE || i_type == S64_TYPE) && (a & (1 << msb))) {
+  if ((i_type == S32_TYPE || i_type == S64_TYPE) && (a & (1ull << msb))) {
     a = ~a;
   }
+  // yasai: the search is done on 64-bit values with a signed index (the original loop used an
+  // unsigned index and a 32-bit shift, so it never ended for a zero input and was wrong for
+  // 64-bit inputs), and .shiftamt returns msb - position.
+  if (msb == 31) a &= 0xffffffffull;
   uint32_t d_data = 0xffffffff;
-  for (uint32_t i = msb; i >= 0; i--) {
-    if (a & (1 << i)) {
-      d_data = i;
+  for (int i = msb; i >= 0; i--) {
+    if (a & (1ull << i)) {
+      d_data = uint32_t(i);
       break;
     }
   }
-
-  // if (.shiftamt && d != 0xffffffff)  { d = msb - d; }
+  bool shiftamt = false;
+  for (int opt : pI->get_options())
+    if (opt == SHIFTAMT_OPTION) shiftamt = true;
+  if (shiftamt && d_data != 0xffffffff) d_data = uint32_t(msb) - d_data;
 
   // store d
   thread->set_operand_value(dst, d_data, U32_TYPE, thread, pI);
@@ -2507,8 +2513,19 @@ void call_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   static unsigned call_uid_next = 1;
 
   const operand_info &target = pI->func_addr();
-  assert(target.is_function_address());
-  const symbol *func_addr = target.get_symbol();
+  const symbol *func_addr = NULL;
+  if (target.is_function_address()) {
+    func_addr = target.get_symbol();
+  } else {
+    // yasai: indirect call through a register that holds a function handle.
+    const ptx_reg_t v = thread->get_operand_value(target, target, U64_TYPE, thread, 1);
+    func_addr = yasai_func::function_of(v.u64);
+    if (func_addr == NULL) {
+      printf("GPGPU-Sim PTX: ERROR ** indirect call to 0x%llx, which is not a function handle\n",
+             (unsigned long long)v.u64);
+      abort();
+    }
+  }
   function_info *target_func = func_addr->get_pc();
   if (target_func->is_pdom_set()) {
     printf("GPGPU-Sim PTX: PDOM analysis already done for %s \n",

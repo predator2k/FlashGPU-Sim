@@ -463,6 +463,7 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.wrap	TC; return WRAP_OPTION;
 
 \.approx TC; return APPROX_OPTION;
+\.shiftamt TC; return SHIFTAMT_OPTION; /* yasai: bfind.shiftamt */
 \.full  TC; return FULL_OPTION;
 
 \.any	TC; return ANY_OPTION;
