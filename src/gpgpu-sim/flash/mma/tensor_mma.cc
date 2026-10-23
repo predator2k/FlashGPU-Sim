@@ -379,6 +379,31 @@ void tensor_mma_impl(const ptx_instruction *pI, core_t *core,
     N = 8;
     K = 16;
     break;
+  case MMA_M16N8K64: // yasai: shapes of s4/u4, FP4 block-scaled and b1
+    M = 16;
+    N = 8;
+    K = 64;
+    break;
+  case MMA_M8N8K32:
+    M = 8;
+    N = 8;
+    K = 32;
+    break;
+  case MMA_M8N8K128:
+    M = 8;
+    N = 8;
+    K = 128;
+    break;
+  case MMA_M16N8K128:
+    M = 16;
+    N = 8;
+    K = 128;
+    break;
+  case MMA_M16N8K256:
+    M = 16;
+    N = 8;
+    K = 256;
+    break;
   default:
     fprintf(stderr, "GPGPU-Sim: ERROR - tensor_mma_impl unsupported shape=%d\n",
             (int)shape);
@@ -413,6 +438,22 @@ void tensor_mma_impl(const ptx_instruction *pI, core_t *core,
     tid = inst.warp_id() * core->get_warp_size();
 
   const operand_info &dst = pI->operand_lookup(0);
+
+  // yasai: types without a type-specific file (FP8/FP6/FP4, block-scaled kinds,
+  // u8, s4/u4, b1, f64) go to the generic model; s8 x s8 keeps
+  // tensor_mma_s8_impl (which reads u8 as s8, so any u8 operand also goes to
+  // the generic model).
+  {
+    const std::list<int> tl = pI->get_scalar_type();
+    bool generic = !(is_f16_type || is_bf16_type || is_tf32_type || is_s8_type);
+    for (int t : tl)
+      if (t == U8_TYPE)
+        generic = true;
+    if (generic) {
+      tensor_mma_generic_impl(pI, core, inst, M, N, K, tid);
+      return;
+    }
+  }
 
   // Dispatch to type-specific implementation based on data type
   if (is_s8_type) {

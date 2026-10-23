@@ -166,25 +166,28 @@ void mbar_inval(uint64_t cta_key, uint32_t addr);
 // cluster are resident together and their warps are interleaved (cuda-sim.cc), so distributed
 // shared memory, remote mbarriers, cluster barriers and multicast copies see one another.
 //
-// Shared-memory addresses of another CTA of the cluster (the .shared::cluster window) carry the
-// target rank in bits 24 and up: rank r is encoded as (r + 1) << 24 | offset, which is what
-// mapa.shared::cluster returns. A plain address (bits 24 and up zero) is the CTA's own shared
-// memory. Generic addresses of the window are SHARED_GENERIC_START + (smid + r + 1) * 1 MiB +
-// offset (cuda-sim.cc shared_to_generic / generic_to_shared).
+// While a cluster executes, every shared-memory address carries the rank of the CTA that owns it
+// in bits 24 and up, as on the hardware: rank r's offset o is (r << 24) | o, for the CTA's own
+// variables too (the address of a shared symbol gets the executing CTA's rank, see
+// ptx_thread_info::get_operand_value). CUTLASS clears bit 24 of its own mbarrier address to
+// reach the leader CTA of a CTA pair, so the encoding must match. Generic addresses of the
+// window are SHARED_GENERIC_START + address (cuda-sim.cc shared_to_generic). Matrix
+// descriptors (wgmma, tcgen05) hold only 18 address bits and refer to the issuing CTA's memory.
+// Without an executing cluster addresses are plain offsets.
 
 // Encoded .shared::cluster address of offset in the CTA of rank rank.
 inline uint64_t dsmem_encode(unsigned rank, uint64_t offset) {
-  return (uint64_t(rank + 1) << 24) | (offset & 0xFFFFFFull);
+  return (uint64_t(rank) << 24) | (offset & 0xFFFFFFull);
 }
 
-// True when addr carries a cluster rank; then rank and offset receive it.
-inline bool dsmem_decode(uint64_t addr, unsigned &rank, uint64_t &offset) {
-  const uint64_t k = (addr >> 24) & 0xFFull;
-  if (k == 0) return false;
-  rank = unsigned(k - 1);
+// Splits a cluster shared-memory address into the owner's rank and the offset.
+inline void dsmem_decode(uint64_t addr, unsigned &rank, uint64_t &offset) {
+  rank = unsigned((addr >> 24) & 0xFFull);
   offset = addr & 0xFFFFFFull;
-  return true;
 }
+
+// Rank bits of the executing CTA (0 without a cluster), to OR into an own shared address.
+uint64_t own_rank_bits();
 
 // Generic addresses follow the hardware layout: while a cluster executes, the generic shared
 // window of rank r is SHARED_GENERIC_START + (r << 24), so code that derives a peer address by
@@ -233,6 +236,9 @@ float minifloat_decode(MiniFloat f, unsigned bits);
 // formats, which have none).
 unsigned minifloat_encode(MiniFloat f, float x, bool satfinite, bool toward_zero = false,
                           bool round_up = false);
+
+// f32 to f16 bits, round to nearest even (overflow to infinity).
+uint16_t minifloat_encode_f16(float x);
 
 // Lazy PTX loading (libcuda/cuda_runtime_api.cc): loads the PTX file that defines the kernel or
 // global variable name and returns true, or returns false when no unloaded file defines it.

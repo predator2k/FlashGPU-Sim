@@ -82,6 +82,14 @@ public:
                          uint32_t rows, uint32_t columns) const;
 
   void clear_cta(unsigned sm_id, unsigned cta_id);
+  // yasai: one 32-bit TMEM cell (lane, column) of a scope, without allocation
+  // checks (the functional tcgen05 model of yasai_umma.cc writes the peer CTA
+  // of a CTA pair and reads scale factors, whose allocations it does not
+  // track).
+  uint32_t peek(const tcgen05_tmem_scope_t &scope, uint32_t lane,
+                uint32_t column) const;
+  void poke(const tcgen05_tmem_scope_t &scope, uint32_t lane, uint32_t column,
+            uint32_t value);
   void reset();
 
 private:

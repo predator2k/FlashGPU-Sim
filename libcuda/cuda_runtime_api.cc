@@ -513,6 +513,17 @@ static int get_app_cuda_version_internal(std::string app_binary) {
   if (const char *pb = getenv("PYTORCH_BIN")) {
     if (strlen(pb) != 0) app_binary = pb;
   }
+  // yasai: one probe per binary; the probe runs ldd, readelf and strings over the binary, which
+  // takes seconds on libtorch_cuda.so, and a PyTorch process registers dozens of fat binaries.
+  static std::map<std::string, int> cached_versions;
+  auto cached = cached_versions.find(app_binary);
+  if (cached != cached_versions.end()) return cached->second;
+  struct yasai_version_cache_store {
+    std::map<std::string, int> &m;
+    const std::string &key;
+    int &value;
+    ~yasai_version_cache_store() { if (value) m[key] = value; }
+  } yasai_store{cached_versions, app_binary, app_cuda_version};
   char fname[1024];
   snprintf(fname, 1024, "_app_cuda_version_XXXXXX");
   int fd = mkstemp(fname);
@@ -5499,6 +5510,15 @@ extern "C" CUresult CUDAAPI cuTensorMapEncodeTiled(
       break;
     case CU_TENSOR_MAP_DATA_TYPE_TFLOAT32_FTZ:
       desc.fields.tensorDataType = TMA_DTYPE_TF32_FTZ;
+      break;
+    case CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B:  // yasai: FP4/FP6 operands of SM100 GEMMs
+      desc.fields.tensorDataType = TMA_DTYPE_16U4_ALIGN8B;
+      break;
+    case CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B:
+      desc.fields.tensorDataType = TMA_DTYPE_16U4_ALIGN16B;
+      break;
+    case CU_TENSOR_MAP_DATA_TYPE_16U6_ALIGN16B:
+      desc.fields.tensorDataType = TMA_DTYPE_16U6_ALIGN16B;
       break;
     default:
       printf("WARNING: cuTensorMapEncodeTiled: unsupported tensorDataType %d\n",

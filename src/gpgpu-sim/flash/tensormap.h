@@ -24,6 +24,15 @@ class ptx_instruction;
 #define TMA_DTYPE_F32_FTZ 10u
 #define TMA_DTYPE_TF32 11u
 #define TMA_DTYPE_TF32_FTZ 12u
+// yasai: sub-byte types (CUDA 12.8
+// CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B/16U4_ALIGN16B/ 16U6_ALIGN16B).
+// Dimensions and coordinates count elements; 16 elements occupy 8 (4-bit) or 12
+// (6-bit) bytes in global memory. In shared memory ALIGN8B stays packed (8
+// bytes per 16 elements) and ALIGN16B pads every 16 elements to 16 bytes (data
+// first, padding after).
+#define TMA_DTYPE_16U4_ALIGN8B 13u
+#define TMA_DTYPE_16U4_ALIGN16B 14u
+#define TMA_DTYPE_16U6_ALIGN16B 15u
 
 // Interleave layout modes (in bytes)
 #define TMA_INTERLEAVE_NONE 0u
@@ -68,7 +77,13 @@ typedef union __attribute__((aligned(128))) tensormap_descriptor_t {
   } fields;
 
   // Helpers
-  uint32_t get_element_size() const;
+  uint32_t
+  get_element_size() const; // bytes; 1 for the sub-byte types (see below)
+  // yasai: bits of one element of a sub-byte type (4 or 6), 0 for the other
+  // types.
+  uint32_t subbyte_bits() const;
+  // yasai: shared-memory bytes of 16 elements of a sub-byte type (8 or 16).
+  uint32_t subbyte_smem_group_bytes() const;
   uint32_t get_tile_size_bytes() const;
   uint64_t calculate_src_addr(const int32_t coords[5]) const;
   uint32_t num_dims() const { return fields.tensorRank + 1u; }

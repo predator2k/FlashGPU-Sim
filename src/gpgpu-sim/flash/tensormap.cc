@@ -62,6 +62,11 @@ uint32_t tensormap_descriptor_t::get_element_size() const {
     return 8;
   case TMA_DTYPE_BF16:
     return 2;
+  case TMA_DTYPE_16U4_ALIGN8B: // yasai: sub-byte types are moved by
+                               // do_tma_transfer_subbyte
+  case TMA_DTYPE_16U4_ALIGN16B:
+  case TMA_DTYPE_16U6_ALIGN16B:
+    return 1;
   default:
     return 4; // default to 4 bytes
   }
@@ -76,7 +81,25 @@ uint32_t tensormap_descriptor_t::get_tile_size_bytes() const {
   for (uint32_t i = 0; i < dims; i++) {
     total_elements *= fields.boxDim[i];
   }
+  if (subbyte_bits() != 0)
+    return total_elements / 16 * subbyte_smem_group_bytes(); // yasai
   return total_elements * get_element_size();
+}
+
+uint32_t tensormap_descriptor_t::subbyte_bits() const {
+  switch (fields.tensorDataType) {
+  case TMA_DTYPE_16U4_ALIGN8B:
+  case TMA_DTYPE_16U4_ALIGN16B:
+    return 4;
+  case TMA_DTYPE_16U6_ALIGN16B:
+    return 6;
+  default:
+    return 0;
+  }
+}
+
+uint32_t tensormap_descriptor_t::subbyte_smem_group_bytes() const {
+  return fields.tensorDataType == TMA_DTYPE_16U4_ALIGN8B ? 8 : 16;
 }
 
 uint64_t

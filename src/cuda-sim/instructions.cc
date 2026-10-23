@@ -443,9 +443,11 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
   ptx_reg_t result, tmp;
 
   if (op.get_double_operand_type() == 0) {
+    // yasai: a scalar .b128 register (clusterlaunchcontrol responses) or an address operand of
+    // a 128-bit load takes the ordinary path; only register vectors are split below.
     if (((opType != BB128_TYPE) && (opType != BB64_TYPE) &&
          (opType != FF64_TYPE)) ||
-        (op.get_addr_space() != undefined_space)) {
+        (op.get_addr_space() != undefined_space) || !op.is_vector()) {
       if (op.is_reg()) {
         result = get_reg(op.get_symbol());
       } else if (op.is_builtin()) {
@@ -483,8 +485,9 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
           const symbol *name = op.get_symbol();
           if (name->is_reg())
             result.u64 = get_reg(name).u64 + op.get_addr_offset();
-          else
-            result.u64 = name->get_address() + op.get_addr_offset();
+          else  // yasai: own rank bits in a cluster (see yasai_func::dsmem_encode)
+            result.u64 =
+                (name->get_address() + op.get_addr_offset()) | yasai_func::own_rank_bits();
         } else if (op.is_sstarr()) {
           const symbol *name = op.get_symbol();
           if (name->is_reg())
@@ -509,7 +512,8 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
         result.u64 = op.get_symbol()->get_address();
       } else if (op.is_shared()) {
         const symbol *name = op.get_symbol();
-        result.u64 = name->is_reg() ? get_reg(name).u64 : name->get_address();
+        result.u64 = name->is_reg() ? get_reg(name).u64
+                                    : name->get_address() | yasai_func::own_rank_bits();
       } else if (op.is_sstarr()) {
         const symbol *name = op.get_symbol();
         result.u64 = name->is_reg() ? get_reg(name).u64 : name->get_address();
@@ -894,6 +898,9 @@ void ptx_thread_info::set_operand_value(const operand_info &dst,
 
       set_reg(predName, predValue);
       set_reg(regName, setValue);
+    } else if (type == BB128_TYPE && !dst.is_vector()) {
+      // yasai: a scalar .b128 register holds all 128 bits.
+      set_reg(dst.get_symbol(), data);
     } else if (type == BB128_TYPE) {
       // b128 stuff here.
       ptx_reg_t setValue2, setValue3, setValue4;
@@ -2722,6 +2729,51 @@ void callp_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   thread->callstack_push_plus(callee_pc + pI->inst_size(), callee_rpc,
                               return_var_src, return_var_dst, call_uid_next++);
   thread->set_npc(target_pc);
+}
+
+
+// yasai: clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes
+// {.multicast::cluster::all}.b128 [addr], [mbar]: asks to cancel a cluster that has not been
+// launched, to take over its work. The functional mode has already enumerated every CTA, so the
+// request always fails: the 16-byte response (all zero, "not canceled") is written to addr and
+// the mbarrier completes 16 bytes, in every CTA of the cluster with .multicast::cluster::all.
+void clc_try_cancel_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  const uint32_t addr =
+      thread->get_operand_value(pI->dst(), pI->dst(), U32_TYPE, thread, 1).u32;
+  const uint32_t mbar =
+      thread->get_operand_value(pI->src1(), pI->src1(), U32_TYPE, thread, 1).u32;
+  const bool all = pI->get_source() != NULL && strstr(pI->get_source(), "multicast") != NULL;
+  const unsigned char zero[16] = {0};
+  yasai_func::ClusterState *c = yasai_func::cluster();
+  const unsigned n = (all && c != nullptr) ? c->size : 1;
+  for (unsigned r = 0; r < n; ++r) {
+    unsigned own_rank;
+    uint64_t off;
+    yasai_func::dsmem_decode(addr, own_rank, off);
+    const uint32_t a = (c != nullptr && all) ? uint32_t(yasai_func::dsmem_encode(r, off)) : addr;
+    yasai_func::dsmem_decode(mbar, own_rank, off);
+    const uint32_t m = (c != nullptr && all) ? uint32_t(yasai_func::dsmem_encode(r, off)) : mbar;
+    thread->m_shared_mem->write(a, 16, zero, thread, pI);
+    yasai_func::mbar_complete_tx(thread->get_cta_uid(), m, 16);
+  }
+}
+
+// yasai: clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p, response: false (see
+// clc_try_cancel_impl); .get_first_ctaid{::x,::y,::z}: zeros.
+void clc_query_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  const operand_info &dst = pI->dst();
+  ptx_reg_t v;
+  v.u64 = 0;
+  if (pI->get_opcode() == CLC_QUERY_IS_CANCELED_OP) {
+    v.pred = 1;  // predicates are stored inverted: 1 means false
+    thread->set_operand_value(dst, v, PRED_TYPE, thread, pI);
+  } else if (dst.is_vector()) {
+    ptx_reg_t regs[4];
+    for (auto &x : regs) x.u64 = 0;
+    thread->set_vector_operand_values(dst, regs[0], regs[1], regs[2], regs[3]);
+  } else {
+    thread->set_operand_value(dst, v, U32_TYPE, thread, pI);
+  }
 }
 
 void clz_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
@@ -4690,12 +4742,10 @@ void mapa_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     unsigned old_rank;
     uint64_t off;
     if (i_type == U64_TYPE || i_type == B64_TYPE || i_type == S64_TYPE) {
-      // generic address: own window or a window that already names a rank
-      addr_t shared = generic_to_shared(smid, data.u64);
-      if (!yasai_func::dsmem_decode(shared, old_rank, off)) off = shared;
+      yasai_func::dsmem_decode(generic_to_shared(smid, data.u64), old_rank, off);
       data.u64 = shared_to_generic(smid, yasai_func::dsmem_encode(rank, off));
     } else {
-      if (!yasai_func::dsmem_decode(data.u32, old_rank, off)) off = data.u32;
+      yasai_func::dsmem_decode(data.u32, old_rank, off);
       data.u64 = 0;
       data.u32 = uint32_t(yasai_func::dsmem_encode(rank, off));
     }

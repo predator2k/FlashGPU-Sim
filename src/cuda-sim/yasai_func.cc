@@ -449,6 +449,8 @@ unsigned current_rank() { return g_current_rank; }
 
 void set_current_rank(unsigned rank) { g_current_rank = rank; }
 
+uint64_t own_rank_bits() { return g_cluster != nullptr ? uint64_t(g_current_rank) << 24 : 0; }
+
 namespace {
 // Exponent bits, mantissa bits, bias and largest finite value of a format.
 struct MiniFloatSpec {
@@ -488,6 +490,29 @@ float minifloat_decode(MiniFloat f, unsigned bits) {
   else
     v = std::ldexp(1.0f + float(m) / float(1u << s.mbits), int(e) - s.bias);
   return neg ? -v : v;
+}
+
+uint16_t minifloat_encode_f16(float f) {
+  uint32_t x;
+  memcpy(&x, &f, 4);
+  const uint32_t sign = (x >> 16) & 0x8000;
+  int e = int((x >> 23) & 0xFF) - 127 + 15;
+  uint32_t m = x & 0x7FFFFF;
+  if (((x >> 23) & 0xFF) == 0xFF) return uint16_t(sign | 0x7C00 | (m ? 0x200 : 0));
+  if (e >= 31) return uint16_t(sign | 0x7C00);
+  if (e <= 0) {
+    if (e < -10) return uint16_t(sign);
+    m |= 0x800000;
+    const int shift = 14 - e;
+    uint32_t r = m >> shift;
+    const uint32_t rem = m & ((1u << shift) - 1), half = 1u << (shift - 1);
+    if (rem > half || (rem == half && (r & 1))) r++;
+    return uint16_t(sign | r);
+  }
+  uint32_t r = (uint32_t(e) << 10) | (m >> 13);
+  const uint32_t rem = m & 0x1FFF;
+  if (rem > 0x1000 || (rem == 0x1000 && (r & 1))) r++;
+  return uint16_t(sign | r);
 }
 
 unsigned minifloat_encode(MiniFloat f, float x, bool satfinite, bool toward_zero, bool round_up) {
@@ -551,12 +576,11 @@ int cluster_rank_of(uint64_t cta_key) {
 }
 
 void mbar_canonical(uint64_t &cta_key, uint32_t &addr) {
+  if (g_cluster == nullptr) return;
   unsigned rank;
   uint64_t off;
-  if (!dsmem_decode(addr, rank, off)) return;
-  if (g_cluster != nullptr && rank < g_cluster->cta_key.size()) {
-    cta_key = g_cluster->cta_key[rank];
-  }
+  dsmem_decode(addr, rank, off);
+  if (rank < g_cluster->cta_key.size()) cta_key = g_cluster->cta_key[rank];
   addr = uint32_t(off);
 }
 

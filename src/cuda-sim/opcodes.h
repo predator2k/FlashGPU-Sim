@@ -93,7 +93,11 @@ enum {
   MMA_M16N8K32 = 103,
   MMA_M16N8K64 = 104,
   MMA_M8N8K4 = 105,
-  MMA_M8N8K16 = 106
+  MMA_M8N8K16 = 106,
+  MMA_M8N8K32 = 107,   // yasai: s4/u4
+  MMA_M8N8K128 = 108,  // yasai: b1
+  MMA_M16N8K128 = 109, // yasai: b1
+  MMA_M16N8K256 = 110  // yasai: b1
 };
 
 // MMA layout mode identifiers

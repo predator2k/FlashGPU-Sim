@@ -1,3 +1,4 @@
+#include "../../../cuda-sim/yasai_func.h"
 #include "tensor_wgmma.h"
 
 #include <climits>
@@ -59,8 +60,8 @@ void wgmma_m64n8k256_b1_impl(const ptx_instruction *pI, core_t *core,
       uint32_t b_word = 0;
       unsigned b_smem_addr = wgmma_gmma_k_major_smem_addr(
           b_desc, col, word, sizeof(uint32_t), KWords);
-      representative_thread->m_shared_mem->read(b_smem_addr, sizeof(b_word),
-                                                &b_word);
+      representative_thread->m_shared_mem->read(
+          b_smem_addr | yasai_func::own_rank_bits(), sizeof(b_word), &b_word);
       B_words[col * KWords + word] = b_word;
     }
   }

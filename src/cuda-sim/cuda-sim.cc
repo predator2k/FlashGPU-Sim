@@ -738,15 +738,7 @@ addr_t shared_to_generic(unsigned smid, addr_t addr) {
   // window smid + r + 1.
   // While a cluster executes, rank r's window is SHARED_GENERIC_START + (r << 24) (the hardware
   // layout); own addresses use the executing CTA's rank.
-  if (yasai_func::cluster() != nullptr) {
-    unsigned rank;
-    uint64_t off;
-    if (!yasai_func::dsmem_decode(addr, rank, off)) {
-      rank = yasai_func::current_rank();
-      off = addr;
-    }
-    return SHARED_GENERIC_START + (uint64_t(rank) << 24) + off;
-  }
+  if (yasai_func::cluster() != nullptr) return SHARED_GENERIC_START + addr;
   assert(addr < SHARED_MEM_SIZE_MAX);
   return SHARED_GENERIC_START + smid * SHARED_MEM_SIZE_MAX + addr;
 }
@@ -779,22 +771,15 @@ memory_space_t whichspace(addr_t addr) {
 
 addr_t generic_to_shared(unsigned smid, addr_t addr) {
   // yasai: inverse of shared_to_generic; another rank's window gives a .shared::cluster address.
-  if (yasai_func::cluster() != nullptr) {
-    const addr_t rel = addr - SHARED_GENERIC_START;
-    const unsigned rank = unsigned(rel >> 24);
-    const addr_t off = rel & 0xFFFFFF;
-    if (rank == yasai_func::current_rank()) return off;
-    return yasai_func::dsmem_encode(rank, off);
-  }
+  if (yasai_func::cluster() != nullptr) return addr - SHARED_GENERIC_START;
   const addr_t base = SHARED_GENERIC_START + smid * SHARED_MEM_SIZE_MAX;
   assert(isspace_shared(smid, addr));
   return addr - base;
 }
 
-// yasai: shared memory of one CTA of an executing cluster. Plain addresses go to the CTA's own
-// shared memory; addresses with a cluster rank (yasai_func::dsmem_encode) go to the shared
-// memory of that rank, so every access path (ld/st/atom, TMA, cp.async, wgmma operands) reaches
-// distributed shared memory without change.
+// yasai: shared memory of one CTA of an executing cluster. An address goes to the shared memory
+// of the rank in its bits 24 and up (yasai_func::dsmem_encode), so every access path (ld/st/atom,
+// TMA, cp.async, matrix loads) reaches distributed shared memory without change.
 class yasai_cluster_smem_view : public memory_space {
  public:
   // View of the CTA of rank rank in state.
@@ -827,7 +812,8 @@ class yasai_cluster_smem_view : public memory_space {
   // The shared memory addr refers to, and the offset in it.
   memory_space *target(mem_addr_t addr, uint64_t &off) const {
     unsigned rank;
-    if (yasai_func::dsmem_decode(addr, rank, off)) {
+    yasai_func::dsmem_decode(addr, rank, off);
+    {
       if (rank >= m_state->size) {
         fprintf(stderr, "GPGPU-Sim PTX: ERROR: shared address 0x%llx names cluster rank %u of %u\n",
                (unsigned long long)addr, rank, m_state->size);
@@ -835,8 +821,6 @@ class yasai_cluster_smem_view : public memory_space {
       }
       return (memory_space *)m_state->smem[rank];
     }
-    off = addr;
-    return own();
   }
   yasai_func::ClusterState *m_state;  // the executing cluster
   unsigned m_rank;                    // rank of this CTA

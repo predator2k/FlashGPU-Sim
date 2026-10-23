@@ -116,6 +116,13 @@ class ptx_recognizer;
 %token  E3M2X2_TYPE
 %token  UE8M0X2_TYPE
 %token  E5M2_TYPE
+%token  E2M1_TYPE
+%token  E2M3_TYPE
+%token  E3M2_TYPE
+%token  UE8M0_TYPE
+%token  UE4M3_TYPE
+%token  S4_TYPE
+%token  U4_TYPE
 %token  F32_TYPE
 %token  F32X2_TYPE
 %token  F64_TYPE
@@ -310,6 +317,16 @@ class ptx_recognizer;
 %token	X64_OPTION;
 %token	X128_OPTION;
 %token	TCGEN05_CTA_GROUP_1_OPTION;
+%token	TCGEN05_BLOCK_SCALE_OPTION;
+%token	TCGEN05_SCALE_VEC_1X_OPTION;
+%token	TCGEN05_SCALE_VEC_2X_OPTION;
+%token	TCGEN05_SCALE_VEC_4X_OPTION;
+%token	TCGEN05_BLOCK16_OPTION;
+%token	TCGEN05_BLOCK32_OPTION;
+%token	TCGEN05_WS_OPTION;
+%token	TCGEN05_COLLECTOR_OPTION;
+%token	TMA_GATHER4_OPTION;
+%token	TMA_SCATTER4_OPTION;
 %token	TCGEN05_CTA_GROUP_2_OPTION;
 %token	TCGEN05_KIND_F16_OPTION;
 %token	TCGEN05_KIND_TF32_OPTION;
@@ -571,6 +588,13 @@ scalar_type: S8_TYPE { recognizer->add_scalar_type_spec( S8_TYPE ); }
 	| UE8M0X2_TYPE { recognizer->add_scalar_type_spec( B16_TYPE ); recognizer->note_packed_minifloat(UE8M0X2_TYPE); }
 	| E2M1X2_TYPE { recognizer->add_scalar_type_spec( B8_TYPE ); recognizer->note_packed_minifloat(E2M1X2_TYPE); }
 	| E5M2_TYPE  { recognizer->add_scalar_type_spec( E5M2_TYPE ); }
+	| E2M1_TYPE  { recognizer->add_scalar_type_spec( E2M1_TYPE ); }
+	| E2M3_TYPE  { recognizer->add_scalar_type_spec( E2M3_TYPE ); }
+	| E3M2_TYPE  { recognizer->add_scalar_type_spec( E3M2_TYPE ); }
+	| UE8M0_TYPE  { recognizer->add_scalar_type_spec( UE8M0_TYPE ); }
+	| UE4M3_TYPE  { recognizer->add_scalar_type_spec( UE4M3_TYPE ); }
+	| S4_TYPE  { recognizer->add_scalar_type_spec( S4_TYPE ); }
+	| U4_TYPE  { recognizer->add_scalar_type_spec( U4_TYPE ); }
 	| F32_TYPE   { recognizer->add_scalar_type_spec( F32_TYPE ); }
 	| F32X2_TYPE { recognizer->add_scalar_type_spec( F32X2_TYPE ); }
 	| F64_TYPE   { recognizer->add_scalar_type_spec( F64_TYPE ); }
@@ -776,6 +800,16 @@ option: type_spec
 	| X64_OPTION { recognizer->add_option(X64_OPTION); }
 	| X128_OPTION { recognizer->add_option(X128_OPTION); }
 	| TCGEN05_CTA_GROUP_1_OPTION { recognizer->add_option(TCGEN05_CTA_GROUP_1_OPTION); }
+	| TCGEN05_BLOCK_SCALE_OPTION { recognizer->add_option(TCGEN05_BLOCK_SCALE_OPTION); }
+	| TCGEN05_SCALE_VEC_1X_OPTION { recognizer->add_option(TCGEN05_SCALE_VEC_1X_OPTION); }
+	| TCGEN05_SCALE_VEC_2X_OPTION { recognizer->add_option(TCGEN05_SCALE_VEC_2X_OPTION); }
+	| TCGEN05_SCALE_VEC_4X_OPTION { recognizer->add_option(TCGEN05_SCALE_VEC_4X_OPTION); }
+	| TCGEN05_BLOCK16_OPTION { recognizer->add_option(TCGEN05_BLOCK16_OPTION); }
+	| TCGEN05_BLOCK32_OPTION { recognizer->add_option(TCGEN05_BLOCK32_OPTION); }
+	| TCGEN05_WS_OPTION { recognizer->add_option(TCGEN05_WS_OPTION); }
+	| TCGEN05_COLLECTOR_OPTION { recognizer->add_option(TCGEN05_COLLECTOR_OPTION); }
+	| TMA_GATHER4_OPTION { recognizer->add_option(TMA_GATHER4_OPTION); }
+	| TMA_SCATTER4_OPTION { recognizer->add_option(TMA_SCATTER4_OPTION); }
 	| TCGEN05_CTA_GROUP_2_OPTION { recognizer->add_option(TCGEN05_CTA_GROUP_2_OPTION); }
 	| TCGEN05_KIND_F16_OPTION { recognizer->add_option(TCGEN05_KIND_F16_OPTION); }
 	| TCGEN05_KIND_TF32_OPTION { recognizer->add_option(TCGEN05_KIND_TF32_OPTION); }

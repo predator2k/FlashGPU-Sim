@@ -315,4 +315,22 @@ tcgen05_tmem_manager_t::find_accessible_allocation_containing(
   return nullptr;
 }
 
+uint32_t tcgen05_tmem_manager_t::peek(const tcgen05_tmem_scope_t &scope,
+                                      uint32_t lane, uint32_t column) const {
+  std::lock_guard<tcgen05_tmem_spinlock_t> lock(m_mutex);
+  const scope_state_t *state = find_scope(scope);
+  if (state == nullptr)
+    return 0;
+  auto it = state->words.find(tcgen05_encode_tmem_address(lane, column));
+  return it == state->words.end() ? 0 : it->second;
+}
+
+void tcgen05_tmem_manager_t::poke(const tcgen05_tmem_scope_t &scope,
+                                  uint32_t lane, uint32_t column,
+                                  uint32_t value) {
+  std::lock_guard<tcgen05_tmem_spinlock_t> lock(m_mutex);
+  get_or_create_scope(scope).words[tcgen05_encode_tmem_address(lane, column)] =
+      value;
+}
+
 } // namespace flash_gpgpu_sim

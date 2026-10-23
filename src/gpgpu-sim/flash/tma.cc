@@ -2209,6 +2209,69 @@ static tma_oob_fill_table_t g_oob_fill_table;
 // Functional Simulation: TMA Data Transfer
 //=============================================================================
 
+// yasai: TMA transfer of a sub-byte type
+// (TMA_DTYPE_16U4_ALIGN8B/16U4_ALIGN16B/16U6_ALIGN16B) in groups of 16
+// elements: 8 or 12 bytes in global memory, 8 or 16 bytes in shared memory
+// (data first, zero padding after). Out-of-bounds groups stay zero on loads and
+// are skipped on stores; boxDim[0] and the inner coordinate are multiples of 16
+// elements.
+static void do_tma_transfer_subbyte(const tensormap_descriptor_t &tm,
+                                    const int32_t coords[5],
+                                    memory_space *shared_mem,
+                                    memory_space *global_mem,
+                                    uint32_t smem_addr, ptx_thread_info *thread,
+                                    const ptx_instruction *pI, bool is_load) {
+  const uint32_t bits = tm.subbyte_bits(), gsz = tm.subbyte_smem_group_bytes();
+  const uint32_t dims = tm.num_dims();
+  const uint32_t groups = tm.fields.boxDim[0] / 16, smem_row = groups * gsz;
+  if (is_load) {
+    std::vector<unsigned char> zero(tm.get_tile_size_bytes(), 0);
+    shared_mem->write(smem_addr, uint32_t(zero.size()), zero.data(), thread,
+                      pI);
+  }
+  uint32_t rows = 1;
+  for (uint32_t d = 1; d < dims; d++)
+    rows *= tm.fields.boxDim[d];
+  unsigned char buf[16];
+  for (uint32_t r = 0; r < rows; r++) {
+    uint64_t row_base = tm.fields.globalAddress;
+    bool oob = false;
+    uint32_t rem = r;
+    for (uint32_t d = 1; d < dims; d++) {
+      const int64_t c = int64_t(coords[d]) + rem % tm.fields.boxDim[d];
+      rem /= tm.fields.boxDim[d];
+      if (c < 0 || c >= int64_t(tm.fields.globalDim[d])) {
+        oob = true;
+        break;
+      }
+      row_base += uint64_t(c) * tm.fields.globalStrides[d - 1];
+    }
+    if (oob)
+      continue;
+    for (uint32_t g = 0; g < groups; g++) {
+      const int64_t e0 = int64_t(coords[0]) + 16 * int64_t(g);
+      if (e0 < 0 || e0 >= int64_t(tm.fields.globalDim[0]))
+        continue;
+      const uint32_t valid =
+          uint32_t(std::min<int64_t>(16, tm.fields.globalDim[0] - e0));
+      const uint32_t nbytes = (valid * bits + 7) / 8;
+      const uint64_t gaddr = row_base + uint64_t(e0) * bits / 8;
+      const uint64_t logical = uint64_t(r) * smem_row + uint64_t(g) * gsz;
+      const uint64_t off = apply_tma_swizzle(logical & ~uint64_t(15), smem_addr,
+                                             tm.fields.swizzle, smem_row) +
+                           (logical & 15);
+      if (is_load) {
+        memset(buf, 0, sizeof(buf));
+        global_mem->read(gaddr, nbytes, buf);
+        shared_mem->write(smem_addr + uint32_t(off), nbytes, buf, thread, pI);
+      } else {
+        shared_mem->read(smem_addr + uint32_t(off), nbytes, buf);
+        global_mem->write(gaddr, nbytes, buf, thread, pI);
+      }
+    }
+  }
+}
+
 // Execute TMA data transfer (load or store)
 // is_load=true: global -> shared, is_load=false: shared -> global
 static void do_tma_transfer(
@@ -2216,6 +2279,16 @@ static void do_tma_transfer(
     memory_space *shared_mem, memory_space *global_mem, uint32_t smem_addr,
     ptx_thread_info *thread, const ptx_instruction *pI, bool is_load,
     tma_reduction_op_t reduction_op = tma_reduction_op_t::NONE) {
+  if (tensormap.subbyte_bits() != 0) { // yasai
+    if (reduction_op != tma_reduction_op_t::NONE) {
+      printf(
+          "TMA ERROR: tensor reduction on a sub-byte type is not supported\n");
+      abort();
+    }
+    do_tma_transfer_subbyte(tensormap, coords, shared_mem, global_mem,
+                            smem_addr, thread, pI, is_load);
+    return;
+  }
   // For load operations, pre-fill the entire tile in shared memory with OOB
   // fill value
   if (is_load) {
@@ -2722,12 +2795,64 @@ static void handle_tma_tensor(ptx_instruction *pI, ptx_thread_info *thread) {
     cache_tensormap_descriptor(tma_dyn_info, tensormap);
     pI->set_tma_dyn_info(thread->get_laneid(), tma_dyn_info);
 
-    do_tma_transfer(tensormap, coords, shared_mem, global_mem, dst_addr, thread,
-                    pI, true);
-    // yasai: in the pure functional mode the transfer is complete now.
-    if (thread->isInFunctionalSimulationMode())
-      yasai_func::mbar_complete_tx(thread->get_cta_uid(), mbar_addr,
-                                   size_in_bytes);
+    // yasai: .tile::gather4 (2-D maps) loads four rows given by
+    // coordinates 1..4 at column coordinate 0, one box row each, stored one
+    // after another; .multicast::cluster writes the tile into every CTA of
+    // ctaMask (operand 4) at the same offset and completes the bytes on each
+    // destination's mbarrier, which with .cta_group::2 is the one of the same
+    // parity as the given mbarrier within the destination's CTA pair.
+    bool gather4 = false, multicast = false, pair = false;
+    for (int op : options) {
+      gather4 = gather4 || op == TMA_GATHER4_OPTION;
+      multicast = multicast || op == TCGEN05_MULTICAST_CLUSTER_OPTION;
+      pair = pair || op == TCGEN05_CTA_GROUP_2_OPTION;
+    }
+    auto transfer_to = [&](uint32_t dst) {
+      if (!gather4) {
+        do_tma_transfer(tensormap, coords, shared_mem, global_mem, dst, thread,
+                        pI, true);
+        return;
+      }
+      tensormap_descriptor_t row_map = tensormap;
+      row_map.fields.boxDim[1] = 1;
+      const uint32_t row_bytes = row_map.get_tile_size_bytes();
+      for (int r = 0; r < 4; ++r) {
+        int32_t c[5] = {coords[0], coords[1 + r], 0, 0, 0};
+        do_tma_transfer(row_map, c, shared_mem, global_mem, dst + r * row_bytes,
+                        thread, pI, true);
+      }
+    };
+    if (gather4) {
+      tensormap_descriptor_t row_map = tensormap;
+      row_map.fields.boxDim[1] = 1;
+      size_in_bytes = 4 * row_map.get_tile_size_bytes();
+    }
+    yasai_func::ClusterState *cl = yasai_func::cluster();
+    if (multicast && cl != nullptr && pI->get_num_operands() > 4) {
+      const uint32_t mask =
+          get_operand_u32(thread, pI->operand_lookup(4)) & 0xFFFF;
+      unsigned dst_rank, mbar_rank;
+      uint64_t dst_off, mbar_off;
+      yasai_func::dsmem_decode(dst_addr, dst_rank, dst_off);
+      yasai_func::dsmem_decode(mbar_addr, mbar_rank, mbar_off);
+      for (unsigned r = 0; r < cl->size; ++r) {
+        if (!((mask >> r) & 1))
+          continue;
+        transfer_to(uint32_t(yasai_func::dsmem_encode(r, dst_off)));
+        const unsigned target = pair ? ((r & ~1u) | (mbar_rank & 1u)) : r;
+        if (thread->isInFunctionalSimulationMode())
+          yasai_func::mbar_complete_tx(
+              thread->get_cta_uid(),
+              uint32_t(yasai_func::dsmem_encode(target, mbar_off)),
+              size_in_bytes);
+      }
+    } else {
+      transfer_to(dst_addr);
+      // yasai: in the pure functional mode the transfer is complete now.
+      if (thread->isInFunctionalSimulationMode())
+        yasai_func::mbar_complete_tx(thread->get_cta_uid(), mbar_addr,
+                                     size_in_bytes);
+    }
     if (getenv("YASAI_WGMMA_DEBUG"))
       printf("yasai-tma load dst=0x%x bytes=%u coords=%d,%d,%d\n",
              (unsigned)dst_addr, (unsigned)size_in_bytes, coords[0], coords[1],

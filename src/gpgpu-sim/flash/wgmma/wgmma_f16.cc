@@ -1,3 +1,4 @@
+#include "../../../cuda-sim/yasai_func.h"
 #include "tensor_wgmma.h"
 
 #include <cassert>
@@ -117,8 +118,8 @@ void wgmma_m64nXk16_16bit_impl(const ptx_instruction *pI, core_t *core,
               ? wgmma_gmma_k_major_smem_addr(b_desc, col, k, sizeof(uint16_t),
                                              K)
               : wgmma_gmma_mn_major_smem_addr(b_desc, col, k, sizeof(uint16_t));
-      representative_thread->m_shared_mem->read(b_smem_addr, sizeof(b_bits),
-                                                &b_bits);
+      representative_thread->m_shared_mem->read(
+          b_smem_addr | yasai_func::own_rank_bits(), sizeof(b_bits), &b_bits);
       B_mat[col * K + k] = scale_b * elem16_to_f32(b_bits, bf16);
     }
   }
@@ -176,8 +177,8 @@ void wgmma_m64nXk16_16bit_impl(const ptx_instruction *pI, core_t *core,
                                                         sizeof(uint16_t), K)
                          : wgmma_gmma_mn_major_smem_addr(a_desc, row, k,
                                                          sizeof(uint16_t));
-        representative_thread->m_shared_mem->read(a_smem_addr, sizeof(a_bits),
-                                                  &a_bits);
+        representative_thread->m_shared_mem->read(
+            a_smem_addr | yasai_func::own_rank_bits(), sizeof(a_bits), &a_bits);
         A_mat[row * K + k] = scale_a * elem16_to_f32(a_bits, bf16);
       }
     }

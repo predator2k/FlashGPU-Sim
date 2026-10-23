@@ -216,6 +216,9 @@ tcgen05\.wait::ld TC; recognizer->add_option(TCGEN05_WAIT_LD_OPTION); yylval->in
 tcgen05\.cp TC; yylval->int_value = TCGEN05_CP_OP; return OPCODE;
 tcgen05\.shift TC; yylval->int_value = TCGEN05_SHIFT_OP; return OPCODE;
 tcgen05\.fence TC; yylval->int_value = TCGEN05_FENCE_OP; return OPCODE;
+clusterlaunchcontrol\.try_cancel[a-z0-9_.:]* TC; yylval->int_value = CLC_TRY_CANCEL_OP; return OPCODE; /* yasai */
+clusterlaunchcontrol\.query_cancel\.is_canceled[a-z0-9_.:]* TC; yylval->int_value = CLC_QUERY_IS_CANCELED_OP; return OPCODE; /* yasai */
+clusterlaunchcontrol\.query_cancel\.get_first_ctaid[a-z0-9_.:]* TC; yylval->int_value = CLC_QUERY_FIRST_CTAID_OP; return OPCODE; /* yasai */
 trap	TC; yylval->int_value = TRAP_OP; return OPCODE;
 vabsdiff TC; yylval->int_value = VABSDIFF_OP; return OPCODE;
 vadd    TC; yylval->int_value = VADD_OP; return OPCODE;
@@ -263,6 +266,10 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.m16n8k64 TC; yylval->int_value = MMA_M16N8K64; return CONFIGURATION;
 \.m8n8k4 TC; yylval->int_value = MMA_M8N8K4; return CONFIGURATION;
 \.m8n8k16 TC; yylval->int_value = MMA_M8N8K16; return CONFIGURATION;
+\.m8n8k32 TC; yylval->int_value = MMA_M8N8K32; return CONFIGURATION; /* yasai: s4/u4 */
+\.m8n8k128 TC; yylval->int_value = MMA_M8N8K128; return CONFIGURATION; /* yasai: b1 */
+\.m16n8k128 TC; yylval->int_value = MMA_M16N8K128; return CONFIGURATION; /* yasai: b1 */
+\.m16n8k256 TC; yylval->int_value = MMA_M16N8K256; return CONFIGURATION; /* yasai: b1 */
 \.m64n[0-9]+k(8|16|32|64|256) TC; yylval->int_value = parse_wgmma_shape_option(yytext); return WGMMA_SHAPE;
 
 \.f4e TC;  return PRMT_F4E_MODE;
@@ -389,6 +396,14 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.tf32  TC;  return TF32_TYPE;
 \.e4m3  TC;  return E4M3_TYPE;
 \.e5m2  TC;  return E5M2_TYPE;
+	/* yasai: element and scale types of mma.sync (kind::f8f6f4, block-scaled kinds, s4/u4) */
+\.e2m1  TC;  return E2M1_TYPE;
+\.e2m3  TC;  return E2M3_TYPE;
+\.e3m2  TC;  return E3M2_TYPE;
+\.ue8m0  TC;  return UE8M0_TYPE;
+\.ue4m3  TC;  return UE4M3_TYPE;
+\.s4  TC;  return S4_TYPE;
+\.u4  TC;  return U4_TYPE;
 	/* yasai: packed small floats are stored as b16 (b8 for e2m1x2); the instruction records
 	   the format (ptx_instruction::packed_minifloat) for cvt. */
 \.e4m3x2  TC;  return E4M3X2_TYPE;
@@ -511,6 +526,16 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.x64 TC; return X64_OPTION; /* yasai */
 \.x128 TC; return X128_OPTION; /* yasai */
 \.cta_group::1 TC; return TCGEN05_CTA_GROUP_1_OPTION;
+\.block_scale TC; return TCGEN05_BLOCK_SCALE_OPTION; /* yasai: block-scaled tcgen05.mma / mma */
+\.scale_vec::1X TC; return TCGEN05_SCALE_VEC_1X_OPTION; /* yasai */
+\.scale_vec::2X TC; return TCGEN05_SCALE_VEC_2X_OPTION; /* yasai */
+\.scale_vec::4X TC; return TCGEN05_SCALE_VEC_4X_OPTION; /* yasai */
+\.block16 TC; return TCGEN05_BLOCK16_OPTION; /* yasai */
+\.block32 TC; return TCGEN05_BLOCK32_OPTION; /* yasai */
+\.ws TC; return TCGEN05_WS_OPTION; /* yasai: weight-stationary tcgen05.mma */
+\.collector::[a-z0-9_:]+ TC; return TCGEN05_COLLECTOR_OPTION; /* yasai: collector buffer hints */
+\.tile::gather4 TC; return TMA_GATHER4_OPTION; /* yasai */
+\.tile::scatter4 TC; return TMA_SCATTER4_OPTION; /* yasai */
 \.cta_group::2 TC; return TCGEN05_CTA_GROUP_2_OPTION;
 \.kind::f16 TC; return TCGEN05_KIND_F16_OPTION;
 \.kind::tf32 TC; return TCGEN05_KIND_TF32_OPTION;

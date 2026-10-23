@@ -1175,6 +1175,22 @@ unsigned type_info_key::type_decode(int type, size_t &size, int &basic_type) {
       size = 8;
       basic_type = -1;
       return 23;
+    case E2M1_TYPE:  // yasai: mma.sync operand types only; never declare registers
+    case E2M3_TYPE:
+    case E3M2_TYPE:
+    case UE8M0_TYPE:
+    case UE4M3_TYPE:
+      size = 8;
+      basic_type = -1;
+      return 22;
+    case S4_TYPE:
+      size = 4;
+      basic_type = 1;
+      return 0;
+    case U4_TYPE:
+      size = 4;
+      basic_type = 0;
+      return 4;
     case B16_TYPE:
       size = 16;
       basic_type = 0;
@@ -1450,6 +1466,18 @@ ptx_instruction::ptx_instruction(
           break;
         case MMA_M8N8K16:
           m_mma_shape = flash_gpgpu_sim::MMA_M8N8K16;
+          break;
+        case MMA_M8N8K32:  // yasai
+          m_mma_shape = flash_gpgpu_sim::MMA_M8N8K32;
+          break;
+        case MMA_M8N8K128:
+          m_mma_shape = flash_gpgpu_sim::MMA_M8N8K128;
+          break;
+        case MMA_M16N8K128:
+          m_mma_shape = flash_gpgpu_sim::MMA_M16N8K128;
+          break;
+        case MMA_M16N8K256:
+          m_mma_shape = flash_gpgpu_sim::MMA_M16N8K256;
           break;
         // MMA layouts - collect both layout tokens
         case ROW:
@@ -1760,6 +1788,16 @@ ptx_instruction::ptx_instruction(
       case X8_OPTION:
       case X64_OPTION:
       case X128_OPTION:
+      case TCGEN05_BLOCK_SCALE_OPTION:  // yasai: read by the tcgen05/mma handlers
+      case TCGEN05_SCALE_VEC_1X_OPTION:
+      case TCGEN05_SCALE_VEC_2X_OPTION:
+      case TCGEN05_SCALE_VEC_4X_OPTION:
+      case TCGEN05_BLOCK16_OPTION:
+      case TCGEN05_BLOCK32_OPTION:
+      case TCGEN05_WS_OPTION:
+      case TCGEN05_COLLECTOR_OPTION:
+      case TMA_GATHER4_OPTION:
+      case TMA_SCATTER4_OPTION:
       case TCGEN05_CTA_GROUP_1_OPTION:
       case TCGEN05_CTA_GROUP_2_OPTION:
       case TCGEN05_KIND_F16_OPTION:

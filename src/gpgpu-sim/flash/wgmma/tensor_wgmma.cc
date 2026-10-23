@@ -520,6 +520,13 @@ void tensor_wgmma_impl(const ptx_instruction *pI, core_t *core,
     return;
   }
 
+  // yasai: every other dense combination (all N, f16 accumulators, fp8, int8,
+  // tf32) goes through the generic implementation (wgmma_generic.cc).
+  if (a_type != B1_TYPE) {
+    wgmma_generic_impl(pI, core, inst);
+    return;
+  }
+
   if (accumulator_type == F32_TYPE && a_type == TF32_TYPE &&
       b_type == TF32_TYPE && pI->get_wgmma_shape_n() == 8 &&
       pI->get_wgmma_shape_k() == 8) {

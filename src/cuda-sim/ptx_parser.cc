@@ -612,6 +612,13 @@ void ptx_recognizer::add_scalar_type_spec(int type_spec) {
     case U8_TYPE:
     case E4M3_TYPE:
     case E5M2_TYPE:
+    case E2M1_TYPE:  // yasai: mma.sync element and scale types
+    case E2M3_TYPE:
+    case E3M2_TYPE:
+    case UE8M0_TYPE:
+    case UE4M3_TYPE:
+    case S4_TYPE:
+    case U4_TYPE:
       g_size = 1;
       break;
     case B16_TYPE:

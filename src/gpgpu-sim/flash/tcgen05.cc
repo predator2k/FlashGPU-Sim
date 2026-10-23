@@ -63,10 +63,19 @@ static unsigned tcgen05_cta_group(const ptx_instruction *pI) {
   return 1;
 }
 
-static void tcgen05_assert_cta_group1(const ptx_instruction *pI) {
-  assert(tcgen05_cta_group(pI) == 1 &&
-         "TCGen05 cta_group::2 is parsed but not implemented");
-}
+// yasai: cta_group::2 is implemented (functional mode, yasai_umma.cc); the
+// check is kept as a no-op so the handlers read as before.
+static void tcgen05_assert_cta_group1(const ptx_instruction *pI) { (void)pI; }
+
+// yasai: functional model of tcgen05.mma/ld/st/cp/commit
+// (tcgen05/yasai_umma.cc).
+namespace yumma {
+void mma(const ptx_instruction *pI, ptx_thread_info *t);
+void ld(const ptx_instruction *pI, ptx_thread_info *t);
+void st(const ptx_instruction *pI, ptx_thread_info *t);
+void cp(const ptx_instruction *pI, ptx_thread_info *t);
+void commit(const ptx_instruction *pI, ptx_thread_info *t);
+} // namespace yumma
 
 bool tcgen05_has_option(const ptx_instruction *pI, int option) {
   std::list<int> options = pI->get_options();
@@ -92,8 +101,11 @@ tcgen05_tmem_scope(const ptx_instruction *pI, const ptx_thread_info *thread) {
   if (cta_id == (unsigned)-1)
     cta_id = thread->get_flat_ctaid();
 
-  return flash_gpgpu_sim::tcgen05_tmem_scope_t{sm_id, cta_id,
-                                               tcgen05_cta_group(pI)};
+  // yasai: TMEM is per CTA whatever the cta_group of the instruction (an
+  // allocation made with cta_group::2 is read by tcgen05.ld, which has no
+  // cta_group).
+  (void)pI;
+  return flash_gpgpu_sim::tcgen05_tmem_scope_t{sm_id, cta_id, 1};
 }
 
 static uint32_t tcgen05_apply_thread_lane(uint32_t address,
@@ -388,6 +400,16 @@ void handle_tcgen05_mma_inst(const ptx_instruction *pI,
                              ptx_thread_info *thread) {
   if (!tcgen05_is_warp_leader(thread))
     return;
+  if (thread->isInFunctionalSimulationMode()) {
+    inst_t::tcgen05_dyn_info_t perf_info;
+    const uint32_t idesc = tcgen05_read_operand(pI, thread, 3).u32;
+    perf_info.mma_work = 2ULL * (((idesc >> 24) & 0x1F) << 4) *
+                         (((idesc >> 17) & 0x3F) << 3) * 32;
+    const_cast<ptx_instruction *>(pI)->set_tcgen05_dyn_info(
+        thread->get_laneid(), perf_info);
+    yumma::mma(pI, thread);
+    return;
+  }
   tcgen05_assert_cta_group1(pI);
   assert(pI->get_num_operands() >= 5);
   assert(tcgen05_has_option(pI, TCGEN05_KIND_F16_OPTION));
@@ -471,6 +493,10 @@ void handle_tcgen05_mma_inst(const ptx_instruction *pI,
 
 void handle_tcgen05_commit_inst(const ptx_instruction *pI,
                                 ptx_thread_info *thread) {
+  if (thread->isInFunctionalSimulationMode()) {
+    yumma::commit(pI, thread);
+    return;
+  }
   tcgen05_assert_cta_group1(pI);
   assert(pI->get_num_operands() >= 1);
   assert(tcgen05_has_option(pI, TCGEN05_MBARRIER_ARRIVE_ONE_OPTION));
@@ -482,6 +508,10 @@ void handle_tcgen05_commit_inst(const ptx_instruction *pI,
 
 void handle_tcgen05_ld_inst(const ptx_instruction *pI,
                             ptx_thread_info *thread) {
+  if (thread->isInFunctionalSimulationMode()) {
+    yumma::ld(pI, thread);
+    return;
+  }
   tcgen05_assert_cta_group1(pI);
   assert(pI->get_num_operands() >= 2);
 
@@ -510,6 +540,10 @@ void handle_tcgen05_ld_inst(const ptx_instruction *pI,
 
 void handle_tcgen05_st_inst(const ptx_instruction *pI,
                             ptx_thread_info *thread) {
+  if (thread->isInFunctionalSimulationMode()) {
+    yumma::st(pI, thread);
+    return;
+  }
   tcgen05_assert_cta_group1(pI);
   assert(pI->get_num_operands() >= 2);
 
@@ -545,6 +579,10 @@ void handle_tcgen05_cp_inst(const ptx_instruction *pI,
                             ptx_thread_info *thread) {
   if (!tcgen05_is_warp_leader(thread))
     return;
+  if (thread->isInFunctionalSimulationMode()) {
+    yumma::cp(pI, thread);
+    return;
+  }
   tcgen05_assert_cta_group1(pI);
   assert(pI->get_num_operands() >= 2);
 

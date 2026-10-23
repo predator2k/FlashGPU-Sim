@@ -46,12 +46,16 @@ enum mma_shape_type {
   MMA_M16N8K8, // F16, BF16, TF32
 
   // SM80 (Ampere) only
-  MMA_M16N8K4,  // TF32
-  MMA_M16N8K16, // F16, BF16, S8/U8
-  MMA_M16N8K32, // S8/U8
-  MMA_M16N8K64, // S4/U4
-  MMA_M8N8K4,   // F64, F16/BF16
-  MMA_M8N8K16   // S8/U8
+  MMA_M16N8K4,   // TF32
+  MMA_M16N8K16,  // F16, BF16, S8/U8
+  MMA_M16N8K32,  // S8/U8
+  MMA_M16N8K64,  // S4/U4
+  MMA_M8N8K4,    // F64, F16/BF16
+  MMA_M8N8K16,   // S8/U8
+  MMA_M8N8K32,   // S4/U4 (yasai)
+  MMA_M8N8K128,  // B1 (yasai)
+  MMA_M16N8K128, // B1 (yasai)
+  MMA_M16N8K256  // B1 (yasai)
 };
 
 // MMA layout modes for matrix operands
@@ -94,6 +98,12 @@ void tensor_mma_tf32_impl(const ptx_instruction *pI, core_t *core,
 
 // tensor_mma_s8_impl: S8/U8 integer MMA implementation
 // Implements functional simulation for M16N8K16/K32 integer tensor cores
+// yasai: generic mma.sync model (mma_generic.cc) for FP8/FP6/FP4, block-scaled
+// kinds, u8, s4/u4, b1 and f64.
+void tensor_mma_generic_impl(const ptx_instruction *pI, core_t *core,
+                             warp_inst_t inst, int M, int N, int K,
+                             unsigned tid);
+
 void tensor_mma_s8_impl(const ptx_instruction *pI, core_t *core,
                         warp_inst_t inst, int M, int N, int K, bool saturate,
                         unsigned tid, const operand_info &dst);
