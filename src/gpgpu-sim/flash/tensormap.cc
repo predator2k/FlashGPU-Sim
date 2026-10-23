@@ -215,8 +215,12 @@ void tensormap_descriptor_t::print() const {
       return "TMA_SWIZZLE_64B";
     case TMA_SWIZZLE_128B:
       return "TMA_SWIZZLE_128B";
-    case TMA_SWIZZLE_96B:
-      return "TMA_SWIZZLE_96B";
+    case TMA_SWIZZLE_128B_ATOM_32B:
+      return "TMA_SWIZZLE_128B_ATOM_32B";
+    case TMA_SWIZZLE_128B_ATOM_32B_FLIP_8B:
+      return "TMA_SWIZZLE_128B_ATOM_32B_FLIP_8B";
+    case TMA_SWIZZLE_128B_ATOM_64B:
+      return "TMA_SWIZZLE_128B_ATOM_64B";
     default:
       return "TMA_SWIZZLE_UNKNOWN";
     }

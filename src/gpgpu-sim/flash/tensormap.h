@@ -44,7 +44,10 @@ class ptx_instruction;
 #define TMA_SWIZZLE_32B 1u
 #define TMA_SWIZZLE_64B 2u
 #define TMA_SWIZZLE_128B 3u
-#define TMA_SWIZZLE_96B 4u
+// yasai: CUDA 12.8 names; 4 was called 96B here before.
+#define TMA_SWIZZLE_128B_ATOM_32B 4u
+#define TMA_SWIZZLE_128B_ATOM_32B_FLIP_8B 5u
+#define TMA_SWIZZLE_128B_ATOM_64B 6u
 
 // Out-of-bound fill modes
 #define TMA_OOB_ZERO 0u

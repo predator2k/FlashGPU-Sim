@@ -90,6 +90,9 @@ class functionalCoreSim : public core_t {
   void yasai_join_cluster(yasai_func::ClusterState *cluster, unsigned rank);
   // yasai: live threads of the CTA.
   unsigned yasai_live_threads() const;
+  // yasai: prints, for every warp with a live thread, the PTX line its first live thread is at
+  // (hang diagnosis, YASAI_HANG_ROUNDS).
+  void yasai_dump_warps(FILE *out) const;
   // yasai: the CTA's own shared memory (before joining a cluster) and the uid of its CTA.
   memory_space *yasai_shared_memory() const;
   uint64_t yasai_cta_key() const;

@@ -151,17 +151,24 @@ struct CUctx_st {
       printf("Warning: cannot find hostFun %p\n", hostFun);
       abort();
     }
-    // yasai: a kernel registered before its PTX file was loaded (lazy loading).
+    // yasai: a kernel registered before its PTX file was loaded (lazy loading). The file may
+    // already be loaded by an earlier kernel of the same file (layer_norm, then rms_norm from
+    // the same libtorch_cuda PTX file), so the symbol is looked up whether or not this call
+    // loaded it; before, the second kernel stayed NULL and its launch crashed.
     if (i->second == NULL) {
       auto p = m_yasai_pending_kernel.find(hostFun);
-      if (p != m_yasai_pending_kernel.end() && yasai_func::g_lazy_load_name != nullptr &&
-          yasai_func::g_lazy_load_name(p->second.c_str())) {
+      if (p != m_yasai_pending_kernel.end()) {
+        if (yasai_func::g_lazy_load_name != nullptr)
+          yasai_func::g_lazy_load_name(p->second.c_str());
         symbol *s = NULL;
         for (size_t k = m_all_code.size(); s == NULL && k > 0; --k)
           s = m_all_code[k - 1]->lookup(p->second.c_str());
         if (s != NULL && s->get_pc() != NULL) {
           i->second = s->get_pc();
           m_yasai_pending_kernel.erase(p);
+        } else {
+          fprintf(stderr, "yasai: no PTX entry %s for a registered kernel\n", p->second.c_str());
+          abort();
         }
       }
     }

@@ -29,6 +29,7 @@
 #include "ptx_loader.h"
 #include <dirent.h>
 #include <cctype>
+#include <map>
 #include <string>
 #include <cerrno>
 #include <sys/stat.h>
@@ -365,8 +366,11 @@ void yasai_replace_word(std::string &line, const std::string &from, const std::s
 // label namespace per function, so a branch went to another block's label of the same name and
 // skipped code (FlashMLA's sparse prefill copied only part of a K/V block). Labels defined inside
 // a block nested in a function body (depth 2 or more, on lines that hold only the brace) are
-// renamed to <name>__yb<k>, a name unique to the block, in every line of that block. The text
-// keeps its line count. Returns text unchanged (and *changed false) when no such label exists.
+// renamed to <name>__yb<k>, a name unique to the block, in every line of that block, when the
+// function defines that name more than once. A name defined once stays as it is, because nvcc
+// also branches into a block from outside it (FlashMLA's SM100 prefill jumps to a basic-block
+// label that sits between two halves of a split asm block). The text keeps its line count.
+// Returns text unchanged (and *changed false) when no label is renamed.
 std::string yasai_scope_block_labels(const std::string &text, bool *changed) {
   *changed = false;
   if (text.find("{\n") == std::string::npos) return text;
@@ -383,6 +387,26 @@ std::string yasai_scope_block_labels(const std::string &text, bool *changed) {
       start = nl + 1;
     }
   }
+  // Definitions per label name in each function body (function = outermost block).
+  std::vector<unsigned> func_of(lines.size(), 0);
+  std::vector<std::map<std::string, unsigned>> def_count(1);
+  {
+    unsigned depth = 0, func = 0;
+    for (size_t i = 0; i < lines.size(); ++i) {
+      if (yasai_is_brace_line(lines[i], '{')) {
+        if (depth == 0) {
+          func = unsigned(def_count.size());
+          def_count.emplace_back();
+        }
+        ++depth;
+      } else if (yasai_is_brace_line(lines[i], '}') && depth > 0) {
+        --depth;
+      }
+      func_of[i] = depth > 0 ? func : 0;
+      const std::string d = yasai_label_definition(lines[i]);
+      if (!d.empty() && depth > 0) def_count[func][d]++;
+    }
+  }
   std::vector<size_t> open;  // line index of each open block
   unsigned next_block = 0;
   for (size_t i = 0; i < lines.size(); ++i) {
@@ -395,7 +419,8 @@ std::string yasai_scope_block_labels(const std::string &text, bool *changed) {
       std::vector<std::string> defs;
       for (size_t j = b + 1; j < i; ++j) {
         std::string d = yasai_label_definition(lines[j]);
-        if (!d.empty() && d.find("__yb") == std::string::npos) defs.push_back(d);
+        if (!d.empty() && d.find("__yb") == std::string::npos && def_count[func_of[j]][d] > 1)
+          defs.push_back(d);
       }
       if (defs.empty()) continue;
       const std::string suffix = "__yb" + std::to_string(next_block++);

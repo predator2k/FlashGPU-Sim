@@ -5121,6 +5121,50 @@ void mov_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   unsigned i_type = pI->get_type();
   assert(src1.is_param_local() == 0);
 
+  // yasai: mov.b128 packs two 64-bit or four 32-bit registers into a scalar .b128 register, or
+  // unpacks one (FlashMLA SM100 builds tcgen05/TMA operands this way).
+  if (i_type == BB128_TYPE && (src1.is_vector() || dst.is_vector())) {
+    uint32_t w[4] = {0, 0, 0, 0};
+    if (src1.is_vector()) {
+      const unsigned n = src1.get_vect_nelem();
+      ptx_reg_t v[4];
+      thread->get_vector_operand_values(src1, v, n);
+      for (unsigned i = 0; i < n; i++) {
+        if (n == 2) {
+          w[2 * i] = uint32_t(v[i].u64);
+          w[2 * i + 1] = uint32_t(v[i].u64 >> 32);
+        } else {
+          w[i] = v[i].u32;
+        }
+      }
+    } else {
+      const ptx_reg_t r = thread->get_reg(src1.get_symbol());
+      w[0] = r.u128.lowest;
+      w[1] = r.u128.low;
+      w[2] = r.u128.high;
+      w[3] = r.u128.highest;
+    }
+    if (dst.is_vector()) {
+      const unsigned n = dst.get_vect_nelem();
+      for (unsigned i = 0; i < n; i++) {
+        if (strcmp(dst.vec_symbol(i)->name().c_str(), "_") == 0) continue;
+        ptx_reg_t e;
+        e.u64 = 0;
+        if (n == 2) e.u64 = uint64_t(w[2 * i]) | (uint64_t(w[2 * i + 1]) << 32);
+        else e.u32 = w[i];
+        thread->set_reg(dst.vec_symbol(i), e);
+      }
+    } else {
+      ptx_reg_t r;
+      r.u128.lowest = w[0];
+      r.u128.low = w[1];
+      r.u128.high = w[2];
+      r.u128.highest = w[3];
+      thread->set_reg(dst.get_symbol(), r);
+    }
+    return;
+  }
+
   if (i_type == B64_TYPE && pI->get_num_operands() == 3 &&
       !src1.is_vector() && pI->src2().is_literal()) {
     ptx_reg_t lo = thread->get_operand_value(src1, dst, B32_TYPE, thread, 1);

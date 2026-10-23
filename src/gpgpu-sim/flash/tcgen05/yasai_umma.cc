@@ -271,10 +271,14 @@ void d_cell(unsigned m_cta, unsigned n_total, bool pair, bool ws, unsigned m,
   col = n % span;
 }
 
-// Scale factor value for row/column x and K block j from TMEM.
+// Scale factor value for row/column x and K block j from TMEM (sf_id: data ID,
+// the byte offset of the first scale factor in each TMEM word, from the
+// instruction descriptor).
 double scale_factor(tcgen05_tmem_manager_t &mgr, const tcgen05_tmem_scope_t &sc,
-                    uint32_t addr, unsigned x, unsigned j, bool ue8m0) {
-  const unsigned byte = ((addr >> 30) & 3u) + j;
+                    uint32_t addr, unsigned sf_id, unsigned x, unsigned j,
+                    bool ue8m0) {
+  const unsigned byte =
+      sf_id + j; // the data ID is a byte offset in the TMEM word
   const unsigned lane = ((addr >> 16) & 0x7Fu) + (x % 32);
   const unsigned col = (addr & 0xFFFFu) + x / 32 + byte / 4;
   const uint32_t word = mgr.peek(sc, lane, col);
@@ -332,24 +336,51 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
   }
   while (next + 1 < nops && pI->operand_lookup(next).is_vector())
     next++; // disable-output mask
+  // enable-input-d follows the operands above. After it come scale-input-d
+  // (non-.ws, an immediate: D = A * B + D * 2^-scale) or the zero-column mask
+  // descriptor (.ws), so it is not always the last operand.
   bool enable_d = true;
-  {
-    const operand_info &op = pI->operand_lookup(nops - 1);
+  double d_scale = 1.0;
+  if (next < nops) {
+    const operand_info &op = pI->operand_lookup(next);
     if (op.is_reg() && op.get_symbol() &&
         op.get_symbol()->type()->get_key().scalar_type() == PRED_TYPE)
       enable_d = (t->get_operand_value(op, op, PRED_TYPE, t, 1).pred & 1) == 0;
     else
       enable_d = t->get_operand_value(op, op, B32_TYPE, t, 1).u32 != 0;
+    if (!ws && next + 1 < nops)
+      d_scale = std::ldexp(1.0, -int(u32(next + 1)));
+    if (ws && next + 1 < nops && u64(next + 1) != 0) {
+      fprintf(
+          stderr,
+          "yasai-umma: tcgen05.mma.ws zero-column mask is not implemented\n");
+      abort();
+    }
   }
 
-  // Instruction descriptor.
-  const unsigned c_format = (idesc >> 4) & 3;
+  // Instruction descriptor (PTX ISA 9.7.18.4.2). The block-scaled kinds (Table
+  // 53) use another layout than kind::f16/tf32/f8f6f4/i8 (Table 51): bits 4-5
+  // hold the SFB data ID instead of the D type (D is f32), bits 29-30 the SFA
+  // data ID, bits 27-28 M >> 7, bit 23 (mxf8f6f4) or bits 23-24 (mxf4/mxf4nvf4)
+  // the scale type, and bit 31 (with bit 3 for mxf4) K.
+  const bool bs_kind = kind == MXF8F6F4 || kind == MXF4 || kind == MXF4NVF4;
+  const unsigned c_format = bs_kind ? 1u : (idesc >> 4) & 3;
   const unsigned a_format = (idesc >> 7) & 7, b_format = (idesc >> 10) & 7;
   const bool a_neg = (idesc >> 13) & 1, b_neg = (idesc >> 14) & 1;
   const bool a_mn = (idesc >> 15) & 1, b_mn = (idesc >> 16) & 1;
   const unsigned N = ((idesc >> 17) & 0x3F) << 3;
-  const unsigned M = ((idesc >> 24) & 0x1F) << 4;
-  const bool scale_ue8m0 = (idesc >> 23) & 1;
+  const unsigned M =
+      bs_kind ? ((idesc >> 27) & 3) << 7 : ((idesc >> 24) & 0x1F) << 4;
+  const unsigned scale_type =
+      kind == MXF8F6F4 ? (idesc >> 23) & 1 : (idesc >> 23) & 3;
+  const bool scale_ue8m0 = scale_type == 1;
+  if (bs_kind && scale_type > 1) {
+    fprintf(stderr, "yasai-umma: scale type %u (ue5m3) is not implemented\n",
+            scale_type);
+    abort();
+  }
+  const unsigned sfb_id = bs_kind ? (idesc >> 4) & 3 : 0;
+  const unsigned sfa_id = bs_kind ? (idesc >> 29) & 3 : 0;
   if ((idesc >> 2) & 1) {
     fprintf(stderr, "yasai-umma: sparse tcgen05.mma is not implemented\n");
     abort();
@@ -391,7 +422,11 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
     break;
   case MXF4:
   case MXF4NVF4:
-    K = (idesc >> 31) & 1 ? 96 : 64;
+    K = 64 +
+        32 * ((((idesc >> 3) & 1) << 1) | ((idesc >> 31) & 1)); // 64, 96 or 128
+    break;
+  case MXF8F6F4:
+    K = (idesc >> 31) & 1 ? 64 : 32;
     break;
   default:
     K = 32;
@@ -475,7 +510,7 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
       std::vector<double> sa(nsf, 1.0);
       if (block_scale)
         for (unsigned j = 0; j < nsf; ++j)
-          sa[j] = scale_factor(mgr, sc, sfa_addr, m, j, scale_ue8m0);
+          sa[j] = scale_factor(mgr, sc, sfa_addr, sfa_id, m, j, scale_ue8m0);
       for (unsigned n = 0; n < N; ++n) {
         unsigned lane, col;
         d_cell(m_cta, N, pair, ws, m, n, lane, col);
@@ -497,13 +532,14 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
           for (unsigned k = j * block; k < (j + 1) * block; ++k)
             part += a[k] * B[size_t(n) * K + k];
           if (block_scale)
-            part *= sa[j] * scale_factor(mgr, sc, sfb_addr, n, j, scale_ue8m0);
+            part *= sa[j] *
+                    scale_factor(mgr, sc, sfb_addr, sfb_id, n, j, scale_ue8m0);
           acc += part;
         }
         if (c_format ==
             0) { // f16 accumulator, one per 32-bit word in the low 16 bits
           const double prev = enable_d ? fmt_value(kF16, old & 0xFFFF) : 0.0;
-          const float r = float(prev + acc);
+          const float r = float(prev * d_scale + acc);
           mgr.poke(sc, d_lane0 + lane, d_col0 + col,
                    yasai_func::minifloat_encode_f16(r));
           continue;
@@ -511,7 +547,7 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
         float prev = 0;
         if (enable_d)
           memcpy(&prev, &old, 4);
-        const float r = float(double(prev) + acc);
+        const float r = float(double(prev) * d_scale + acc);
         uint32_t ru;
         memcpy(&ru, &r, 4);
         mgr.poke(sc, d_lane0 + lane, d_col0 + col, ru);

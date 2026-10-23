@@ -364,7 +364,7 @@ static unsigned compute_inst_dim(unsigned dim_option) {
   case DIM_5D_OPTION:
     return 5;
   default:
-    printf("TMA ERROR: Unknown dimension option %d\n", dim_option);
+    fprintf(stderr, "TMA ERROR: Unknown dimension option %d\n", dim_option);
     abort();
   }
 }
@@ -400,8 +400,8 @@ static bool validate_tensormap(uint64_t tensormap_addr,
                                const tensormap_descriptor_t &tensormap,
                                unsigned inst_dim) {
   if (!tensormap.is_valid()) {
-    printf("TMA ERROR: Invalid tensormap at 0x%llx\n",
-           (unsigned long long)tensormap_addr);
+    fprintf(stderr, "TMA ERROR: Invalid tensormap at 0x%llx\n",
+            (unsigned long long)tensormap_addr);
     tensormap.print();
     fflush(stdout);
     exit(1);
@@ -409,9 +409,10 @@ static bool validate_tensormap(uint64_t tensormap_addr,
 
   unsigned tensormap_dim = tensormap.num_dims();
   if (tensormap_dim != inst_dim) {
-    printf("TMA ERROR: Dimension mismatch - instruction is %uD but tensormap "
-           "num_dims is %u (dim=%uD)\n",
-           inst_dim, tensormap_dim, tensormap_dim);
+    fprintf(stderr,
+            "TMA ERROR: Dimension mismatch - instruction is %uD but tensormap "
+            "num_dims is %u (dim=%uD)\n",
+            inst_dim, tensormap_dim, tensormap_dim);
     fflush(stdout);
     exit(1);
   }
@@ -1255,8 +1256,8 @@ public:
             validate_tensormap(tensormap_addr, tensormap,
                                tma_static_info.tensor_dim);
           } else if (!tensormap.is_valid()) {
-            printf("TMA ERROR: Invalid tensormap at 0x%llx\n",
-                   (unsigned long long)tensormap_addr);
+            fprintf(stderr, "TMA ERROR: Invalid tensormap at 0x%llx\n",
+                    (unsigned long long)tensormap_addr);
             tensormap.print();
             fflush(stdout);
             exit(1);
@@ -1952,24 +1953,32 @@ static uint64_t apply_tma_swizzle(uint64_t linear_offset,
   if (swizzle_mode == TMA_SWIZZLE_NONE)
     return linear_offset;
 
-  uint32_t mask = 0;
-  constexpr uint32_t shift = 4; // only support 16B granularity for now
-
+  // XOR of the 128-byte row index bits (address bits 7 and up, masked) into the
+  // chunk index: 16-byte chunks for 32B/64B/128B, 32-byte and 64-byte atoms for
+  // the CUDA 12.8 modes 128B_ATOM_32B (CuTe Swizzle<2,5,2>) and 128B_ATOM_64B
+  // (Swizzle<1,6,1>).
+  uint32_t mask = 0, shift = 4;
   switch (swizzle_mode) {
   case TMA_SWIZZLE_128B:
     mask = 0x7;
-    break; // 3 bits, cycle of 8
+    break;
   case TMA_SWIZZLE_64B:
     mask = 0x3;
-    break; // 2 bits, cycle of 4
+    break;
   case TMA_SWIZZLE_32B:
     mask = 0x1;
-    break; // 1 bit, cycle of 2
-  case TMA_SWIZZLE_96B:
-    printf("ERROR: TMA 96B swizzle mode is not yet implemented\n");
-    abort();
+    break;
+  case TMA_SWIZZLE_128B_ATOM_32B:
+    mask = 0x3;
+    shift = 5;
+    break;
+  case TMA_SWIZZLE_128B_ATOM_64B:
+    mask = 0x1;
+    shift = 6;
+    break;
   default:
-    printf("ERROR: Unknown TMA swizzle mode %u\n", swizzle_mode);
+    fprintf(stderr, "TMA ERROR: swizzle mode %u is not implemented\n",
+            swizzle_mode);
     abort();
   }
 
@@ -2191,9 +2200,10 @@ public:
     if (oob_mode == TMA_OOB_NAN && !nan_supported[dtype]) {
       static bool warned[NUM_DTYPES] = {false};
       if (!warned[dtype]) {
-        printf("TMA ERROR: OOB_NAN not supported for data type %u, using zero "
-               "fill\n",
-               dtype);
+        fprintf(stderr,
+                "TMA ERROR: OOB_NAN not supported for data type %u, using zero "
+                "fill\n",
+                dtype);
         warned[dtype] = true;
       }
       return patterns[TMA_OOB_ZERO][dtype];
@@ -2384,9 +2394,10 @@ static void do_tma_transfer(
       } else {
         const uint32_t element_size = tensormap.get_element_size();
         if (req_size % element_size != 0) {
-          printf("TMA ERROR: tensor reduction request size %u is not a "
-                 "multiple of element size %u\n",
-                 req_size, element_size);
+          fprintf(stderr,
+                  "TMA ERROR: tensor reduction request size %u is not a "
+                  "multiple of element size %u\n",
+                  req_size, element_size);
           abort();
         }
         std::vector<uint8_t> destination(req_size);
@@ -2425,8 +2436,8 @@ static tma_reduction_op_t decode_tma_reduction_op(const ptx_instruction *pI) {
   case ATOMIC_XOR:
     return tma_reduction_op_t::BIT_XOR;
   default:
-    printf("TMA ERROR: unsupported tensor reduction operation %u\n",
-           pI->get_atomic());
+    fprintf(stderr, "TMA ERROR: unsupported tensor reduction operation %u\n",
+            pI->get_atomic());
     pI->print_insn();
     abort();
   }
@@ -2452,8 +2463,9 @@ static void reduce_add_f32_mem(memory_space *src_mem, uint64_t src_addr,
                                uint32_t size_in_bytes, ptx_thread_info *thread,
                                const ptx_instruction *pI) {
   if (size_in_bytes % sizeof(float) != 0) {
-    printf("TMA ERROR: f32 reduce size must be a multiple of 4, got %u\n",
-           size_in_bytes);
+    fprintf(stderr,
+            "TMA ERROR: f32 reduce size must be a multiple of 4, got %u\n",
+            size_in_bytes);
     abort();
   }
 
@@ -2471,10 +2483,11 @@ static void reduce_add_f32_mem(memory_space *src_mem, uint64_t src_addr,
 static void check_tma_alignment(uint64_t dst_addr, uint64_t src_addr,
                                 uint32_t size_in_bytes) {
   if (dst_addr % 16 != 0 || src_addr % 16 != 0 || size_in_bytes % 16 != 0) {
-    printf("TMA ERROR: unaligned TMA copy dst=0x%llx, src=0x%llx, "
-           "size_in_bytes=%u\n",
-           (unsigned long long)dst_addr, (unsigned long long)src_addr,
-           size_in_bytes);
+    fprintf(stderr,
+            "TMA ERROR: unaligned TMA copy dst=0x%llx, src=0x%llx, "
+            "size_in_bytes=%u\n",
+            (unsigned long long)dst_addr, (unsigned long long)src_addr,
+            size_in_bytes);
     abort();
   }
 }
@@ -2529,7 +2542,7 @@ static void handle_tma_copy(ptx_instruction *pI, ptx_thread_info *thread) {
   }
 
   if (space_options.size() < 2 || completion_option == 0) {
-    printf("TMA ERROR: unsupported linear TMA option list: ");
+    fprintf(stderr, "TMA ERROR: unsupported linear TMA option list: ");
     for (auto op : options) {
       printf("%d ", op);
     }
@@ -2623,7 +2636,8 @@ static void handle_tma_copy(ptx_instruction *pI, ptx_thread_info *thread) {
     if (reduce_add) {
       const auto scalar_types = pI->get_scalar_type();
       if (scalar_types.empty() || scalar_types.front() != F32_TYPE) {
-        printf("TMA ERROR: only cp.reduce.async.bulk.add.f32 is supported\n");
+        fprintf(stderr,
+                "TMA ERROR: only cp.reduce.async.bulk.add.f32 is supported\n");
         pI->print_insn();
         abort();
       }
@@ -2641,9 +2655,10 @@ static void handle_tma_copy(ptx_instruction *pI, ptx_thread_info *thread) {
                          reduce_add ? " reduce.add.f32" : "",
                          (unsigned long long)dst_addr, src_addr, size_in_bytes);
   } else {
-    printf("TMA ERROR: unsupported linear TMA instruction options: dst=%d "
-           "src=%d completion=%d reduce_add=%d\n",
-           dst_option, src_option, completion_option, reduce_add ? 1 : 0);
+    fprintf(stderr,
+            "TMA ERROR: unsupported linear TMA instruction options: dst=%d "
+            "src=%d completion=%d reduce_add=%d\n",
+            dst_option, src_option, completion_option, reduce_add ? 1 : 0);
     printf("  raw options: ");
     for (auto op : options) {
       printf("%d ", op);
@@ -2737,7 +2752,7 @@ static void handle_tma_tensor(ptx_instruction *pI, ptx_thread_info *thread) {
   }
 
   if (dim_option == 0 || space_options.size() < 2 || completion_option == 0) {
-    printf("TMA ERROR: unsupported tensor TMA option list: ");
+    fprintf(stderr, "TMA ERROR: unsupported tensor TMA option list: ");
     for (auto op : options) {
       printf("%d ", op);
     }
@@ -2758,7 +2773,8 @@ static void handle_tma_tensor(ptx_instruction *pI, ptx_thread_info *thread) {
       src_option == GLOBAL_OPTION &&
       completion_option == TMA_MBAR_COMPLETE_BYTES) {
     if (reduction_op != tma_reduction_op_t::NONE) {
-      printf("TMA ERROR: tensor reduction is only supported for stores\n");
+      fprintf(stderr,
+              "TMA ERROR: tensor reduction is only supported for stores\n");
       pI->print_insn();
       abort();
     }
@@ -2876,10 +2892,11 @@ static void handle_tma_tensor(ptx_instruction *pI, ptx_thread_info *thread) {
     if (reduction_op != tma_reduction_op_t::NONE &&
         !tma_tensor_reduction_supported(reduction_op,
                                         tensormap.fields.tensorDataType)) {
-      printf("TMA ERROR: tensor reduction %s does not support tensor-map "
-             "data type %u\n",
-             tma_reduction_op_name(reduction_op),
-             tensormap.fields.tensorDataType);
+      fprintf(stderr,
+              "TMA ERROR: tensor reduction %s does not support tensor-map "
+              "data type %u\n",
+              tma_reduction_op_name(reduction_op),
+              tensormap.fields.tensorDataType);
       pI->print_insn();
       abort();
     }

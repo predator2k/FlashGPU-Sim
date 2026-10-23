@@ -3599,16 +3599,30 @@ void cuda_sim::gpgpu_cuda_ptx_sim_main_func(kernel_info_t &kernel,
           for (unsigned r = 0; r < csize; r++) ctas[r]->yasai_join_cluster(&state, r);
           yasai_func::set_cluster(&state);
           bool live = true;
+          // yasai: YASAI_HANG_ROUNDS=<n> stops a cluster that is still live after n rounds and
+          // prints where each warp is (a spin on a barrier that never completes).
+          static const unsigned long hang_rounds =
+              getenv("YASAI_HANG_ROUNDS") ? strtoul(getenv("YASAI_HANG_ROUNDS"), NULL, 10) : 0;
+          unsigned long rounds = 0;
           while (live) {
             live = false;
             for (unsigned r = 0; r < csize; r++) {
               yasai_func::set_current_rank(r);
               live = ctas[r]->yasai_round() || live;
             }
+            if (live && hang_rounds != 0 && ++rounds == hang_rounds) {
+              fprintf(stderr, "yasai: cluster (%u,%u,%u) still live after %lu rounds\n", cx, cy,
+                      cz, rounds);
+              for (unsigned r = 0; r < csize; r++) ctas[r]->yasai_dump_warps(stderr);
+              abort();
+            }
           }
           yasai_func::set_cluster(nullptr);
           yasai_func::set_current_rank(0);
           for (functionalCoreSim *core : ctas) delete core;
+          // yasai: functional mode runs one CTA or cluster at a time; its TMEM state (allocation
+          // permit, words) must not leak into the next CTA that reuses the same CTA id.
+          gpgpu_ctx->the_gpgpusim->g_the_gpu->get_tcgen05_tmem_manager().reset();
           cta_launched += csize;
         }
     kernel.set_all_ctas_issued();
@@ -3637,6 +3651,7 @@ void cuda_sim::gpgpu_cuda_ptx_sim_main_func(kernel_info_t &kernel,
           &kernel, gpgpu_ctx->the_gpgpusim->g_the_gpu,
           gpgpu_ctx->the_gpgpusim->g_the_gpu->getShaderCoreConfig()->warp_size);
       cta.execute(cp_count, temp);
+      gpgpu_ctx->the_gpgpusim->g_the_gpu->get_tcgen05_tmem_manager().reset();  // yasai: see above
 
 #if (CUDART_VERSION >= 5000)
       gpgpu_ctx->device_runtime->launch_all_device_kernels();
@@ -3870,6 +3885,20 @@ void functionalCoreSim::yasai_join_cluster(yasai_func::ClusterState *cluster, un
   m_yasai_views.push_back(view);
   for (unsigned i = 0; i < m_warp_count * m_warp_size; i++)
     if (m_thread[i] != NULL) m_thread[i]->m_shared_mem = view;
+}
+
+void functionalCoreSim::yasai_dump_warps(FILE *out) const {
+  for (unsigned w = 0; w < m_warp_count; w++) {
+    for (unsigned l = 0; l < m_warp_size; l++) {
+      ptx_thread_info *t = m_thread[w * m_warp_size + l];
+      if (t == NULL || t->is_done()) continue;
+      const ptx_instruction *pI = t->get_inst();
+      fprintf(out, "  rank %u warp %u lane %u live %u: %s:%u %s\n", m_yasai_rank, w, l,
+              m_liveThreadCount[w], pI ? pI->source_file() : "?", pI ? pI->source_line() : 0,
+              pI ? pI->get_source() : "?");
+      break;
+    }
+  }
 }
 
 unsigned functionalCoreSim::yasai_live_threads() const {
