@@ -60,6 +60,7 @@ typedef void *yyscan_t;
 #include "ptx_sim.h"
 
 #include "dyn_ptx_inst.h"
+#include "yasai_func.h"
 
 int g_debug_execution = 0;
 // Output debug information to file options
@@ -2764,6 +2765,9 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
       // redundant tensorcore operation
       if (!tensorcore_op(inst_opcode) ||
           ((tensorcore_op(inst_opcode)) && (lane_id == 0))) {
+        // yasai: with YASAI_SKIP_FP the value of an FP-only instruction is not computed.
+        if (yasai_func::skip_fp_value(pI, lane_id)) {
+        } else
         switch (inst_opcode) {
 #define OP_DEF(OP, FUNC, STR, DST, CLASSIFICATION) \
   case OP:                                         \
@@ -3465,11 +3469,27 @@ void cuda_sim::gpgpu_cuda_ptx_sim_main_func(kernel_info_t &kernel,
   cp_count = gpgpu_ctx->the_gpgpusim->g_the_gpu->checkpoint_insn_Y;
   cp_cta_resume = gpgpu_ctx->the_gpgpusim->g_the_gpu->checkpoint_CTA_t;
   int cta_launched = 0;
+  const dim3 yasai_grid = kernel.get_grid_dim();
+  const dim3 yasai_block = kernel.get_cta_dim();
+  const yasai_func::Dim3 yasai_g{yasai_grid.x, yasai_grid.y, yasai_grid.z};
+  const yasai_func::Dim3 yasai_b{yasai_block.x, yasai_block.y, yasai_block.z};
+  // The kernel object may be released by register_finished_kernel, so keep its name here.
+  const std::string yasai_name = kernel.name();
+  yasai_func::kernel_begin(yasai_name, yasai_g, yasai_b);
 
   // we excute the kernel one CTA (Block) at the time, as synchronization
   // functions work block wise
   while (!kernel.no_more_ctas_to_run()) {
     unsigned temp = kernel.get_next_cta_id_single();
+
+    // yasai: CTA sampling executes only the representative CTAs.
+    if (!yasai_func::cta_is_representative(yasai_g, temp)) {
+      yasai_func::count_cta(true);
+      kernel.increment_cta_id();
+      cta_launched++;
+      continue;
+    }
+    yasai_func::count_cta(false);
 
     if (cp_op == 0 ||
         (cp_op == 1 && cta_launched < cp_cta_resume &&
@@ -3508,6 +3528,8 @@ void cuda_sim::gpgpu_cuda_ptx_sim_main_func(kernel_info_t &kernel,
     gpgpu_ctx->the_gpgpusim->g_stream_manager->register_finished_kernel(
         kernel.get_uid());
   }
+
+  yasai_func::kernel_end(yasai_name, yasai_g, yasai_b);
 
   //******PRINTING*******
   printf("GPGPU-Sim: Done functional simulation (%u instructions simulated).\n",
@@ -3670,11 +3692,90 @@ void functionalCoreSim::execute(int inst_count, unsigned ctaid_cp) {
   }
 }
 
+// yasai: adds the PTX register symbols of operand op (a register, a vector of registers or the
+// base register of a memory operand) to rec's register list.
+static void yasai_add_operand_regs(const operand_info &op, yasai_func::WarpRecord &rec) {
+  const unsigned cap = sizeof(rec.reg_uid) / sizeof(rec.reg_uid[0]);
+  auto add = [&](const symbol *s) {
+    if (s != NULL && s->is_reg() && unsigned(rec.dst_count) + rec.src_count < cap) {
+      rec.reg_uid[rec.dst_count + rec.src_count] = s->uid();
+      rec.src_count++;
+    }
+  };
+  if (op.is_vector()) {
+    for (unsigned e = 0; e < op.get_vect_nelem(); e++) add(op.vec_symbol_or_null(e));
+  } else if (op.is_reg() || op.is_memory_operand()) {
+    add(op.get_symbol());
+  }
+}
+
+// yasai: fills a WarpRecord for the warp instruction inst of warp w and appends it to the
+// kernel's trace. Destination registers are those of operand 0 for instructions that write a
+// register; every other register operand and the guard predicate are sources.
+void functionalCoreSim::yasai_emit_warp(const warp_inst_t &inst, unsigned w) {
+  yasai_func::WarpRecord rec;
+  unsigned first = m_warp_size;
+  for (unsigned l = 0; l < m_warp_size; l++)
+    if (inst.active(l)) {
+      rec.active_mask |= 1u << l;
+      if (first == m_warp_size) first = l;
+    }
+  if (first == m_warp_size) return;
+  ptx_thread_info *t0 = m_thread[w * m_warp_size + first];
+  const dim3 cta = t0->get_ctaid();
+  const dim3 grid = m_kernel->get_grid_dim();
+  const unsigned cta_linear = cta.x + grid.x * (cta.y + grid.y * cta.z);
+  rec.warp_idx = cta_linear * m_warp_count + w;
+  rec.pc = inst.pc;
+  const ptx_instruction *pI = m_gpu->gpgpu_ctx->pc_to_instruction(inst.pc);
+  const int opc = pI->get_opcode();
+  rec.ptx_opcode = uint16_t(opc);
+  const int space = (inst.is_load() || inst.is_store() || inst.isatomic() ||
+                     opc == CP_ASYNC_OP)
+                        ? int(inst.space.get_type())
+                        : 0;
+  rec.is_write = inst.is_store() || inst.isatomic() || opc == RED_OP;
+  rec.class_code = yasai_func::class_of(opc, space, inst.is_store(), inst.isatomic());
+  // Registers: operand 0 is the destination unless the instruction writes no register.
+  const bool writes_reg = !(opc == ST_OP || opc == BRA_OP || opc == BAR_OP || opc == EXIT_OP ||
+                            opc == RET_OP || opc == MEMBAR_OP || opc == RED_OP ||
+                            opc == CP_ASYNC_OP || opc == CP_ASYNC_COMMIT_OP ||
+                            opc == CP_ASYNC_WAIT_OP || opc == FENCE_OP || opc == STMATRIX_OP);
+  const unsigned nops = pI->get_num_operands();
+  for (unsigned n = 0; n < nops; n++) {
+    yasai_add_operand_regs(pI->operand_lookup(n), rec);
+    if (n == 0 && writes_reg) {
+      rec.dst_count = rec.src_count;
+      rec.src_count = 0;
+    }
+  }
+  if (pI->has_pred()) yasai_add_operand_regs(pI->get_pred(), rec);
+  // Global addresses of the active lanes.
+  if (space == global_space &&
+      (rec.class_code == yasai_func::kLoad || rec.class_code == yasai_func::kStore ||
+       rec.class_code == yasai_func::kAtomic || rec.class_code == yasai_func::kAsyncCopy)) {
+    rec.global_mem = true;
+    for (unsigned l = 0; l < m_warp_size; l++) {
+      if (!inst.active(l)) continue;
+      rec.lane_addr[l] = inst.get_addr(l);
+      const unsigned sz = inst.get_per_thread_memory_access_size(l);
+      rec.lane_bytes[l] = sz ? sz : inst.data_size;
+    }
+    if (rec.class_code == yasai_func::kLoad) {
+      rec.has_value = true;
+      rec.value = t0->m_last_set_operand_value.u64;
+    }
+  }
+  yasai_func::emit(rec);
+}
+
 void functionalCoreSim::executeWarp(unsigned i, bool &allAtBarrier,
                                     bool &someOneLive) {
   if (!m_warpAtBarrier[i] && m_liveThreadCount[i] != 0) {
     warp_inst_t inst = getExecuteWarp(i);
     execute_warp_inst_t(inst, i);
+    yasai_func::count_warp_inst(inst.active_count());
+    if (yasai_func::tracing()) yasai_emit_warp(inst, i);
     if (inst.isatomic()) inst.do_atomic(true);
     if (inst.op == BARRIER_OP || inst.op == MEMORY_BARRIER_OP)
       m_warpAtBarrier[i] = true;

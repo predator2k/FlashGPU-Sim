@@ -30,6 +30,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include <cstring>
 #include "instructions.h"
 #include "../gpgpu-sim/flash/mma/mma_trace.h"
 #include "../gpgpu-sim/flash/mma/tensor_mma.h"
@@ -3460,6 +3461,59 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
            decode_token(from_type), decode_token(to_type));
     printf("  Only cvt.f16x2.f32 is currently supported\n");
     abort();
+  }
+
+  // yasai: conversions with bf16 or tf32 on either side. The generic table below has rows only
+  // for the formats 0..10, so these go through f32 here: bf16 is the upper half of an f32, tf32
+  // is an f32 with the low 13 mantissa bits cleared. f32 to bf16 rounds to nearest even.
+  if (from_type == BF16_TYPE || to_type == BF16_TYPE || from_type == TF32_TYPE ||
+      to_type == TF32_TYPE) {
+    ptx_reg_t in = thread->get_operand_value(src1, dst, from_type, thread, 1);
+    float f = 0.0f;
+    switch (from_type) {
+      case BF16_TYPE: { uint32_t u = uint32_t(in.u16) << 16; std::memcpy(&f, &u, 4); break; }
+      case F16_TYPE: f = half_float::detail::half2float<float>(in.u16); break;
+      case F32_TYPE: case TF32_TYPE: f = in.f32; break;
+      case F64_TYPE: case FF64_TYPE: f = float(in.f64); break;
+      case S8_TYPE: f = float(in.s8); break;
+      case S16_TYPE: f = float(in.s16); break;
+      case S32_TYPE: f = float(in.s32); break;
+      case S64_TYPE: f = float(in.s64); break;
+      case U8_TYPE: f = float(in.u8); break;
+      case U16_TYPE: f = float(in.u16); break;
+      case U32_TYPE: f = float(in.u32); break;
+      case U64_TYPE: f = float(in.u64); break;
+      default:
+        printf("GPGPU-Sim PTX: ERROR ** unsupported cvt source %s for bf16/tf32\n",
+               decode_token(from_type));
+        abort();
+    }
+    if (pI->is_neg()) f = -f;
+    if (saturation_mode) f = cuda_math::__saturatef(f);
+    ptx_reg_t out;
+    out.u64 = 0;
+    uint32_t fu;
+    std::memcpy(&fu, &f, 4);
+    switch (to_type) {
+      case BF16_TYPE:
+        if ((fu & 0x7fffffffu) > 0x7f800000u)
+          out.u16 = uint16_t((fu >> 16) | 0x40u);  // quiet NaN
+        else
+          out.u16 = uint16_t((fu + 0x7fffu + ((fu >> 16) & 1u)) >> 16);
+        break;
+      case TF32_TYPE: out.u32 = (fu + 0xfffu + ((fu >> 13) & 1u)) & 0xffffe000u; break;
+      case F32_TYPE: out.f32 = f; break;
+      case F16_TYPE: out.u16 = half_float::detail::float2half<std::round_to_nearest>(f); break;
+      case F64_TYPE: case FF64_TYPE: out.f64 = double(f); break;
+      case S32_TYPE: out.s32 = int32_t(nearbyintf(f)); break;
+      case U32_TYPE: out.u32 = uint32_t(nearbyintf(f)); break;
+      default:
+        printf("GPGPU-Sim PTX: ERROR ** unsupported cvt destination %s for bf16/tf32\n",
+               decode_token(to_type));
+        abort();
+    }
+    thread->set_operand_value(dst, out, to_type, thread, pI);
+    return;
   }
 
   ptx_reg_t data = thread->get_operand_value(src1, dst, from_type, thread, 1);

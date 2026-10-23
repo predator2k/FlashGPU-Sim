@@ -1159,6 +1159,12 @@ class warp_inst_t : public inst_t {
     for (unsigned i = 0; i < num_addrs; i++)
       m_per_scalar_thread[n].memreqaddr[i] = addr[i];
   }
+  // yasai: access size of lane n set by set_per_thread_memory_access_size, or 0 when unset.
+  unsigned get_per_thread_memory_access_size(unsigned n) const {
+    return (n < m_per_scalar_thread.size() && m_per_scalar_thread[n].memory_access_size_valid)
+               ? m_per_scalar_thread[n].memory_access_size
+               : 0;
+  }
   void set_per_thread_memory_access_size(unsigned n, unsigned size) {
     if (!m_per_scalar_thread_valid) {
       m_per_scalar_thread.resize(m_config->warp_size);

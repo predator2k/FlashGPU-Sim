@@ -84,6 +84,8 @@ class functionalCoreSim : public core_t {
 
  private:
   void executeWarp(unsigned, bool &, bool &);
+  // yasai: writes the trace record of the warp instruction inst of warp w (YASAI_TRACE_DIR).
+  void yasai_emit_warp(const warp_inst_t &inst, unsigned w);
   // initializes threads in the CTA block which we are executing
   void initializeCTA(unsigned ctaid_cp);
   virtual void checkExecutionStatusAndUpdate(warp_inst_t &inst, unsigned t,
