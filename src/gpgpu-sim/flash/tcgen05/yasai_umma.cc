@@ -467,10 +467,12 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
     snprintf(key, sizeof key,
              "kind=%d M=%u N=%u K=%u ws=%d pair=%d a_tmem=%d a_mn=%d b_mn=%d "
              "c=%u bs=%d nsf=%u "
-             "a_swz=%u b_swz=%u",
+             "a_swz=%u b_swz=%u a_lane=%u d_lane=%u",
              int(kind), M, N, K, int(ws), int(pair), int(a_tmem), int(a_mn),
              int(b_mn), c_format, int(block_scale), nsf,
-             a_tmem ? 0u : unsigned(a_desc_v >> 61), unsigned(b_desc_v >> 61));
+             a_tmem ? 0u : unsigned(a_desc_v >> 61), unsigned(b_desc_v >> 61),
+             a_tmem ? (a_tmem_addr >> 16) & 0xFFFF : 0u,
+             (d_addr >> 16) & 0xFFFF);
     if (seen.insert(key).second)
       fprintf(stderr, "yasai-umma %s\n", key);
   }
@@ -505,35 +507,52 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
     const tcgen05_tmem_scope_t sc = scope_of(t, lead_cta + c);
     const uint64_t bits = cl != nullptr ? (uint64_t(lead_rank + c) << 24) : 0;
     const uint32_t d_lane0 = (d_addr >> 16) & 0xFFFF, d_col0 = d_addr & 0xFFFF;
+    // N parts of the 2x2 / 1x4 datapath layouts (.ws, cta_group::2): part p
+    // computes columns [p * N / parts, (p + 1) * N / parts) in lanes m + p *
+    // m_cta.
+    const unsigned parts = (pair || ws) ? 128 / m_cta : 1;
     for (unsigned m = 0; m < m_cta; ++m) {
-      std::vector<double> a(K);
-      for (unsigned k = 0; k < K; ++k) {
-        double v;
-        if (a_tmem) {
-          // A in TMEM (PTX ISA 9.7.18.10.4): 16/32-bit types packed in 32-bit
-          // words; FP8 and the FP6/FP4 types of .kind::f8f6f4/mxf8f6f4 one per
-          // byte (E2M1 in bits [5:2], FP6 in bits [5:0]); .kind::mxf4/mxf4nvf4
-          // two FP4 per byte.
-          unsigned slot_bits = fmt_bits(fa);
-          if (fa == kE2M1 || fa == kE2M3 || fa == kE3M2)
-            slot_bits = 8;
-          const unsigned per_word = 32 / slot_bits;
-          unsigned lane, col;
-          d_cell(m_cta, K / per_word, pair, ws, m, k / per_word, lane, col);
-          const uint32_t w = mgr.peek(sc, ((a_tmem_addr >> 16) & 0xFFFF) + lane,
-                                      (a_tmem_addr & 0xFFFF) + col);
-          uint32_t slot =
-              (w >> (slot_bits * (k % per_word))) & ((1ull << slot_bits) - 1);
-          if (fa == kE2M1)
-            slot = (slot >> 2) & 0xF;
-          else if (fa == kE2M3 || fa == kE3M2)
-            slot &= 0x3F;
-          v = fmt_value(fa, slot);
-        } else {
-          v = smem_element(t, ad, a_mn, fa, m, k, bits);
+      std::vector<std::vector<double>> a_part(parts, std::vector<double>(K));
+      for (unsigned p = 0; p < parts; ++p)
+        for (unsigned k = 0; k < K; ++k) {
+          if (!a_tmem &&
+              p > 0) { // A in shared memory is the same for every part
+            a_part[p][k] = a_part[0][k];
+            continue;
+          }
+          double v;
+          if (a_tmem) {
+            // A in TMEM (PTX ISA 9.7.18.10.4): 16/32-bit types packed in 32-bit
+            // words; FP8 and the FP6/FP4 types of .kind::f8f6f4/mxf8f6f4 one
+            // per byte (E2M1 in bits [5:2], FP6 in bits [5:0]);
+            // .kind::mxf4/mxf4nvf4 two FP4 per byte.
+            unsigned slot_bits = fmt_bits(fa);
+            if (fa == kE2M1 || fa == kE2M3 || fa == kE3M2)
+              slot_bits = 8;
+            const unsigned per_word = 32 / slot_bits;
+            unsigned lane, col;
+            // A row m of N part p sits in the lane that part's datapath uses
+            // for row m (the lane of D(m, first column of part p)), its K words
+            // in consecutive columns. CUTLASS and FlashMLA head128 copy the
+            // same rows into every part (tcgen05.cp .warpx2::02_13); FlashMLA
+            // head64 (.ws M=64) copies 128 rows.
+            d_cell(m_cta, N, pair, ws, m, p * (N / parts), lane, col);
+            col = k / per_word;
+            const uint32_t w =
+                mgr.peek(sc, ((a_tmem_addr >> 16) & 0xFFFF) + lane,
+                         (a_tmem_addr & 0xFFFF) + col);
+            uint32_t slot =
+                (w >> (slot_bits * (k % per_word))) & ((1ull << slot_bits) - 1);
+            if (fa == kE2M1)
+              slot = (slot >> 2) & 0xF;
+            else if (fa == kE2M3 || fa == kE3M2)
+              slot &= 0x3F;
+            v = fmt_value(fa, slot);
+          } else {
+            v = smem_element(t, ad, a_mn, fa, m, k, bits);
+          }
+          a_part[p][k] = v * (a_neg ? -1 : 1);
         }
-        a[k] = v * (a_neg ? -1 : 1);
-      }
       std::vector<double> sa(nsf, 1.0);
       if (block_scale)
         for (unsigned j = 0; j < nsf; ++j)
@@ -541,6 +560,7 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
       for (unsigned n = 0; n < N; ++n) {
         unsigned lane, col;
         d_cell(m_cta, N, pair, ws, m, n, lane, col);
+        const std::vector<double> &a = a_part[parts > 1 ? n / (N / parts) : 0];
         const uint32_t old =
             enable_d ? mgr.peek(sc, d_lane0 + lane, d_col0 + col) : 0;
         if (kind == I8) {
