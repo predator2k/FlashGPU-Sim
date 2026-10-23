@@ -3916,6 +3916,14 @@ void ld_exec(const ptx_instruction *pI, ptx_thread_info *thread) {
           mem, decode_token(type), (unsigned long long)addr, data.u64, pI->to_string().c_str());
     }
 
+  } else if (vector_spec == V8_TYPE) {
+    // yasai: 256-bit vector load (.v8), eight elements of size bits each.
+    for (unsigned e = 0; e < 8 && e < dst.get_vect_nelem(); e++) {
+      ptx_reg_t d;
+      d.u64 = 0;
+      mem->read(addr + e * size / 8, size / 8, &d.s64);
+      thread->set_reg(dst.vec_symbol(e), d);
+    }
   } else {
     ptx_reg_t data1, data2, data3, data4;
     mem->read(addr, size / 8, &data1.s64);
@@ -5261,6 +5269,14 @@ void prefetchu_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   // Functional no-op. See prefetch_impl.
 }
 
+// yasai: createpolicy makes an opaque L2 cache-eviction policy that later loads and copies
+// pass with .L2::cache_hint. The simulator models no L2 policy, so the value is 0.
+void createpolicy_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  ptx_reg_t d;
+  d.u64 = 0;
+  thread->set_operand_value(pI->dst(), d, B64_TYPE, thread, pI);
+}
+
 int prmt_mode_present(int mode) {
   int returnval = 0;
   switch (mode) {
@@ -6516,6 +6532,13 @@ void st_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     }
 
   } else {
+    if (vector_spec == V8_TYPE) {
+      // yasai: 256-bit vector store (.v8).
+      ptx_reg_t ptx_regs[8];
+      thread->get_vector_operand_values(src1, ptx_regs, 8);
+      for (unsigned e = 0; e < 8; e++)
+        mem->write(addr + e * size / 8, size / 8, &ptx_regs[e].s64, thread, pI);
+    }
     if (vector_spec == V2_TYPE) {
       ptx_reg_t *ptx_regs = new ptx_reg_t[2];
       thread->get_vector_operand_values(src1, ptx_regs, 2);

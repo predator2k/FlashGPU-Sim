@@ -1608,6 +1608,7 @@ ptx_instruction::ptx_instruction(
       case V2_TYPE:
       case V3_TYPE:
       case V4_TYPE:
+      case V8_TYPE:
         m_vector_spec = last_ptx_inst_option;
         break;
       case ATOMIC_AND:
@@ -1734,6 +1735,9 @@ ptx_instruction::ptx_instruction(
       case X4_OPTION:
       case X16_OPTION:
       case X32_OPTION:
+      case X8_OPTION:
+      case X64_OPTION:
+      case X128_OPTION:
       case TCGEN05_CTA_GROUP_1_OPTION:
       case TCGEN05_CTA_GROUP_2_OPTION:
       case TCGEN05_KIND_F16_OPTION:

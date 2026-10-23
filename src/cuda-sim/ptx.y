@@ -71,6 +71,9 @@ class ptx_recognizer;
 %token  MAXNNREG_DIRECTIVE
 %token  MAXNTID_DIRECTIVE
 %token  MINNCTAPERSM_DIRECTIVE
+%token  MAXCLUSTERRANK_DIRECTIVE
+%token  REQNCTAPERCLUSTER_DIRECTIVE
+%token  EXPLICITCLUSTER_DIRECTIVE
 %token  PARAM_DIRECTIVE
 %token  PRAGMA_DIRECTIVE
 %token  REG_DIRECTIVE
@@ -125,6 +128,7 @@ class ptx_recognizer;
 %token  V2_TYPE
 %token  V3_TYPE
 %token  V4_TYPE
+%token  V8_TYPE
 %token  COMMA
 %token  PRED
 %token  HALF_OPTION
@@ -293,6 +297,9 @@ class ptx_recognizer;
 %token	X4_OPTION;
 %token	X16_OPTION;
 %token	X32_OPTION;
+%token	X8_OPTION;
+%token	X64_OPTION;
+%token	X128_OPTION;
 %token	TCGEN05_CTA_GROUP_1_OPTION;
 %token	TCGEN05_CTA_GROUP_2_OPTION;
 %token	TCGEN05_KIND_F16_OPTION;
@@ -362,6 +369,11 @@ block_spec: MAXNTID_DIRECTIVE INT_OPERAND COMMA INT_OPERAND COMMA INT_OPERAND {r
 										recognizer->func_header_info_int(",", 1);
 										recognizer->maxnt_id($2, $4, 1);}
 	| MINNCTAPERSM_DIRECTIVE INT_OPERAND { recognizer->func_header_info_int(".minnctapersm", $2); printf("GPGPU-Sim PTX: Warning: .minnctapersm ignored. \n"); }
+	| MAXCLUSTERRANK_DIRECTIVE INT_OPERAND { /* yasai: cluster launch hint, ignored */ }
+	| REQNCTAPERCLUSTER_DIRECTIVE INT_OPERAND { /* yasai */ }
+	| REQNCTAPERCLUSTER_DIRECTIVE INT_OPERAND COMMA INT_OPERAND { /* yasai */ }
+	| REQNCTAPERCLUSTER_DIRECTIVE INT_OPERAND COMMA INT_OPERAND COMMA INT_OPERAND { /* yasai */ }
+	| EXPLICITCLUSTER_DIRECTIVE { /* yasai */ }
 	| MAXNCTAPERSM_DIRECTIVE INT_OPERAND { recognizer->func_header_info_int(".maxnctapersm", $2); printf("GPGPU-Sim PTX: Warning: .maxnctapersm ignored. \n"); }
 	| REQNTID_DIRECTIVE INT_OPERAND { recognizer->func_header_info_int(".reqntid", $2); printf("GPGPU-Sim PTX: Warning: .reqntid ignored. \n"); }
 	| REQNTID_DIRECTIVE INT_OPERAND COMMA INT_OPERAND COMMA INT_OPERAND { recognizer->func_header_info_int(".reqntid", $2); printf("GPGPU-Sim PTX: Warning: .reqntid ignored. \n"); }
@@ -526,6 +538,7 @@ type_spec: scalar_type
 vector_spec:  V2_TYPE {  recognizer->add_option(V2_TYPE); recognizer->func_header_info(".v2");}
 	| V3_TYPE     {  recognizer->add_option(V3_TYPE); recognizer->func_header_info(".v3");}
 	| V4_TYPE     {  recognizer->add_option(V4_TYPE); recognizer->func_header_info(".v4");}
+	| V8_TYPE     {  recognizer->add_option(V8_TYPE); recognizer->func_header_info(".v8");}
 	;
 
 scalar_type: S8_TYPE { recognizer->add_scalar_type_spec( S8_TYPE ); }
@@ -741,6 +754,9 @@ option: type_spec
 	| X4_OPTION { recognizer->add_option(X4_OPTION); }
 	| X16_OPTION { recognizer->add_option(X16_OPTION); }
 	| X32_OPTION { recognizer->add_option(X32_OPTION); }
+	| X8_OPTION { recognizer->add_option(X8_OPTION); }
+	| X64_OPTION { recognizer->add_option(X64_OPTION); }
+	| X128_OPTION { recognizer->add_option(X128_OPTION); }
 	| TCGEN05_CTA_GROUP_1_OPTION { recognizer->add_option(TCGEN05_CTA_GROUP_1_OPTION); }
 	| TCGEN05_CTA_GROUP_2_OPTION { recognizer->add_option(TCGEN05_CTA_GROUP_2_OPTION); }
 	| TCGEN05_KIND_F16_OPTION { recognizer->add_option(TCGEN05_KIND_F16_OPTION); }

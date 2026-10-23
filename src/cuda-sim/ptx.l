@@ -161,6 +161,7 @@ pmevent TC; yylval->int_value = PMEVENT_OP; return OPCODE;
 popc    TC; yylval->int_value = POPC_OP; return OPCODE;
 prefetch TC; yylval->int_value = PREFETCH_OP; return OPCODE;
 prefetchu TC; yylval->int_value = PREFETCHU_OP; return OPCODE;
+createpolicy TC; yylval->int_value = CREATEPOLICY_OP; return OPCODE; /* yasai: L2 cache policy, functional value 0 */
 prmt    TC; yylval->int_value = PRMT_OP; return OPCODE;
 rcp	TC; yylval->int_value = RCP_OP; return OPCODE;
 red     TC; yylval->int_value = RED_OP; return OPCODE;
@@ -285,6 +286,9 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.maxnreg TC; return MAXNNREG_DIRECTIVE;
 \.maxntid TC; return MAXNTID_DIRECTIVE;
 \.minnctapersm TC; return MINNCTAPERSM_DIRECTIVE;
+\.maxclusterrank TC; return MAXCLUSTERRANK_DIRECTIVE; /* yasai: cluster launch hints, ignored */
+\.reqnctapercluster TC; return REQNCTAPERCLUSTER_DIRECTIVE; /* yasai */
+\.explicitcluster TC; return EXPLICITCLUSTER_DIRECTIVE; /* yasai */
 \.param  TC; return PARAM_DIRECTIVE;
 \.pragma TC; return PRAGMA_DIRECTIVE;
 \.reg    TC; return REG_DIRECTIVE;
@@ -400,6 +404,7 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.v2	TC; return V2_TYPE;
 \.v3	TC; return V3_TYPE;
 \.v4	TC; return V4_TYPE;
+\.v8	TC; return V8_TYPE; /* yasai: 256-bit vector loads and stores */
 
 \.half  TC; return HALF_OPTION; /* ptxplus */
 \.cc	TC; return EXTP_OPTION; /* extended precision option */
@@ -486,6 +491,9 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.x4 TC; return X4_OPTION;
 \.x16 TC; return X16_OPTION;
 \.x32 TC; return X32_OPTION;
+\.x8 TC; return X8_OPTION; /* yasai */
+\.x64 TC; return X64_OPTION; /* yasai */
+\.x128 TC; return X128_OPTION; /* yasai */
 \.cta_group::1 TC; return TCGEN05_CTA_GROUP_1_OPTION;
 \.cta_group::2 TC; return TCGEN05_CTA_GROUP_2_OPTION;
 \.kind::f16 TC; return TCGEN05_KIND_F16_OPTION;
@@ -560,6 +568,14 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.acc::f32 TC; return IGNORED_OPTION;
 \.gpu TC; return GPU_OPTION;
 \.L2::128B TC; return L2_OPTION;
+\.L2::256B TC; return IGNORED_OPTION; /* yasai: prefetch-size hint, no functional effect */
+\.L2::64B TC; return IGNORED_OPTION; /* yasai */
+\.L2::evict_normal TC; return IGNORED_OPTION; /* yasai: L2 eviction hints */
+\.L2::evict_first TC; return IGNORED_OPTION; /* yasai */
+\.L2::evict_last TC; return IGNORED_OPTION; /* yasai */
+\.L2::evict_unchanged TC; return IGNORED_OPTION; /* yasai */
+\.L2::no_allocate TC; return IGNORED_OPTION; /* yasai */
+\.fractional TC; return IGNORED_OPTION; /* yasai: createpolicy */
 \.L2::cache_hint TC; return L2_CACHE_HINT_OPTION;
 \.L2 TC; return L2_OPTION;
 \.aligned TC; return ALIGNED_OPTION;
