@@ -1710,6 +1710,8 @@ ptx_instruction::ptx_instruction(
       case FILL_MODE_OPTION:
       case CP_FENCEPROXY_OPTION:
       case RELEASE_OPTION:
+      case ACQ_REL_OPTION:  // yasai: memory order, no effect in functional execution
+      case SC_OPTION:       // yasai: memory order, no effect in functional execution
       case RELAXED_OPTION:
       case ACQUIRE_OPTION:
       case GPU_OPTION:
