@@ -1932,6 +1932,9 @@ cudaError_t CUDARTAPI cudaFuncGetAttributesInternal(
     attr->ptxVersion = kinfo->ptx_version;
     attr->binaryVersion = kinfo->sm_target;
 #endif
+  } else {
+    // yasai: a kernel registered without PTX is not a valid device function (NCCL skips it).
+    return g_last_cudaError = cudaErrorInvalidDeviceFunction;
   }
   return g_last_cudaError = cudaSuccess;
 }
@@ -4678,6 +4681,8 @@ cudaError_t CUDARTAPI cudaFuncSetAttribute(const void *func,
   gpgpu_context *ctx = GPGPU_Context();
   CUctx_st *context = GPGPUSim_Context(ctx);
   function_info *entry = context->get_kernel((const char *)func);
+  // yasai: a kernel registered without PTX (none loaded for it) is not a valid device function.
+  if (entry == NULL) return g_last_cudaError = cudaErrorInvalidDeviceFunction;
 
   if (attr == cudaFuncAttributeMaxDynamicSharedMemorySize) {
     if (value < 0) return g_last_cudaError = cudaErrorInvalidValue;
