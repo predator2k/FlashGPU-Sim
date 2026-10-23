@@ -127,6 +127,8 @@ class memory_space_impl : public memory_space {
                          void *data) const;
   std::string m_name;
   unsigned m_log2_block_size;
+  // yasai: true for the "global" space; accesses inside host_window ranges go to host memory.
+  bool m_host_window = false;
   using map_t = mem_map<mem_addr_t, std::unique_ptr<mem_storage<BSIZE>>>;
   map_t m_data;
 #ifdef FLASH_GPGPU_SIM_OMP

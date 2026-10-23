@@ -154,6 +154,7 @@ typedef enum CUoutput_mode_enum {
 #endif
 #include "../src/abstract_hardware_model.h"
 #include "../src/cuda-sim/cuda-sim.h"
+#include "../src/cuda-sim/host_window.h"
 #include "../src/cuda-sim/ptx_ir.h"
 #include "../src/cuda-sim/ptx_loader.h"
 #include "../src/cuda-sim/ptx_parser.h"
@@ -1291,6 +1292,8 @@ cudaError_t cudaMallocHostInternal(void **ptr, size_t size,
     // track pinned memory size allocated in the host so that same amount of
     // memory is also allocated in GPU.
     ctx->api->pinned_memory_size[*ptr] = size;
+    // yasai: pinned host memory is mapped in place (device address == host address).
+    host_window::add(reinterpret_cast<uint64_t>(*ptr), size);
     return g_last_cudaError = cudaSuccess;
   } else {
     return g_last_cudaError = cudaErrorMemoryAllocation;
@@ -1354,6 +1357,12 @@ cudaError_t cudaHostGetDevicePointerInternal(void **pDevice, void *pHost,
   }
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
+  }
+  // yasai: memory registered in host_window is accessed in place by kernels, so its device
+  // pointer is the host pointer itself (as with unified virtual addressing).
+  if (host_window::contains(reinterpret_cast<uint64_t>(pHost), 1)) {
+    *pDevice = pHost;
+    return g_last_cudaError = cudaSuccess;
   }
   // only cpu memory allocation happens in cudaHostAlloc. Linking with device
   // pointer to pinned memory happens here.
@@ -1865,6 +1874,8 @@ cudaError_t cudaHostAllocInternal(void **pHost, size_t bytes,
   // TODO: vary this function behavior based on flags value (following nvidia
   // documentation)
   ctx->api->pinned_memory_size[*pHost] = bytes;
+  // yasai: pinned host memory is mapped in place (device address == host address).
+  if (*pHost) host_window::add(reinterpret_cast<uint64_t>(*pHost), bytes);
   if (*pHost)
     return g_last_cudaError = cudaSuccess;
   else
@@ -2796,6 +2807,7 @@ __host__ cudaError_t CUDARTAPI cudaFreeHost(void *ptr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
+  host_window::remove(reinterpret_cast<uint64_t>(ptr));
   free(ptr);  // this will crash the system if called twice
   return g_last_cudaError = cudaSuccess;
 }
@@ -4466,9 +4478,27 @@ cudaPointerGetAttributes(cudaPointerAttributes *attributes, const void *ptr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-
-  cuda_not_implemented(__my_func__, __LINE__);
-  return g_last_cudaError = cudaErrorUnknown;
+  // yasai: minimal answer from the address ranges the simulator knows: host_window ranges are
+  // registered host memory, addresses at or above GLOBAL_HEAP_START are device memory, everything
+  // else is unregistered host memory.
+  if (attributes == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  const uint64_t a = reinterpret_cast<uint64_t>(ptr);
+  memset(attributes, 0, sizeof(*attributes));
+  if (host_window::contains(a, 1)) {
+    attributes->type = cudaMemoryTypeHost;
+    attributes->device = 0;
+    attributes->devicePointer = const_cast<void *>(ptr);
+    attributes->hostPointer = const_cast<void *>(ptr);
+  } else if (a >= GLOBAL_HEAP_START && a < 0x500000000000ull) {
+    attributes->type = cudaMemoryTypeDevice;
+    attributes->device = 0;
+    attributes->devicePointer = const_cast<void *>(ptr);
+    attributes->hostPointer = NULL;
+  } else {
+    attributes->type = cudaMemoryTypeUnregistered;
+    attributes->device = -2;
+  }
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI cudaDeviceCanAccessPeer(int *canAccessPeer,
@@ -5854,7 +5884,12 @@ extern "C" __host__ cudaError_t CUDARTAPI cudaHostRegister(void *ptr, size_t siz
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  (void)flags;
+  // yasai: registered host memory is mapped in place, whatever the flags (the simulator has no
+  // separate device copy to keep coherent).
+  if (ptr == NULL || size == 0) return g_last_cudaError = cudaErrorInvalidValue;
+  host_window::add(reinterpret_cast<uint64_t>(ptr), size);
+  GPGPU_Context()->api->pinned_memory_size[ptr] = size;
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -8400,7 +8435,11 @@ __host__ cudaError_t CUDARTAPI cudaGetDriverEntryPointByVersion(
 }
 
 __host__ cudaError_t CUDARTAPI cudaHostUnregister(void *ptr) {
-  cuda_error_not_impl;
+  // yasai: undoes cudaHostRegister.
+  if (!host_window::remove(reinterpret_cast<uint64_t>(ptr)))
+    return g_last_cudaError = cudaErrorHostMemoryNotRegistered;
+  GPGPU_Context()->api->pinned_memory_size.erase(ptr);
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI cudaLaunchKernelExC(
