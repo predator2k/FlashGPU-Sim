@@ -1,3 +1,4 @@
+#include <dlfcn.h>
 // This file created from cuda_runtime_api.h distributed with CUDA 1.1
 // Changes Copyright 2009,  Tor M. Aamodt, Ali Bakhoda and George L. Yuan
 // University of British Columbia
@@ -2563,21 +2564,37 @@ CUresult CUDAAPI cuLaunchKernelInternal(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  if (extra != NULL) {
-    printf(
-        "GPGPU-Sim CUDA DRIVER API: ERROR: Currently do not support void** "
-        "extra.\n");
-    abort();
-  }
   const char *hostFun = (const char *)f;
   CUctx_st *context = GPGPUSim_Context(ctx);
   function_info *entry = context->get_kernel(hostFun);
   cudaConfigureCallInternal(dim3(gridDimX, gridDimY, gridDimZ),
                             dim3(blockDimX, blockDimY, blockDimZ),
                             sharedMemBytes, (cudaStream_t)hStream, ctx);
-  for (unsigned i = 0; i < entry->num_args(); i++) {
-    std::pair<size_t, unsigned> p = entry->get_param_config(i);
-    cudaSetupArgumentInternal(kernelParams[i], p.first, p.second, ctx);
+  if (extra != NULL) {
+    // yasai: arguments packed in one buffer (CU_LAUNCH_PARAM_BUFFER_POINTER/SIZE), as NCCL
+    // passes them. Each parameter is taken from its offset in the buffer; bytes past the end of
+    // the buffer are zero.
+    const unsigned char *buf = NULL;
+    size_t buf_size = 0;
+    for (unsigned k = 0; extra[k] != CU_LAUNCH_PARAM_END; k += 2) {
+      if (extra[k] == CU_LAUNCH_PARAM_BUFFER_POINTER) buf = (const unsigned char *)extra[k + 1];
+      else if (extra[k] == CU_LAUNCH_PARAM_BUFFER_SIZE) buf_size = *(size_t *)extra[k + 1];
+    }
+    if (buf == NULL) return CUDA_ERROR_INVALID_VALUE;
+    for (unsigned i = 0; i < entry->num_args(); i++) {
+      std::pair<size_t, unsigned> p = entry->get_param_config(i);
+      std::vector<unsigned char> arg(p.first, 0);
+      if (p.second < buf_size) {
+        size_t n = std::min(p.first, buf_size - p.second);
+        memcpy(arg.data(), buf + p.second, n);
+      }
+      cudaSetupArgumentInternal(arg.data(), p.first, p.second, ctx);
+    }
+  } else {
+    for (unsigned i = 0; i < entry->num_args(); i++) {
+      std::pair<size_t, unsigned> p = entry->get_param_config(i);
+      cudaSetupArgumentInternal(kernelParams[i], p.first, p.second, ctx);
+    }
   }
   cudaError_t launch_result = cudaLaunchInternal(hostFun, ctx);
   return launch_result == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
@@ -3098,11 +3115,10 @@ __host__ cudaError_t CUDARTAPI cudaStreamGetPriority(cudaStream_t hStream,
 
 __host__ cudaError_t CUDARTAPI cudaDeviceGetPCIBusId(char *pciBusId, int len,
                                                      int device) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  cuda_not_implemented(__my_func__, __LINE__);
-  return g_last_cudaError = cudaErrorUnknown;
+  // yasai: a stable made-up bus id per simulated device (NCCL uses it for topology only).
+  if (pciBusId == NULL || len <= 0) return g_last_cudaError = cudaErrorInvalidValue;
+  snprintf(pciBusId, len, "0000:%02x:00.0", (device + 1) & 0xff);
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI cudaIpcGetMemHandle(cudaIpcMemHandle_t *handle,
@@ -4504,11 +4520,11 @@ cudaPointerGetAttributes(cudaPointerAttributes *attributes, const void *ptr) {
 __host__ cudaError_t CUDARTAPI cudaDeviceCanAccessPeer(int *canAccessPeer,
                                                        int device,
                                                        int peerDevice) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  cuda_not_implemented(__my_func__, __LINE__);
-  return g_last_cudaError = cudaErrorUnknown;
+  // yasai: one simulated device per process, so no peer access.
+  (void)device;
+  (void)peerDevice;
+  if (canAccessPeer) *canAccessPeer = 0;
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI cudaDeviceEnablePeerAccess(int peerDevice,
@@ -8253,7 +8269,13 @@ extern "C" {
   return cudaSuccess;
 
 __host__ cudaError_t CUDARTAPI cudaThreadExchangeStreamCaptureMode(enum cudaStreamCaptureMode *mode) {
-  cuda_error_not_impl;
+  // yasai: stream capture is not simulated; keep a per-thread mode so swap pairs round-trip.
+  static thread_local enum cudaStreamCaptureMode t_mode = cudaStreamCaptureModeGlobal;
+  if (mode == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  enum cudaStreamCaptureMode old = t_mode;
+  t_mode = *mode;
+  *mode = old;
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI cudaDeviceGetDefaultMemPool(cudaMemPool_t *memPool, int device) {
@@ -8277,7 +8299,10 @@ __host__ cudaError_t CUDARTAPI cudaMemPoolTrimTo(cudaMemPool_t memPool, size_t m
 }
 
 __host__ cudaError_t CUDARTAPI cudaStreamIsCapturing(cudaStream_t stream, enum cudaStreamCaptureStatus *pCaptureStatus) {
-  cuda_error_not_impl;
+  // yasai: no stream is ever capturing in the simulator.
+  (void)stream;
+  if (pCaptureStatus) *pCaptureStatus = cudaStreamCaptureStatusNone;
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI cudaMallocAsync(void **devPtr, size_t size, cudaStream_t hStream) {
@@ -8364,7 +8389,34 @@ __host__ cudaError_t CUDARTAPI cudaStreamEndCapture(cudaStream_t stream, cudaGra
 }
 
 __host__ cudaError_t CUDARTAPI cudaStreamGetCaptureInfo_v2(cudaStream_t stream, enum cudaStreamCaptureStatus *captureStatus_out, unsigned long long *id_out __dv(0), cudaGraph_t *graph_out __dv(0), const cudaGraphNode_t **dependencies_out __dv(0), size_t *numDependencies_out __dv(0)) {
-  cuda_error_not_impl;
+  // yasai: no stream is ever capturing in the simulator.
+  (void)stream;
+  if (captureStatus_out) *captureStatus_out = cudaStreamCaptureStatusNone;
+  if (id_out) *id_out = 0;
+  if (graph_out) *graph_out = NULL;
+  if (dependencies_out) *dependencies_out = NULL;
+  if (numDependencies_out) *numDependencies_out = 0;
+  return g_last_cudaError = cudaSuccess;
+}
+
+
+// yasai: looks a function up in this shared library itself (not in a real libcuda).
+// @param symbol Driver function name, for example "cuLaunchKernelEx".
+// @return Address, or NULL when neither the name nor its _v2.._v4 variants are defined here.
+static void *yasai_find_own_symbol(const char *symbol) {
+  static void *self = NULL;
+  if (self == NULL) {
+    Dl_info info;
+    if (dladdr((void *)&yasai_find_own_symbol, &info) && info.dli_fname)
+      self = dlopen(info.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+  }
+  if (self == NULL) return NULL;
+  const char *suffixes[] = {"", "_v2", "_v3", "_v4"};
+  for (const char *suf : suffixes) {
+    std::string n = std::string(symbol) + suf;
+    if (void *fp = dlsym(self, n.c_str())) return fp;
+  }
+  return NULL;
 }
 
 __host__ cudaError_t CUDARTAPI cudaGetDriverEntryPoint(
@@ -8401,6 +8453,13 @@ __host__ cudaError_t CUDARTAPI cudaGetDriverEntryPoint(
     return cudaSuccess;
   }
 
+  // yasai: any driver function this library defines is handed out (NCCL loads its driver
+  // calls this way); the _v2 / _v3 names that cuda.h maps base names to are tried as well.
+  if (void *fp = yasai_find_own_symbol(symbol)) {
+    *funcPtr = fp;
+    if (driverStatus) *driverStatus = cudaDriverEntryPointSuccess;
+    return cudaSuccess;
+  }
   *funcPtr = NULL;
   if (driverStatus) {
     *driverStatus = cudaDriverEntryPointSymbolNotFound;
@@ -8464,9 +8523,69 @@ __host__ cudaError_t CUDARTAPI _cudaLaunchKernelEx(
 }
 
 __host__ cudaError_t CUDARTAPI cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void *userData) {
-  cuda_error_not_impl;
+  // yasai: runs the host function after the stream's earlier work, in the calling thread.
+  if (fn == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  cudaError_t e = cudaStreamSynchronize(stream);
+  if (e != cudaSuccess) return e;
+  fn(userData);
+  return g_last_cudaError = cudaSuccess;
 }
 
 #undef cuda_error_not_impl
 
+}
+
+
+// ---- yasai additions for NCCL 2.30.7 -----------------------------------------------------
+
+// yasai: CUfunction values in this simulator are the host stub pointers, so the stub is the
+// function handle.
+extern "C" __host__ cudaError_t CUDARTAPI cudaGetFuncBySymbol(cudaFunction_t *functionPtr,
+                                                             const void *symbolPtr) {
+  if (functionPtr == NULL || symbolPtr == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  *functionPtr = (cudaFunction_t)symbolPtr;
+  return g_last_cudaError = cudaSuccess;
+}
+
+// yasai: stream id from the simulator's stream uid (0 for the default stream).
+extern "C" __host__ cudaError_t CUDARTAPI cudaStreamGetId(cudaStream_t hStream,
+                                                         unsigned long long *streamId) {
+  if (streamId == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  *streamId = hStream ? (unsigned long long)((struct CUstream_st *)hStream)->get_uid() : 0;
+  return g_last_cudaError = cudaSuccess;
+}
+
+// yasai: CUDA 13 form of cudaStreamGetCaptureInfo; no stream is ever capturing.
+extern "C" __host__ cudaError_t CUDARTAPI cudaStreamGetCaptureInfo(
+    cudaStream_t stream, enum cudaStreamCaptureStatus *captureStatus_out,
+    unsigned long long *id_out, cudaGraph_t *graph_out,
+    const cudaGraphNode_t **dependencies_out, const cudaGraphEdgeData **edgeData_out,
+    size_t *numDependencies_out) {
+  (void)stream;
+  if (captureStatus_out) *captureStatus_out = cudaStreamCaptureStatusNone;
+  if (id_out) *id_out = 0;
+  if (graph_out) *graph_out = NULL;
+  if (dependencies_out) *dependencies_out = NULL;
+  if (edgeData_out) *edgeData_out = NULL;
+  if (numDependencies_out) *numDependencies_out = 0;
+  return g_last_cudaError = cudaSuccess;
+}
+
+// yasai: cuLaunchKernelEx without attribute support (cluster, memory-sync domain and other
+// attributes are ignored); grid, block, shared memory and stream come from the config.
+extern "C" CUresult CUDAAPI cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f,
+                                             void **kernelParams, void **extra) {
+  if (config == NULL) return CUDA_ERROR_INVALID_VALUE;
+  return cuLaunchKernelInternal(f, config->gridDimX, config->gridDimY, config->gridDimZ,
+                                config->blockDimX, config->blockDimY, config->blockDimZ,
+                                config->sharedMemBytes, config->hStream, kernelParams, extra);
+}
+
+// yasai: a fixed UUID per simulated device (NCCL reads it for topology and logging).
+extern "C" CUresult CUDAAPI cuDeviceGetUuid(CUuuid *uuid, CUdevice dev) {
+  if (uuid == NULL) return CUDA_ERROR_INVALID_VALUE;
+  memset(uuid->bytes, 0, sizeof(uuid->bytes));
+  uuid->bytes[0] = 0x59;  // 'Y'
+  uuid->bytes[15] = (char)(dev & 0xff);
+  return CUDA_SUCCESS;
 }
