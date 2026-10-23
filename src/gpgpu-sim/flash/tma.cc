@@ -1973,12 +1973,17 @@ static uint64_t apply_tma_swizzle(uint64_t linear_offset,
     abort();
   }
 
-  // Extract row information assuming 128B stride
-  // In Hopper/Blackwell hardware, row extraction is based on 128B alignment
-  uint32_t row_bits = (uint32_t)(linear_offset >> 7);
+  // yasai: the hardware swizzles the absolute shared-memory address, not the
+  // offset inside the box, so a box that does not start on a 1024-byte boundary
+  // (CUTLASS's cooperative SM90 kernels place theirs at 0x180) is permuted by
+  // the address bits. wgmma's descriptor addressing (tensor_wgmma.cc) already
+  // works on absolute bits; with an offset-relative swizzle here, TMA and wgmma
+  // disagreed and the GEMM results were wrong.
+  const uint64_t abs_addr = (uint64_t)smem_base_addr + linear_offset;
+  const uint32_t row_bits = (uint32_t)(abs_addr >> 7);
 
   // Apply XOR permutation: addr XOR ((row_bits & mask) << shift)
-  return linear_offset ^ ((uint64_t)(row_bits & mask) << shift);
+  return (abs_addr ^ ((uint64_t)(row_bits & mask) << shift)) - smem_base_addr;
 }
 
 // Generate 128B-aligned memory fetch requests
@@ -2723,6 +2728,10 @@ static void handle_tma_tensor(ptx_instruction *pI, ptx_thread_info *thread) {
     if (thread->isInFunctionalSimulationMode())
       yasai_func::mbar_complete_tx(thread->get_cta_uid(), mbar_addr,
                                    size_in_bytes);
+    if (getenv("YASAI_WGMMA_DEBUG"))
+      printf("yasai-tma load dst=0x%x bytes=%u coords=%d,%d,%d\n",
+             (unsigned)dst_addr, (unsigned)size_in_bytes, coords[0], coords[1],
+             coords[2]);
 
   } else if (dst_option == GLOBAL_OPTION && src_option == CTA_OPTION) {
     // Tensor store: global <- shared

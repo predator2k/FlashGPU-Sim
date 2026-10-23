@@ -2,6 +2,8 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 #include "../../../abstract_hardware_model.h"
 #include "../../../cuda-sim/ptx_ir.h"
@@ -22,10 +24,24 @@ uint16_t packed_f16(const ptx_reg_t &reg, int half_index) {
   return static_cast<uint16_t>((reg.u32 >> 16) & 0xFFFFu);
 }
 
-} // namespace
+// yasai: value of a 16-bit operand element, f16 or bf16 (bf16 is the upper half
+// of an f32).
+float elem16_to_f32(uint16_t bits, bool bf16) {
+  if (!bf16)
+    return mma_f16_to_f32(bits);
+  union {
+    uint32_t u;
+    float f;
+  } v;
+  v.u = static_cast<uint32_t>(bits) << 16;
+  return v.f;
+}
 
-void wgmma_m64nXk16_f16_impl(const ptx_instruction *pI, core_t *core,
-                             warp_inst_t &inst) {
+// yasai: m64nNk16 with f16 or bf16 inputs and f32 accumulation for every N the
+// f16 path supports (the bf16 path existed only for N = 8). The body is the
+// former f16 implementation with the element conversion chosen by bf16.
+void wgmma_m64nXk16_16bit_impl(const ptx_instruction *pI, core_t *core,
+                               warp_inst_t &inst, bool bf16) {
   constexpr int M = 64;
   constexpr int K = 16;
 
@@ -103,10 +119,26 @@ void wgmma_m64nXk16_f16_impl(const ptx_instruction *pI, core_t *core,
               : wgmma_gmma_mn_major_smem_addr(b_desc, col, k, sizeof(uint16_t));
       representative_thread->m_shared_mem->read(b_smem_addr, sizeof(b_bits),
                                                 &b_bits);
-      B_mat[col * K + k] = scale_b * mma_f16_to_f32(b_bits);
+      B_mat[col * K + k] = scale_b * elem16_to_f32(b_bits, bf16);
     }
   }
 
+  if (getenv("YASAI_WGMMA_DEBUG")) {
+    static int printed = 0;
+    if (printed++ < 4) {
+      printf("yasai-wgmma N=%d a_reg=%d major_a=%d major_b=%d b_desc=0x%llx "
+             "B[c,k] c0..3,k0..3:",
+             N, (int)a_from_register, major_a, major_b,
+             (unsigned long long)b_desc);
+      for (int c = 0; c < 4; ++c)
+        for (int k = 0; k < 4; ++k)
+          printf(" %.0f", B_mat[c * K + k]);
+      printf(" addr(c0,k0)=0x%x addr(c1,k0)=0x%x addr(c0,k8)=0x%x\n",
+             wgmma_gmma_k_major_smem_addr(b_desc, 0, 0, 2, K),
+             wgmma_gmma_k_major_smem_addr(b_desc, 1, 0, 2, K),
+             wgmma_gmma_k_major_smem_addr(b_desc, 0, 8, 2, K));
+    }
+  }
   if (a_from_register) {
     if (src_a.get_vect_nelem() != 4)
       return;
@@ -127,9 +159,9 @@ void wgmma_m64nXk16_f16_impl(const ptx_instruction *pI, core_t *core,
         int k0 = 2 * tid_mma_col + 8 * reg_k_block;
 
         A_mat[row * K + k0] =
-            scale_a * mma_f16_to_f32(packed_f16(a_regs[reg], 0));
+            scale_a * elem16_to_f32(packed_f16(a_regs[reg], 0), bf16);
         A_mat[row * K + k0 + 1] =
-            scale_a * mma_f16_to_f32(packed_f16(a_regs[reg], 1));
+            scale_a * elem16_to_f32(packed_f16(a_regs[reg], 1), bf16);
       }
     }
   } else {
@@ -146,7 +178,7 @@ void wgmma_m64nXk16_f16_impl(const ptx_instruction *pI, core_t *core,
                                                          sizeof(uint16_t));
         representative_thread->m_shared_mem->read(a_smem_addr, sizeof(a_bits),
                                                   &a_bits);
-        A_mat[row * K + k] = scale_a * mma_f16_to_f32(a_bits);
+        A_mat[row * K + k] = scale_a * elem16_to_f32(a_bits, bf16);
       }
     }
   }
@@ -176,6 +208,18 @@ void wgmma_m64nXk16_f16_impl(const ptx_instruction *pI, core_t *core,
       thread->set_reg(dst.vec_symbol(reg), d_reg);
     }
   }
+}
+
+} // namespace
+
+void wgmma_m64nXk16_f16_impl(const ptx_instruction *pI, core_t *core,
+                             warp_inst_t &inst) {
+  wgmma_m64nXk16_16bit_impl(pI, core, inst, false);
+}
+
+void wgmma_m64nXk16_bf16_impl(const ptx_instruction *pI, core_t *core,
+                              warp_inst_t &inst) {
+  wgmma_m64nXk16_16bit_impl(pI, core, inst, true);
 }
 
 } // namespace flash_gpgpu_sim

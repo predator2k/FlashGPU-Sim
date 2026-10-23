@@ -401,6 +401,11 @@ void ptx_recognizer::add_identifier(const char *identifier, int array_dim,
       assert((num_bits % 8) == 0);
       addr = g_current_symbol_table->get_shared_next();
       addr_pad = pad_address(addr, num_bits / 8, 128);
+      // yasai: honor an explicit .align (CUTLASS declares its dynamic shared storage
+      // .align 1024 because swizzled TMA and wgmma layouts need 1024-byte alignment); the size
+      // heuristic above gives no alignment at all to an unsized extern array.
+      if (g_alignment_spec > 0 && (addr + addr_pad) % g_alignment_spec != 0)
+        addr_pad += pad_address(addr + addr_pad, g_alignment_spec, g_alignment_spec);
       printf("from 0x%llx to 0x%llx (shared memory space)\n", addr + addr_pad,
              addr + addr_pad + num_bits / 8);
       fflush(stdout);

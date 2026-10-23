@@ -399,7 +399,9 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
           cta_key, get_u32_value(pI->src1()), get_u32_value(pI->src2()) & 1u);
       ptx_reg_t p;
       p.u64 = 0;
-      p.pred = done ? 1 : 0;
+      p.pred =
+          done ? 0
+               : 1; // FlashGPU-Sim stores predicates inverted (0 means true)
       thread->set_reg(pI->dst().get_symbol(), p);
       if (std::getenv("YASAI_MBAR_DEBUG") && laneid == 0)
         printf(
