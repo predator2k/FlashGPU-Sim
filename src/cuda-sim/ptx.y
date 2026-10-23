@@ -268,6 +268,9 @@ class ptx_recognizer;
 %token	CP_FENCEPROXY_OPTION;
 %token	RELEASE_OPTION;
 %token	ACQUIRE_OPTION;
+%token	ACQ_REL_OPTION;
+%token	SC_OPTION;
+%token	IGNORED_OPTION;
 %token	GPU_OPTION;
 %token	L2_CACHE_HINT_OPTION;
 %token	L2_OPTION;
@@ -699,6 +702,9 @@ option: type_spec
 	| RELEASE_OPTION { recognizer->add_option(RELEASE_OPTION); }
 	| RELAXED_OPTION { recognizer->add_option(RELAXED_OPTION); }
 	| ACQUIRE_OPTION { recognizer->add_option(ACQUIRE_OPTION); }
+	| ACQ_REL_OPTION { recognizer->add_option(ACQ_REL_OPTION); }
+	| SC_OPTION { recognizer->add_option(SC_OPTION); }
+	| IGNORED_OPTION { }
 	| GPU_OPTION { recognizer->add_option(GPU_OPTION); }
 	| L2_CACHE_HINT_OPTION { recognizer->add_option(L2_CACHE_HINT_OPTION); }
 	| L2_OPTION { recognizer->add_option(L2_OPTION); }

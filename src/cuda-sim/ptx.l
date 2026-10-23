@@ -88,6 +88,12 @@ and	TC; yylval->int_value = AND_OP; return OPCODE;
 andn	TC; yylval->int_value = ANDN_OP; return OPCODE;
 atom	TC; yylval->int_value = ATOM_OP; return OPCODE;
 bar.warp 	TC; yylval->int_value = NOP_OP; return OPCODE;
+	/* yasai: parsed so that NCCL's modules load; nanosleep is a no-op in functional execution
+	   and multimem (NVLS kernels, disabled in fakeenv runs) is never executed. */
+nanosleep	TC; yylval->int_value = NOP_OP; return OPCODE;
+multimem\.ld_reduce	TC; yylval->int_value = NOP_OP; return OPCODE;
+multimem\.red	TC; yylval->int_value = NOP_OP; return OPCODE;
+multimem\.st	TC; yylval->int_value = NOP_OP; return OPCODE;
 bar 	TC; yylval->int_value = BAR_OP; return OPCODE;
 barrier	TC; yylval->int_value = BAR_OP; return OPCODE;
 mbarrier 	TC; yylval->int_value = MBAR_OP; return OPCODE;
@@ -367,6 +373,7 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.f16  TC;  return F16_TYPE;
 \.f16x2  TC;  return F16X2_TYPE;
 \.bf16  TC;  return BF16_TYPE;
+\.bf16x2  TC;  return F16X2_TYPE; /* yasai: same size as f16x2; only in never-executed multimem */
 \.tf32  TC;  return TF32_TYPE;
 \.e4m3  TC;  return E4M3_TYPE;
 \.e5m2  TC;  return E5M2_TYPE;
@@ -536,6 +543,17 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.release TC; return RELEASE_OPTION;
 \.relaxed TC; return RELAXED_OPTION;
 \.acquire TC; return ACQUIRE_OPTION;
+\.acq_rel TC; return ACQ_REL_OPTION;
+\.sc TC; return SC_OPTION;
+	/* yasai: options without effect in functional execution (MMIO ordering, L1 cache hints,
+	   accumulator type of multimem reductions). */
+\.mmio TC; return IGNORED_OPTION;
+\.L1::no_allocate TC; return IGNORED_OPTION;
+\.L1::evict_normal TC; return IGNORED_OPTION;
+\.L1::evict_first TC; return IGNORED_OPTION;
+\.L1::evict_last TC; return IGNORED_OPTION;
+\.L1::evict_unchanged TC; return IGNORED_OPTION;
+\.acc::f32 TC; return IGNORED_OPTION;
 \.gpu TC; return GPU_OPTION;
 \.L2::128B TC; return L2_OPTION;
 \.L2::cache_hint TC; return L2_CACHE_HINT_OPTION;
