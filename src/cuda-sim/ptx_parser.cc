@@ -952,11 +952,23 @@ void ptx_recognizer::end_vector_operand() {
     // bf16 to f32 with "mov.b32 %f, {0, %rs}", the b64 form packs two 32-bit halves).
     const bool is_mov_pack = g_opcode == MOV_OP && g_vector_operand_start == 1 &&
                              (g_scalar_type_spec == B64_TYPE || g_scalar_type_spec == B32_TYPE);
-    parse_assert(is_store_source || is_mov_pack,
-                 "literal vector operands are only valid as store sources "
-                 "or mov.b32/mov.b64 pack sources.");
+    // yasai: an mma.sync accumulator (C, a source after the destination) may hold literal
+    // components: FlashInfer's prefill kernels write "{%f670, 0., %f671, 0.}". Decimal literals
+    // are lexed as doubles; the accumulator registers are f32, so they become f32 literals, which
+    // get_vector_operand_values reads like registers.
+    const bool is_mma_source = g_opcode == MMA_OP && g_vector_operand_start >= 1;
+    parse_assert(is_store_source || is_mov_pack || is_mma_source,
+                 "literal vector operands are only valid as store sources, "
+                 "mov.b32/mov.b64 pack sources or mma.sync sources.");
 
-    if (is_mov_pack) {
+    if (is_mma_source) {
+      for (operand_info &component : components) {
+        if (component.is_literal() && component.get_type() == double_op_t) {
+          const ptx_reg_t value = component.get_literal_value();
+          component = operand_info(static_cast<float>(value.f64), gpgpu_ctx);
+        }
+      }
+    } else if (is_mov_pack) {
       const unsigned pack_bits = scalar_type_bits(g_scalar_type_spec);
       parse_assert(components.size() >= 2 && pack_bits % components.size() == 0,
                    "mov pack source has an invalid component count.");
