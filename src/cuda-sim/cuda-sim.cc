@@ -544,6 +544,10 @@ void function_info::recognize_dynamic_shared_mem() {
       auto &op = instr->get_operands()[i];
       if (op.is_shared()) {
         auto symbol = m_symtab->lookup(op.name().c_str());
+        // yasai: the operand's own symbol when the function's tables do not resolve the name
+        // (an extern .shared array declared in a per-kernel PTX piece; FlashInfer's prefill
+        // kernels take its address with "mov.u32 %r, _ZN10flashinfer4smemE").
+        if (symbol == nullptr) symbol = const_cast<::symbol *>(op.get_symbol());
         if (symbol && symbol->is_shared()) {
           auto size_in_bytes = symbol->get_size_in_bytes();
           printf("GPGPU-Sim PTX: >>> This is a shared memory symbol: %s size "
