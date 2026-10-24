@@ -140,6 +140,10 @@ bool stream_operation::do_operation(gpgpu_sim *gpu) {
       m_stream->record_next_done();
       if (gpu->is_SST_mode()) SST_callback_memcpy_D2H_done();
       break;
+    case stream_memset:
+      gpu->gpu_memset(m_device_address_dst, m_memset_value, m_cnt);
+      m_stream->record_next_done();
+      break;
     case stream_memcpy_device_to_device:
       if (g_debug_execution >= 3) printf("memcpy device-to-device\n");
       gpu->memcpy_gpu_to_gpu(m_device_address_dst, m_device_address_src, m_cnt);
@@ -222,6 +226,9 @@ void stream_operation::print(FILE *fp) const {
       break;
     case stream_kernel_launch:
       fprintf(fp, "kernel");
+      break;
+    case stream_memset:
+      fprintf(fp, "memset");
       break;
     case stream_memcpy_device_to_device:
       fprintf(fp, "memcpy device-to-device");

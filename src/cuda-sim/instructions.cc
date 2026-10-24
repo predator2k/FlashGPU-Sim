@@ -4315,6 +4315,21 @@ void ld_exec(const ptx_instruction *pI, ptx_thread_info *thread) {
       mem->read(addr + e * size / 8, size / 8, &d.s64);
       thread->set_reg(dst.vec_symbol(e), d);
     }
+  } else if ((vector_spec == V2_TYPE || vector_spec == V4_TYPE) &&
+             (vector_spec == V2_TYPE ? 2 : 4) * size / 8 <= 16) {
+    // yasai: a vector of at most 16 bytes is read in one access, so memory shared with other
+    // processes (host_window) delivers all elements from one instant (NCCL's LL protocol packs
+    // data and flag in one 8-byte vector, LL128 in 16-byte vectors).
+    const unsigned n = vector_spec == V2_TYPE ? 2 : 4, eb = size / 8;
+    unsigned char buf[16] = {0};
+    mem->read(addr, n * eb, buf);
+    ptx_reg_t d[4];
+    for (unsigned e = 0; e < 4; e++) {
+      d[e].u64 = 0;
+      if (e < n) memcpy(&d[e].s64, buf + e * eb, eb);
+    }
+    if (n == 2) thread->set_vector_operand_values(dst, d[0], d[1], d[1], d[1]);
+    else thread->set_vector_operand_values(dst, d[0], d[1], d[2], d[3]);
   } else {
     ptx_reg_t data1, data2, data3, data4;
     mem->read(addr, size / 8, &data1.s64);
@@ -6650,10 +6665,14 @@ void shf_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     else
       n = 32;
   }
+  // yasai: shift the 64-bit concatenation b:a. The 32-bit form shifted by 32 - n, which is
+  // undefined for n = 0 (x86 masks the count to 0), so shf.r with a zero shift returned a | b
+  // instead of a; NCCL's LL sends of aligned data hit it (every even f32 element wrong).
+  const uint64_t ba = (uint64_t(b.u32) << 32) | a.u32;
   if (pI->left_mode())
-    d.u32 = (b.u32 << n) | (a.u32 >> (32 - n));
+    d.u32 = uint32_t((ba << n) >> 32);
   else
-    d.u32 = (b.u32 << (32 - n)) | (a.u32 >> n);
+    d.u32 = uint32_t(ba >> n);
 
   thread->set_operand_value(dst, d, i_type, thread, pI);
 }
@@ -7037,6 +7056,16 @@ void st_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
           mem, decode_token(type), addr, data.u64, pI->to_string().c_str());
     }
 
+  } else if ((vector_spec == V2_TYPE || vector_spec == V4_TYPE) &&
+             (vector_spec == V2_TYPE ? 2 : 4) * size / 8 <= 16) {
+    // yasai: a vector of at most 16 bytes is written in one access (see ld_exec), so another
+    // process sees all elements at once.
+    const unsigned n = vector_spec == V2_TYPE ? 2 : 4, eb = size / 8;
+    ptx_reg_t r[4];
+    thread->get_vector_operand_values(src1, r, n);
+    unsigned char buf[16];
+    for (unsigned e = 0; e < n; e++) memcpy(buf + e * eb, &r[e].s64, eb);
+    mem->write(addr, n * eb, buf, thread, pI);
   } else {
     if (vector_spec == V8_TYPE) {
       // yasai: 256-bit vector store (.v8).

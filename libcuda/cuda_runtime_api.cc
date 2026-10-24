@@ -1930,11 +1930,10 @@ cudaMemsetAsyncInternal(void *mem, int c, size_t count, cudaStream_t stream = 0,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("GPGPU-Sim PTX: WARNING: Asynchronous memset not supported (%s)\n",
-         __my_func__);
-  CUctx_st *context = GPGPUSim_Context(ctx);
-  gpgpu_t *gpu = context->get_device()->get_gpgpu();
-  gpu->gpu_memset((size_t)mem, c, count);
+  // yasai: the memset is a stream operation, so it runs after the work queued before it on the
+  // stream and before the work queued after it.
+  ctx->the_gpgpusim->g_stream_manager->push(stream_operation::memset_op(
+      (size_t)mem, c, count, (struct CUstream_st *)stream));
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -4886,6 +4885,19 @@ void yasai_ptx_called(const std::string &t, size_t b, size_t e,
 // Total bytes of PTX parsed by the per-kernel loader (printed with each piece).
 size_t g_yasai_piece_bytes = 0;
 
+// Path of a per-kernel piece file: in YASAI_PTX_PIECE_DIR, else in the current directory, named
+// after the source file, the process and the piece number. Several rank processes load pieces
+// of one shared source file (NCCL's merged module) at the same time, so the pieces may not be
+// written next to the source file under a common name.
+//   src: source PTX file; piece: piece number; suffix: ".ptx" or ".full.ptx"
+std::string yasai_piece_path(const std::string &src, int piece, const char *suffix) {
+  const char *d = getenv("YASAI_PTX_PIECE_DIR");
+  const size_t slash = src.rfind('/');
+  const std::string base = slash == std::string::npos ? src : src.substr(slash + 1);
+  return std::string(d && *d ? d : ".") + "/" + base + ".p" + std::to_string(getpid()) + ".k" +
+         std::to_string(piece) + suffix;
+}
+
 // True when per-kernel loading also defers function bodies to their first call
 // (YASAI_PTX_LAZY_FUNC unset or nonzero). Otherwise a kernel's piece holds every function it
 // reaches, through calls and through the function pointers of the file's initializers.
@@ -4990,7 +5002,7 @@ bool yasai_lazy_load_piece_lazyfunc(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int
     if (!ptxas_part.empty()) ptxas_text.append(ptxas_part).push_back('\n');
   }
   const int piece = L.pieces[i]++;
-  const std::string parse_file = L.files[i] + ".k" + std::to_string(piece) + ".ptx";
+  const std::string parse_file = yasai_piece_path(L.files[i], piece, ".ptx");
   {
     std::ofstream out(parse_file);
     out << parse_text;
@@ -5009,7 +5021,7 @@ bool yasai_lazy_load_piece_lazyfunc(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int
   L.vars_loaded[i] = true;
   if (entry_item >= 0 || func_item >= 0) L.funcs_loaded[i].insert(target);
   if (entry_item >= 0) {
-    const std::string ptxas_file = L.files[i] + ".k" + std::to_string(piece) + ".full.ptx";
+    const std::string ptxas_file = yasai_piece_path(L.files[i], piece, ".full.ptx");
     {
       std::ofstream out(ptxas_file);
       out << ptxas_text;
@@ -5086,7 +5098,7 @@ bool yasai_lazy_load_piece(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i, const
     if (to_parse) parse_text.append(t, it.begin, it.end - it.begin).push_back('\n');
   }
   const int piece = L.pieces[i]++;
-  const std::string parse_file = L.files[i] + ".k" + std::to_string(piece) + ".ptx";
+  const std::string parse_file = yasai_piece_path(L.files[i], piece, ".ptx");
   {
     std::ofstream out(parse_file);
     out << parse_text;
@@ -5105,7 +5117,7 @@ bool yasai_lazy_load_piece(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i, const
   for (const std::string &f : reached) L.funcs_loaded[i].insert(f);
   if (entry_item >= 0) {
     L.funcs_loaded[i].insert(target);
-    const std::string ptxas_file = L.files[i] + ".k" + std::to_string(piece) + ".full.ptx";
+    const std::string ptxas_file = yasai_piece_path(L.files[i], piece, ".full.ptx");
     {
       std::ofstream out(ptxas_file);
       out << ptxas_text;
@@ -6653,7 +6665,9 @@ CUresult CUDAAPI cuCtxGetCurrent(CUcontext *pctx) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: the one context of the simulated device.
+  if (!pctx) return CUDA_ERROR_INVALID_VALUE;
+  *pctx = (CUcontext)GPGPUSim_Context(GPGPU_Context());
   return CUDA_SUCCESS;
 }
 #endif /* CUDART_VERSION >= 4000 */

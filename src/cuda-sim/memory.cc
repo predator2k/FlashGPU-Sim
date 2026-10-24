@@ -28,6 +28,8 @@
 
 #include "memory.h"
 #include "host_window.h"
+#include "ptx_ir.h"
+#include "ptx_sim.h"
 #include <stdlib.h>
 #include "../../libcuda/gpgpu_context.h"
 #include "../debug.h"
@@ -96,11 +98,37 @@ void memory_space_impl<BSIZE>::write_only(mem_addr_t offset, mem_addr_t index,
   get_or_init_block(index).write(offset, length, (const unsigned char *)data);
 }
 
+// yasai: YASAI_WATCH="<first address>:<bytes>" (hexadecimal address) prints every kernel store to
+// the global space that overlaps the range: the instruction, the thread and the bytes written.
+// A debugging aid for wrong results in shared or device memory.
+static bool yasai_watch_hit(uint64_t addr, size_t length) {
+  static uint64_t lo = 0, hi = 0;
+  static const bool on = [] {
+    const char *v = getenv("YASAI_WATCH");
+    if (!v) return false;
+    char *e = nullptr;
+    lo = strtoull(v, &e, 16);
+    hi = lo + ((e && *e == ':') ? strtoull(e + 1, nullptr, 0) : 8);
+    return true;
+  }();
+  return on && addr < hi && addr + length > lo;
+}
+
 template <unsigned BSIZE>
 void memory_space_impl<BSIZE>::write(mem_addr_t addr, size_t length,
                                      const void *data,
                                      class ptx_thread_info *thread,
                                      const ptx_instruction *pI) {
+  if (m_host_window && yasai_watch_hit(addr, length)) {
+    printf("yasai-watch: store 0x%llx len %zu bytes", (unsigned long long)addr, length);
+    for (size_t i = 0; i < length && i < 16; i++)
+      printf(" %02x", ((const unsigned char *)data)[i]);
+    if (thread && pI)
+      printf(" by tid (%u,%u,%u) cta (%u,%u,%u): %s", thread->get_tid().x, thread->get_tid().y,
+             thread->get_tid().z, thread->get_ctaid().x, thread->get_ctaid().y,
+             thread->get_ctaid().z, pI->get_source());
+    printf("\n");
+  }
   if (m_host_window && host_window::try_write(addr, length, data)) return;
   mem_addr_t index = addr >> m_log2_block_size;
 
