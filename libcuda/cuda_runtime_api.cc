@@ -2342,6 +2342,11 @@ cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlagsInternal(
     // not care which stream this kernel runs at, just picked -1
     kernel_info_t result(gridDim, blockDim, entry, -1);
     result.set_dynamic_smem(unsigned(dynamicSMemSize));
+    // yasai: the query only counts CTAs. The adaptive L1 carve-out belongs to the launch on the
+    // simulation thread; applied from this host thread it raced with that thread's L1 re-init
+    // (cache_config::init copies m_assoc into original_m_assoc), and get_max_cache_multiplier
+    // asserted (DeepEP intranode at 4 ranks).
+    result.cache_config_set = true;
     // if(entry == NULL){
     //	*numBlocks = 1;
     //	return g_last_cudaError = cudaErrorUnknown;
@@ -9003,6 +9008,9 @@ CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
   dim3 blockDim(blockSize);
   kernel_info_t probe(gridDim, blockDim, entry, -1);
   probe.set_dynamic_smem(unsigned(dynamicSMemSize));
+  // The query only counts CTAs; it leaves the L1 carve-out to the launch (see
+  // cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlagsInternal).
+  probe.cache_config_set = true;
   *numBlocks = gpu->get_max_cta(probe);
   return CUDA_SUCCESS;
 }
