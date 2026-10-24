@@ -511,7 +511,8 @@ static int get_app_cuda_version_internal(std::string app_binary) {
     if (atoi(v) > 0) return atoi(v);
   }
   if (const char *pb = getenv("PYTORCH_BIN")) {
-    if (strlen(pb) != 0) app_binary = pb;
+    // yasai: PYTORCH_BIN may list several libraries separated by ':'; the first one is probed.
+    if (strlen(pb) != 0) app_binary = std::string(pb).substr(0, std::string(pb).find(':'));
   }
   // yasai: one probe per binary; the probe runs ldd, readelf and strings over the binary, which
   // takes seconds on libtorch_cuda.so, and a PyTorch process registers dozens of fat binaries.
@@ -2347,6 +2348,28 @@ cudaDeviceGetAttributeInternal(int *value, enum cudaDeviceAttr attr, int device,
       case 134:  // cudaDevAttrHostNumaId
         *value = 0;
         break;
+      // yasai: the CUDA 13 attributes after 134. The PCI ids are those of an RTX 5090
+      // (device 0x2b85, vendor 0x10de; the simulated device has no subsystem id); the CIG, host
+      // NUMA, host memory pool and partial host atomic features are absent.
+      case 135:  // cudaDevAttrD3D12CigSupported
+      case 136:
+      case 137:
+      case 138:  // cudaDevAttrVulkanCigSupported
+        *value = 0;
+        break;
+      case 139:  // cudaDevAttrGpuPciDeviceId
+        *value = int((0x2b85u << 16) | 0x10deu);
+        break;
+      case 140:  // cudaDevAttrGpuPciSubsystemId
+      case 141:  // cudaDevAttrReserved141
+      case 142:  // cudaDevAttrHostNumaMemoryPoolsSupported
+      case 143:  // cudaDevAttrHostNumaMultinodeIpcSupported
+      case 144:  // cudaDevAttrHostMemoryPoolsSupported
+      case 145:  // cudaDevAttrReserved145
+      case 146:
+      case 147:  // cudaDevAttrOnlyPartialHostNativeAtomicSupported
+        *value = 0;
+        break;
       default:
         printf("ERROR: Attribute number %d unimplemented \n", attr);
         abort();
@@ -3762,16 +3785,29 @@ void cuda_runtime_api::extract_ptx_files_using_cuobjdump_internal(
   int fd2 = mkstemp(ptx_list_file_name);
   close(fd2);
 
+  // yasai: PYTORCH_BIN may list several libraries separated by ':' (for example libtorch_cuda.so
+  // and the cuBLAS replacement); the PTX files of all of them are listed and extracted, and
+  // cuobjdumpParseBinary selects the PTX version per library.
+  std::vector<std::string> binaries;
   if (pytorch_bin != NULL && strlen(pytorch_bin) != 0) {
-    app_binary = std::string(pytorch_bin);
+    std::string list(pytorch_bin);
+    size_t start = 0;
+    while (start <= list.size()) {
+      const size_t end = std::min(list.find(':', start), list.size());
+      if (end > start) binaries.push_back(list.substr(start, end - start));
+      start = end + 1;
+    }
   }
+  if (binaries.empty()) binaries.push_back(app_binary);
+  app_binary = binaries[0];
   app_binary_path = app_binary;
 
   // only want file names
-  snprintf(command, sizeof(command),
-           "$CUDA_INSTALL_PATH/bin/cuobjdump -lptx %s  | cut -d \":\" -f 2 | "
-           "awk '{$1=$1}1' > %s",
-           app_binary.c_str(), ptx_list_file_name);
+  std::string list_cmd;
+  for (const std::string &b : binaries)
+    list_cmd += "$CUDA_INSTALL_PATH/bin/cuobjdump -lptx " + b +
+                "  | cut -d \":\" -f 2 | awk '{$1=$1}1' >> " + ptx_list_file_name + "; ";
+  snprintf(command, sizeof(command), "%s", list_cmd.c_str());
   if (GPTRACE(PTX_IR)) {
     char cwd_buf[4096];
     [[maybe_unused]] const char *cwd =
@@ -3797,13 +3833,15 @@ void cuda_runtime_api::extract_ptx_files_using_cuobjdump_internal(
     std::string line;
     while (std::getline(infile, line)) context->no_of_ptx++;
     if (context->no_of_ptx) {
-      printf("Extracting all %d PTX files of %s\n", context->no_of_ptx, app_binary.c_str());
-      snprintf(command, sizeof(command),
-               "$CUDA_INSTALL_PATH/bin/cuobjdump -xptx all %s > /dev/null",
-               app_binary.c_str());
-      if (system(command) != 0) {
-        printf("ERROR: command: %s failed \n", command);
-        exit(0);
+      for (const std::string &b : binaries) {
+        printf("Extracting all PTX files of %s (%d listed in total)\n", b.c_str(),
+               context->no_of_ptx);
+        snprintf(command, sizeof(command),
+                 "$CUDA_INSTALL_PATH/bin/cuobjdump -xptx all %s > /dev/null", b.c_str());
+        if (system(command) != 0) {
+          printf("ERROR: command: %s failed \n", command);
+          exit(0);
+        }
       }
     }
   }
@@ -4403,27 +4441,39 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
                                        ->get_gpgpu()
                                        ->get_config()
                                        .get_forced_max_capability();
-  if (!api->version_filename.empty()) {
+  // yasai: the version is selected per library (file name prefix before ".<n>.sm_"), so the PTX
+  // of libraries built for different architectures (PYTORCH_BIN with several libraries) all load.
+  std::map<std::string, std::map<unsigned, std::set<std::string>>> by_library;
+  for (const auto &kv : api->version_filename)
+    for (const std::string &f : kv.second) {
+      const size_t sm_pos = f.find("sm_");
+      const size_t cut = (sm_pos != std::string::npos && sm_pos >= 2) ? f.rfind('.', sm_pos - 2)
+                                                                       : std::string::npos;
+      by_library[cut == std::string::npos ? std::string() : f.substr(0, cut)][kv.first].insert(f);
+    }
+  for (auto &library : by_library) {
+  std::map<unsigned, std::set<std::string>> &vf = library.second;
+  if (!vf.empty()) {
     // pick selected_version: largest version <= forced_max_capability (or
     // largest available)
     unsigned selected_version = 0;
     if (forced_max_capability != 0) {
-      for (auto rit = api->version_filename.rbegin();
-           rit != api->version_filename.rend(); ++rit) {
+      for (auto rit = vf.rbegin();
+           rit != vf.rend(); ++rit) {
         if (rit->first <= forced_max_capability) {
           selected_version = rit->first;
           break;
         }
       }
       if (selected_version == 0)
-        selected_version = api->version_filename.rbegin()->first;
+        selected_version = vf.rbegin()->first;
     } else {
-      selected_version = api->version_filename.rbegin()->first;
+      selected_version = vf.rbegin()->first;
     }
 
     // Determine if there are suffix variants for this selected_version
     bool has_suffix = false;
-    for (auto &check_name : api->version_filename[selected_version]) {
+    for (auto &check_name : vf[selected_version]) {
       size_t sm_pos = check_name.find("sm_");
       if (sm_pos != std::string::npos) {
         size_t dot_pos = check_name.find('.', sm_pos);
@@ -4439,7 +4489,7 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
       }
     }
 
-    for (auto &ptx_filename : api->version_filename[selected_version]) {
+    for (auto &ptx_filename : vf[selected_version]) {
       // Skip base version if suffix version exists
       if (has_suffix) {
         size_t sm_pos = ptx_filename.find("sm_");
@@ -4463,6 +4513,8 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
       }
       selected_files.push_back(ptx_filename);
     }
+  }
+
   }
 
   // Parse the selected files (if any)
