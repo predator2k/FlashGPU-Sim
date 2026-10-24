@@ -155,6 +155,88 @@ class functionalCoreSim : public core_t {
   bool *m_warpAtBarrier;
 };
 
+class cuda_sim;
+
+/*!
+ * yasai: functional execution of one kernel launch as a sequence of rounds, so that the
+ * simulation thread can run several kernels (of different streams) at the same time and the
+ * CTAs of one kernel can be co-resident.
+ *
+ * The run keeps a set of CTA groups active at once; a group is one CTA, or the CTAs of one
+ * cluster. step() executes one round (every warp of every active CTA once), retires finished
+ * groups and starts the next CTAs in their place. The number of active groups is
+ *   * all of them for a cooperative launch (the grid fits the co-resident limit, checked at
+ *     launch; CTA sampling is off because grid.sync counts every CTA);
+ *   * the co-resident limit (the reported SM count x CTAs per SM for this kernel, from the
+ *     device properties the application sees, not from the functional cores; divided by
+ *     the cluster size) when CTA interleaving is on: YASAI_CTA_INTERLEAVE=1;
+ *   * one otherwise (CTA-at-a-time, the former order).
+ * A kernel that allocates tensor memory, or launches with clusters (except cooperatively), is
+ * exclusive: it runs with one group and no other kernel runs beside it. Checkpointing
+ * (checkpoint_option) uses the former loop, run to completion by the constructor.
+ * Each active CTA's core holds its own hardware CTA slot from the pool
+ * (yasai_acquire_cta_slot: shared memory, CTA, warp, mbarrier, tcgen05 and local memory state),
+ * shared by all concurrently running kernels; %smid is the CTA's virtual SM, its co-resident
+ * placement round-robin over the reported SM count.
+ */
+class yasai_func_run {
+ public:
+  /// Prepares the kernel (PDOM analysis, occupancy, per-kernel statistics) and starts its first
+  /// CTAs.
+  /// @param sim Functional simulator of the process.
+  /// @param kernel Kernel launch.
+  /// @param openCL True for an OpenCL launch (its exit is not registered with the streams).
+  yasai_func_run(cuda_sim *sim, kernel_info_t &kernel, bool openCL);
+  ~yasai_func_run();
+  /// Executes one round.
+  /// @return True when the kernel has finished (its completion is then registered).
+  bool step();
+  /// Whether no other kernel may run beside this one (see the class comment).
+  bool exclusive() const { return m_exclusive; }
+  /// Whether a launch of kernel would be exclusive.
+  static bool is_exclusive(kernel_info_t &kernel);
+  /// The kernel launch.
+  kernel_info_t &kernel() const { return m_kernel; }
+
+ private:
+  /// One active CTA or cluster.
+  struct group {
+    std::vector<functionalCoreSim *> cores;  // CTAs (cluster rank order)
+    yasai_func::ClusterState state;          // cluster state (clusters only)
+    unsigned long rounds = 0;                // rounds executed (YASAI_HANG_ROUNDS)
+  };
+  /// Starts the next CTA (or cluster) in g, the group at co-resident position pos; false when
+  /// none is left.
+  bool refill(group &g, unsigned pos);
+  /// Virtual SM id of rank r of a group at co-resident position pos running CTA cta.
+  unsigned virtual_smid(unsigned pos, unsigned r, unsigned cta) const;
+  /// Deletes the CTAs of g and frees their slots.
+  void retire(group &g);
+  /// Registers the kernel's completion and prints the per-kernel lines.
+  void finish();
+  /// The former CTA-at-a-time loop with checkpoint support, run to completion.
+  void run_checkpointed();
+
+  cuda_sim *m_sim;
+  kernel_info_t &m_kernel;
+  bool m_openCL;
+  std::string m_name;             // kernel name (the kernel object may be released at the end)
+  yasai_func::Dim3 m_grid, m_block;  // extents for the statistics
+  yasai_func::KernelScope *m_scope;  // per-kernel state of yasai_func
+  unsigned m_csize = 1;           // CTAs per group (cluster size)
+  yasai_func::Dim3 m_ncl;         // grid of clusters (clusters only)
+  unsigned m_ncl_total = 0;       // clusters in the grid
+  unsigned m_next_cluster = 0;    // next cluster to start (clusters only)
+  bool m_coop = false;            // cooperative launch
+  bool m_exclusive = false;       // see exclusive()
+  bool m_uses_tmem = false;       // the kernel allocates tensor memory
+  bool m_done = false;            // finish() has run
+  unsigned m_warp_size = 32;
+  unsigned m_sms = 1;             // SM count the application sees (virtual %smid)
+  bool m_interleaved = false;     // more than one group is active at once
+  std::vector<group *> m_groups;  // active groups (null: slot drained)
+};
+
 #define RECONVERGE_RETURN_PC ((address_type) - 2)
 #define NO_BRANCH_DIVERGENCE ((address_type) - 1)
 address_type get_return_pc(void *thd);

@@ -70,6 +70,22 @@ struct Dim3 {
   unsigned z = 1;  // extent in z
 };
 
+// Per-kernel state of one kernel run: counters, trace file, executed-PC table, name, extents and
+// the launch-only / CTA-sampling switches of the kernel. The functional mode can run kernels of
+// different streams at the same time; each run owns a scope and selects it (scope_set) before
+// it steps its CTAs, so kernel_begin, count_*, cta_is_representative and kernel_end act on that
+// run's state.
+struct KernelScope;
+
+// A new, empty scope.
+KernelScope *scope_new();
+
+// Deletes a scope made by scope_new (not the selected one).
+void scope_delete(KernelScope *s);
+
+// Selects scope s; null selects the default scope.
+void scope_set(KernelScope *s);
+
 // Starts the per-kernel counters and the wall clock for the next kernel, and opens its trace
 // when YASAI_TRACE_DIR is set.
 void kernel_begin(const std::string &name, Dim3 grid, Dim3 block);
@@ -261,6 +277,16 @@ extern thread_local bool g_wait_failed;
 // next kernel launch, and a stale completed phase let a wait pass before the new launch's
 // mbarrier.init; FlashMLA SM100 decode launched twice for h_q 128).
 void mbar_reset_all();
+
+// Grid barrier workspaces of cooperative launches (64 bytes of device memory each): a launch
+// takes a free one (0 when none is free; the caller then allocates one) and the run gives it
+// back when the kernel finishes. Thread-safe (host thread takes, simulation thread gives).
+uint64_t grid_ws_take();
+void grid_ws_give(uint64_t ws);
+
+// Forgets the mbarriers of the CTA whose key is cta_key (when the CTA exits and its hardware
+// slot, hence its key, may be reused while other CTAs keep their mbarriers).
+void mbar_reset_cta(uint64_t cta_key);
 
 // f32 to f16 bits, round to nearest even (overflow to infinity).
 uint16_t minifloat_encode_f16(float x);

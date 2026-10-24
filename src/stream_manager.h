@@ -272,6 +272,9 @@ class stream_operation {
   uint64_t yasai_seq() const { return m_yasai_seq; }
   /// yasai: sets the sequence number (stream_manager::push only).
   void yasai_set_seq(uint64_t seq) { m_yasai_seq = seq; }
+  /// yasai: whether the operation can run now: a wait for an event whose awaited record has not
+  /// completed cannot; every other operation can.
+  bool yasai_ready() const;
 
  private:
   uint64_t m_yasai_seq = 0;          ///< yasai: host-order sequence number
@@ -315,6 +318,9 @@ struct CUstream_st {
   /// @param seq Output.
   /// @return False when the stream is empty.
   bool yasai_front_seq(uint64_t *seq);
+  /// yasai: whether the stream is idle and its front operation can run now
+  /// (stream_operation::yasai_ready).
+  bool yasai_front_ready();
   /// yasai: a stream created with cudaStreamNonBlocking is not ordered against the legacy
   /// default stream.
   bool yasai_nonblocking() const { return m_yasai_nonblocking; }
@@ -399,7 +405,6 @@ class stream_manager {
   // non-blocking stream is ordered only by itself. Called with m_lock held.
   bool yasai_eligible(CUstream_st *s, uint64_t seq);
   uint64_t m_yasai_next_seq = 1;  // yasai: next sequence number (under m_lock)
-  size_t m_yasai_rr = 0;          // yasai: round-robin position of front()
   bool m_yasai_host_sync = false;  // yasai: YASAI_STREAM_ZERO_HOST_SYNC=1, the former waits
   std::map<pthread_t, CUstream_st *> m_yasai_per_thread;  // yasai: cudaStreamPerThread
   pthread_mutex_t m_lock;

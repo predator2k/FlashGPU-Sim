@@ -637,6 +637,36 @@ char *get_app_binary_name(std::string abs_path) {
 // yasai: cluster shape of the next launch, set from cudaLaunchKernelExC / cuLaunchKernelEx
 // attributes and consumed (reset to 1,1,1) when the launch creates its kernel_info_t.
 static dim3 g_yasai_pending_cluster(1, 1, 1);
+// yasai: the next launch is cooperative (cudaLaunchCooperativeKernel, cuLaunchCooperativeKernel,
+// or the cooperative attribute of cudaLaunchKernelExC / cuLaunchKernelEx); consumed by the
+// launch (cudaLaunchInternalImpl or the graph capture of the launch).
+static bool g_yasai_pending_cooperative = false;
+
+// yasai: CTAs of launch grid that the device holds at once, from the device properties the
+// application sees (cudaDeviceProp: SM count, threads, registers, shared memory and blocks per
+// SM), not from the functional cores the simulator built: SMs x min(block limit, threads /
+// padded block size, registers / (registers per thread x padded block size), shared memory /
+// shared memory per block).
+static unsigned yasai_coresident_ctas(gpgpu_sim *gpu, kernel_info_t *grid) {
+  const cudaDeviceProp *p = gpu->get_prop();
+  const gpgpu_ptx_sim_info *ki = grid->entry()->get_kernel_info();
+  const unsigned warp = p->warpSize > 0 ? (unsigned)p->warpSize : 32u;
+  const unsigned padded = (grid->threads_per_cta() + warp - 1) / warp * warp;
+  unsigned per_sm = gpu->max_cta_per_core();
+#if (CUDART_VERSION >= 11000)
+  if (p->maxBlocksPerMultiProcessor > 0) per_sm = (unsigned)p->maxBlocksPerMultiProcessor;
+#endif
+  if (p->maxThreadsPerMultiProcessor > 0 && padded > 0)
+    per_sm = std::min(per_sm, (unsigned)p->maxThreadsPerMultiProcessor / padded);
+  const unsigned regs = ki ? ki->regs : 0;
+  if (regs > 0 && p->regsPerMultiprocessor > 0)
+    per_sm = std::min(per_sm, (unsigned)p->regsPerMultiprocessor / (regs * padded));
+  const size_t smem = (ki ? ki->smem : 0) + grid->get_dynamic_smem();
+  if (smem > 0 && p->sharedMemPerMultiprocessor > 0)
+    per_sm = std::min(per_sm, (unsigned)(p->sharedMemPerMultiprocessor / smem));
+  const unsigned sms = p->multiProcessorCount > 0 ? (unsigned)p->multiProcessorCount : 1u;
+  return std::max(1u, per_sm) * sms;
+}
 
 static int get_app_cuda_version_internal(std::string app_binary) {
   int app_cuda_version = 0;
@@ -1517,6 +1547,8 @@ cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx
     announce_call(__my_func__);
   }
   CUctx_st *context = GPGPUSim_Context(ctx);
+  const bool yasai_coop = g_yasai_pending_cooperative;
+  g_yasai_pending_cooperative = false;
   char *mode = getenv("PTX_SIM_MODE_FUNC");
   if (mode) sscanf(mode, "%u", &(ctx->func_sim->g_ptx_sim_mode));
   gpgpusim_ptx_assert(!ctx->api->g_cuda_launch_stack.empty(),
@@ -1598,6 +1630,27 @@ cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx
   if (shared_mem_size > 0) {
     function_info *func_info = grid->entry();
     func_info->alloc_dyn_shared_mem(shared_mem_size);
+  }
+  // yasai: a cooperative grid must fit the co-resident limit (SMs x CTAs per SM from the
+  // occupancy of this launch), as on hardware; its CTAs then run together and get a zeroed grid
+  // barrier workspace (yasai_func_run).
+  const unsigned yasai_limit = yasai_coresident_ctas(device_gpu, grid);
+  grid->set_yasai_coresident(yasai_limit);
+  grid->set_yasai_reported_sms(device_gpu->get_prop()->multiProcessorCount > 0
+                                   ? (unsigned)device_gpu->get_prop()->multiProcessorCount
+                                   : 1u);
+  if (yasai_coop) {
+    const dim3 g = grid->get_grid_dim();
+    const unsigned long long ctas = (unsigned long long)g.x * g.y * g.z;
+    if (ctas > yasai_limit) {
+      printf("GPGPU-Sim PTX: cooperative launch of '%s' too large: %llu CTAs, co-resident "
+             "limit %u\n", grid->name().c_str(), ctas, yasai_limit);
+      ctx->api->g_cuda_launch_stack.pop_back();
+      return g_last_cudaError = (cudaError_t)720;  // cudaErrorCooperativeLaunchTooLarge
+    }
+    unsigned long long ws = yasai_func::grid_ws_take();
+    if (ws == 0) ws = (unsigned long long)device_gpu->gpu_malloc(64);
+    grid->set_yasai_cooperative(true, ws);
   }
 
   // do dynamic PDOM analysis for performance simulation scenario
@@ -10482,6 +10535,10 @@ __host__ cudaError_t CUDARTAPI cudaLaunchKernelExC(
       g_yasai_pending_cluster = dim3(config->attrs[i].val.clusterDim.x,
                                      config->attrs[i].val.clusterDim.y,
                                      config->attrs[i].val.clusterDim.z);
+  // yasai: the cooperative attribute makes this a cooperative launch.
+  for (unsigned i = 0; i < config->numAttrs; ++i)
+    if (config->attrs[i].id == cudaLaunchAttributeCooperative && config->attrs[i].val.cooperative)
+      g_yasai_pending_cooperative = true;
 
   cudaConfigureCallInternal(config->gridDim, config->blockDim,
                             config->dynamicSmemBytes, config->stream);
@@ -10575,6 +10632,9 @@ extern "C" CUresult CUDAAPI cuLaunchKernelEx(const yasai_CUlaunchConfig *config,
   for (unsigned i = 0; attrs != NULL && i < config->numAttrs; ++i)
     if (attrs[i].id == 4)
       g_yasai_pending_cluster = dim3(attrs[i].value[0], attrs[i].value[1], attrs[i].value[2]);
+  // yasai: CU_LAUNCH_ATTRIBUTE_COOPERATIVE (2), value int in value[0].
+  for (unsigned i = 0; attrs != NULL && i < config->numAttrs; ++i)
+    if (attrs[i].id == 2 && attrs[i].value[0] != 0) g_yasai_pending_cooperative = true;
   return cuLaunchKernelInternal(f, config->gridDimX, config->gridDimY, config->gridDimZ,
                                 config->blockDimX, config->blockDimY, config->blockDimZ,
                                 config->sharedMemBytes, config->hStream, kernelParams, extra);
@@ -10645,21 +10705,38 @@ extern "C" CUresult CUDAAPI cuGreenCtxGetDevResource(void *, void *, int) {
 }
 extern "C" CUresult CUDAAPI cuCtxFromGreenCtx(void *, void *) { return CUDA_ERROR_NOT_SUPPORTED; }
 
-// cudaLaunchCooperativeKernel: launched as a normal kernel. The functional simulator runs the
-// CTAs of a grid one after another, so a kernel that synchronizes the whole grid (grid.sync)
-// would wait for CTAs that have not started; the call prints a warning once per process.
+// cudaLaunchCooperativeKernel: a cooperative launch. All CTAs of the grid run together
+// (yasai_func_run), %envreg1:%envreg2 give the grid barrier workspace, and a grid larger than
+// the co-resident limit fails with cudaErrorCooperativeLaunchTooLarge.
 //   func, gridDim, blockDim, args, sharedMem, stream  as for cudaLaunchKernel
 extern "C" cudaError_t CUDARTAPI cudaLaunchCooperativeKernel(const void *func, dim3 gridDim,
                                                              dim3 blockDim, void **args,
                                                              size_t sharedMem, cudaStream_t stream) {
-  static bool warned = false;
-  if (!warned) {
-    warned = true;
-    printf("GPGPU-Sim PTX: warning: cudaLaunchCooperativeKernel runs as a normal launch; grid-wide "
-           "synchronization is not simulated\n");
-  }
-  return cudaLaunchKernel((const char *)func, gridDim, blockDim, (const void **)args, sharedMem,
-                          stream);
+  g_yasai_pending_cooperative = true;
+  // As cudaLaunchKernelExC: the launch configuration is pushed here (no <<<>>> stub did it).
+  cudaConfigureCallInternal(gridDim, blockDim, sharedMem, stream);
+  const cudaError_t e = cudaLaunchKernelInternal((const char *)func, gridDim, blockDim,
+                                                 (const void **)args, sharedMem, stream);
+  g_yasai_pending_cooperative = false;
+  return e;
+}
+
+// cuLaunchCooperativeKernel: the driver form of cudaLaunchCooperativeKernel.
+//   f, grid and block extents, sharedMemBytes, hStream, kernelParams  as for cuLaunchKernel
+extern "C" CUresult CUDAAPI cuLaunchCooperativeKernel(CUfunction f, unsigned int gridDimX,
+                                                      unsigned int gridDimY,
+                                                      unsigned int gridDimZ,
+                                                      unsigned int blockDimX,
+                                                      unsigned int blockDimY,
+                                                      unsigned int blockDimZ,
+                                                      unsigned int sharedMemBytes,
+                                                      CUstream hStream, void **kernelParams) {
+  g_yasai_pending_cooperative = true;
+  const CUresult r = cuLaunchKernelInternal(f, gridDimX, gridDimY, gridDimZ, blockDimX,
+                                            blockDimY, blockDimZ, sharedMemBytes, hStream,
+                                            kernelParams, NULL);
+  g_yasai_pending_cooperative = false;
+  return r;
 }
 
 // yasai: cuLaunchCooperativeKernel, the driver-API form of cudaLaunchCooperativeKernel, launched
@@ -10742,6 +10819,7 @@ struct CUgraphNode_st {
   dim3 grid, block;                 // KERNEL: launch shape
   size_t smem = 0;                  // KERNEL: dynamic shared memory bytes
   dim3 cluster = dim3(1, 1, 1);     // KERNEL: cluster shape of a launch with that attribute
+  bool cooperative = false;          // KERNEL: yasai: cooperative launch
   std::vector<std::vector<unsigned char>> arg_bytes;  // KERNEL: argument copies, in list order
   std::vector<std::pair<size_t, size_t>> arg_cfg;     // KERNEL: (size, offset) of each argument
   void *dst = nullptr;              // MEMCPY / MEMSET: destination
@@ -10814,6 +10892,7 @@ cudaError_t yasai_replay_node(const CUgraphNode_st &n, cudaStream_t stream) {
         cudaSetupArgumentInternal(n.arg_bytes[i - 1].data(), n.arg_cfg[i - 1].first,
                                   n.arg_cfg[i - 1].second, ctx);
       g_yasai_pending_cluster = n.cluster;
+      g_yasai_pending_cooperative = n.cooperative;
       return cudaLaunchInternal(n.host_fun, ctx);
     }
     case CUgraphNode_st::MEMCPY:
@@ -10850,6 +10929,8 @@ static bool yasai_capture_kernel(const char *hostFun, kernel_config &config) {
   n.smem = config.shared_mem();
   n.cluster = g_yasai_pending_cluster;
   g_yasai_pending_cluster = dim3(1, 1, 1);
+  n.cooperative = g_yasai_pending_cooperative;
+  g_yasai_pending_cooperative = false;
   for (const gpgpu_ptx_sim_arg &a : config.get_args()) {
     const unsigned char *p = static_cast<const unsigned char *>(a.m_start);
     n.arg_bytes.emplace_back(p, p + a.m_nbytes);

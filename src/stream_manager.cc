@@ -97,6 +97,12 @@ class yasai_host_callbacks {
   std::deque<item> m_queue;
 };
 
+// yasai: YASAI_STREAM_TRACE=1 prints every push and every issue of a stream operation.
+bool yasai_stream_trace() {
+  static const bool on = getenv("YASAI_STREAM_TRACE") != NULL && atoi(getenv("YASAI_STREAM_TRACE")) != 0;
+  return on;
+}
+
 // yasai: sleeps for a growing interval (20 us up to 1 ms) between polls of a host wait.
 void yasai_backoff(unsigned *us) {
   usleep(*us);
@@ -155,6 +161,18 @@ bool CUstream_st::yasai_front_seq(uint64_t *seq) {
   return any;
 }
 
+bool CUstream_st::yasai_front_ready() {
+  pthread_mutex_lock(&m_lock);
+  const bool r = !m_pending && !m_operations.empty() && m_operations.front().yasai_ready();
+  pthread_mutex_unlock(&m_lock);
+  return r;
+}
+
+bool stream_operation::yasai_ready() const {
+  if (m_type == stream_wait_event) return m_event->num_updates() >= m_cnt;
+  return true;
+}
+
 void CUstream_st::push(const stream_operation &op) {
   // called by host thread
   pthread_mutex_lock(&m_lock);
@@ -189,8 +207,9 @@ void CUstream_st::cancel_front() {
 
 void CUstream_st::print(FILE *fp) {
   pthread_mutex_lock(&m_lock);
-  fprintf(fp, "GPGPU-Sim API:    stream %u has %zu operations\n", m_uid,
-          m_operations.size());
+  fprintf(fp, "GPGPU-Sim API:    stream %u has %zu operations%s%s\n", m_uid,
+          m_operations.size(), m_pending ? " (front running)" : "",
+          m_yasai_nonblocking ? " (non-blocking)" : "");
   std::list<stream_operation>::iterator i;
   unsigned n = 0;
   for (i = m_operations.begin(); i != m_operations.end(); i++) {
@@ -333,9 +352,17 @@ void stream_operation::print(FILE *fp) const {
     case stream_no_op:
       fprintf(fp, "no-op");
       break;
+    case stream_host_fn:
+      fprintf(fp, "host function");
+      break;
+    case stream_wait_event:
+      fprintf(fp, "wait event (needs %zu updates, has %d)", m_cnt,
+              m_event ? (int)m_event->num_updates() : -1);
+      break;
     default:
       break;
   }
+  fprintf(fp, " seq %llu", (unsigned long long)m_yasai_seq);
 }
 
 stream_manager::stream_manager(gpgpu_sim *gpu, bool cuda_launch_blocking) {
@@ -449,24 +476,33 @@ bool stream_manager::yasai_eligible(CUstream_st *s, uint64_t seq) {
 stream_operation stream_manager::front() {
   // called by gpu simulation thread
   stream_operation result;
-  // yasai: legacy default stream semantics on the device side. The streams (the legacy one
-  // first) are scanned round-robin from the one after the last served, and the first idle
-  // stream whose front operation is eligible (yasai_eligible) provides the next operation.
+  // yasai: legacy default stream semantics on the device side. Of the idle streams whose front
+  // operation can run (no unmet event wait) and is eligible (yasai_eligible), the one whose
+  // front operation was submitted first provides the next operation, so operations of
+  // independent streams run in submission order, as an otherwise idle GPU runs them (NCCL's
+  // connection setup relies on that order between its streams). A wait whose event is not yet
+  // recorded no longer takes a turn.
   if (!m_cuda_launch_blocking && !m_yasai_host_sync) {
-    std::vector<CUstream_st *> c;
-    c.reserve(m_streams.size() + 1);
-    c.push_back(&m_stream_zero);
-    for (CUstream_st *s : m_streams) c.push_back(s);
-    const size_t n = c.size();
-    for (size_t i = 1; i <= n; i++) {
-      const size_t idx = (m_yasai_rr + i) % n;
-      CUstream_st *s = c[idx];
+    CUstream_st *best = NULL;
+    uint64_t best_seq = UINT64_MAX;
+    auto consider = [&](CUstream_st *s) {
       uint64_t f = 0;
-      if (s->busy() || !s->yasai_front_seq(&f) || !yasai_eligible(s, f)) continue;
-      m_yasai_rr = idx;
+      if (!s->yasai_front_seq(&f) || f >= best_seq) return;
+      if (!s->yasai_front_ready() || !yasai_eligible(s, f)) return;
+      best = s;
+      best_seq = f;
+    };
+    consider(&m_stream_zero);
+    for (CUstream_st *s : m_streams) consider(s);
+    if (best != NULL) {
+      CUstream_st *s = best;
       result = s->next();
+      if (yasai_stream_trace()) {
+        printf("yasai-stream: issue stream %u%s:", s->get_uid(), s->yasai_nonblocking() ? " (nb)" : "");
+        result.print(stdout);
+        printf("\n");
+      }
       if (result.is_kernel()) m_grid_id_to_stream[result.get_kernel()->get_uid()] = s;
-      break;
     }
     return result;
   }
@@ -529,7 +565,6 @@ void stream_manager::destroy_stream(CUstream_st *stream) {
   }
   delete stream;
   m_last_stream = m_streams.begin();
-  m_yasai_rr = 0;
   pthread_mutex_unlock(&m_lock);
 }
 
@@ -635,6 +670,11 @@ uint64_t stream_manager::push(stream_operation op) {
     pthread_mutex_lock(&m_lock);
     const uint64_t seq = m_yasai_next_seq++;
     op.yasai_set_seq(seq);
+    if (yasai_stream_trace()) {
+      printf("yasai-stream: push stream %u:", stream ? stream->get_uid() : m_stream_zero.get_uid());
+      op.print(stdout);
+      printf("\n");
+    }
     if (!m_gpu->cycle_insn_cta_max_hit()) {
       if (stream) {
         stream->push(op);

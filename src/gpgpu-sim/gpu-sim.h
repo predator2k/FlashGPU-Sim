@@ -926,22 +926,39 @@ class gpgpu_sim : public gpgpu_t {
   // set by stream operation every time a functoinal simulation is done
   bool m_functional_sim;
   kernel_info_t *m_functional_sim_kernel;
+  std::deque<kernel_info_t *> m_yasai_func_queue;  // yasai: see functional_launch
 
  public:
   bool is_functional_sim() { return m_functional_sim; }
-  kernel_info_t *get_functional_kernel() { return m_functional_sim_kernel; }
+  kernel_info_t *get_functional_kernel() { return yasai_take_functional_kernel(); }
   std::vector<kernel_info_t *> get_running_kernels() {
     return m_running_kernels;
   }
+  // yasai: a launched functional kernel is queued for the simulation thread, which may run
+  // several at once (yasai_func_run); is_functional_sim() stays true while any is queued or
+  // running.
   void functional_launch(kernel_info_t *k) {
     m_functional_sim = true;
     m_functional_sim_kernel = k;
+    m_yasai_func_queue.push_back(k);
+  }
+  // yasai: the oldest launched functional kernel not yet taken, or null.
+  kernel_info_t *yasai_take_functional_kernel() {
+    if (m_yasai_func_queue.empty()) return NULL;
+    kernel_info_t *k = m_yasai_func_queue.front();
+    m_yasai_func_queue.pop_front();
+    return k;
+  }
+  // yasai: ends the functional mode when no functional kernel is queued or running.
+  void yasai_end_functional() {
+    if (!m_yasai_func_queue.empty()) return;
+    m_functional_sim = false;
+    m_functional_sim_kernel = NULL;
   }
   void finish_functional_sim(kernel_info_t *k) {
     assert(m_functional_sim);
-    assert(m_functional_sim_kernel == k);
-    m_functional_sim = false;
-    m_functional_sim_kernel = NULL;
+    (void)k;
+    yasai_end_functional();
   }
 
 #ifdef FLASH_GEM_FORGE

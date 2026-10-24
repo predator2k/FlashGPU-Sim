@@ -3258,15 +3258,18 @@ unsigned ptx_sim_init_thread(kernel_info_t &kernel,
     thd->m_warp_info = warp_info;
 
     memory_space *local_mem = NULL;
+    // yasai: the key includes the hardware CTA slot; CTAs that run at the same time (a cluster,
+    // co-resident CTAs, concurrent kernels) need their own local memory per thread.
+    const unsigned local_key = (hw_cta_id << 16) | new_tid;
     std::map<unsigned, memory_space *>::iterator l =
-        local_mem_lookup.find(new_tid);
+        local_mem_lookup.find(local_key);
     if (l != local_mem_lookup.end()) {
       local_mem = l->second;
     } else {
       char buf[512];
       snprintf(buf, 512, "local_%u_%u", sid, new_tid);
       local_mem = new memory_space_impl<32>(buf, 32);
-      local_mem_lookup[new_tid] = local_mem;
+      local_mem_lookup[local_key] = local_mem;
     }
     thd->set_info(kernel.entry());
     thd->set_nctaid(kernel.get_grid_dim());
@@ -3603,22 +3606,44 @@ unsigned max_cta(const struct gpgpu_ptx_sim_info *kernel_info,
 This function simulates the CUDA code functionally, it takes a kernel_info_t
 parameter which holds the data for the CUDA kernel to be executed
 !*/
+// yasai: runs the kernel to completion through a yasai_func_run (OpenCL, CDP and SST callers;
+// the simulation thread steps its runs itself, see gpgpu_sim_thread_concurrent).
 void cuda_sim::gpgpu_cuda_ptx_sim_main_func(kernel_info_t &kernel,
                                             bool openCL) {
+  yasai_func_run run(this, kernel, openCL);
+  while (!run.step()) {
+  }
+}
+
+namespace {
+
+// Value of an integer environment switch, or dflt when unset.
+int yasai_env_int(const char *name, int dflt) {
+  const char *v = getenv(name);
+  return (v != NULL && *v != '\0') ? atoi(v) : dflt;
+}
+
+}  // namespace
+
+bool yasai_func_run::is_exclusive(kernel_info_t &kernel) {
+  if (kernel.yasai_cooperative()) return kernel.entry()->yasai_uses_tmem();
+  return kernel.cluster_size() > 1 || kernel.entry()->yasai_uses_tmem();
+}
+
+yasai_func_run::yasai_func_run(cuda_sim *sim, kernel_info_t &kernel, bool openCL)
+    : m_sim(sim), m_kernel(kernel), m_openCL(openCL) {
+  gpgpu_context *gpgpu_ctx = sim->gpgpu_ctx;
   printf(
       "GPGPU-Sim: Performing Functional Simulation, executing kernel %s...\n",
       kernel.name().c_str());
 
   // using a shader core object for book keeping, it is not needed but as most
   // function built for performance simulation need it we use it here
-  // extern gpgpu_sim *g_the_gpu;
   // before we execute, we should do PDOM analysis for functional simulation
   // scenario.
   function_info *kernel_func_info = kernel.entry();
   const struct gpgpu_ptx_sim_info *kernel_info =
       ptx_sim_kernel_info(kernel_func_info);
-  checkpoint *g_checkpoint;
-  g_checkpoint = new checkpoint();
 
   if (kernel_func_info->is_pdom_set()) {
     printf("GPGPU-Sim PTX: PDOM analysis already done for %s \n",
@@ -3630,168 +3655,280 @@ void cuda_sim::gpgpu_cuda_ptx_sim_main_func(kernel_info_t &kernel,
     kernel_func_info->set_pdom();
   }
 
-  unsigned max_cta_tot = max_cta(
-      kernel_info, kernel.threads_per_cta(),
-      gpgpu_ctx->the_gpgpusim->g_the_gpu->getShaderCoreConfig()->warp_size,
-      gpgpu_ctx->the_gpgpusim->g_the_gpu->getShaderCoreConfig()
-          ->n_thread_per_shader,
-      gpgpu_ctx->the_gpgpusim->g_the_gpu->getShaderCoreConfig()
-          ->gpgpu_shmem_size,
-      gpgpu_ctx->the_gpgpusim->g_the_gpu->getShaderCoreConfig()
-          ->gpgpu_shader_registers,
-        gpgpu_ctx->the_gpgpusim->g_the_gpu->getShaderCoreConfig()
-          ->max_cta_per_core,
-        kernel.get_dynamic_smem());
+  const shader_core_config *scfg = gpgpu_ctx->the_gpgpusim->g_the_gpu->getShaderCoreConfig();
+  m_warp_size = scfg->warp_size;
+  unsigned max_cta_tot = max_cta(kernel_info, kernel.threads_per_cta(), scfg->warp_size,
+                                 scfg->n_thread_per_shader, scfg->gpgpu_shmem_size,
+                                 scfg->gpgpu_shader_registers, scfg->max_cta_per_core,
+                                 kernel.get_dynamic_smem());
   printf("Max CTA : %d\n", max_cta_tot);
 
-  int cp_op = gpgpu_ctx->the_gpgpusim->g_the_gpu->checkpoint_option;
-  int cp_kernel = gpgpu_ctx->the_gpgpusim->g_the_gpu->checkpoint_kernel;
-  cp_count = gpgpu_ctx->the_gpgpusim->g_the_gpu->checkpoint_insn_Y;
-  cp_cta_resume = gpgpu_ctx->the_gpgpusim->g_the_gpu->checkpoint_CTA_t;
-  int cta_launched = 0;
-  const dim3 yasai_grid = kernel.get_grid_dim();
-  const dim3 yasai_block = kernel.get_cta_dim();
-  const yasai_func::Dim3 yasai_g{yasai_grid.x, yasai_grid.y, yasai_grid.z};
-  const yasai_func::Dim3 yasai_b{yasai_block.x, yasai_block.y, yasai_block.z};
+  const dim3 grid = kernel.get_grid_dim();
+  const dim3 block = kernel.get_cta_dim();
+  m_grid = yasai_func::Dim3{grid.x, grid.y, grid.z};
+  m_block = yasai_func::Dim3{block.x, block.y, block.z};
   // The kernel object may be released by register_finished_kernel, so keep its name here.
-  const std::string yasai_name = kernel.name();
-  yasai_func::kernel_begin(yasai_name, yasai_g, yasai_b);
+  m_name = kernel.name();
+  m_scope = yasai_func::scope_new();
+  yasai_func::scope_set(m_scope);
+  yasai_func::kernel_begin(m_name, m_grid, m_block);
 
-  // yasai: a launch with a cluster shape runs cluster by cluster. The CTAs of one cluster are
-  // created together, each with its own hardware CTA slot and therefore its own shared memory,
-  // joined to a yasai_func::ClusterState (distributed shared memory, remote mbarriers,
-  // barrier.cluster), and their warps are interleaved one round at a time until all exit.
-  // CTA sampling then selects whole clusters: a cluster runs when its cluster coordinates are
-  // representative in the grid of clusters.
-  const dim3 yasai_cd = kernel.get_cluster_dim();
-  if (kernel.cluster_size() > 1 && cp_op == 0) {
-    const unsigned warp_size =
-        gpgpu_ctx->the_gpgpusim->g_the_gpu->getShaderCoreConfig()->warp_size;
-    const yasai_func::Dim3 ncl{(yasai_grid.x + yasai_cd.x - 1) / yasai_cd.x,
-                               (yasai_grid.y + yasai_cd.y - 1) / yasai_cd.y,
-                               (yasai_grid.z + yasai_cd.z - 1) / yasai_cd.z};
-    const unsigned csize = kernel.cluster_size();
-    for (unsigned cz = 0; cz < ncl.z; cz++)
-      for (unsigned cy = 0; cy < ncl.y; cy++)
-        for (unsigned cx = 0; cx < ncl.x; cx++) {
-          const unsigned cl_linear = cx + ncl.x * (cy + ncl.y * cz);
-          if (!yasai_func::cta_is_representative(ncl, cl_linear)) {
-            for (unsigned r = 0; r < csize; r++) yasai_func::count_cta(true);
-            continue;
-          }
-          yasai_func::ClusterState state;
-          state.size = csize;
-          std::vector<functionalCoreSim *> ctas;
-          for (unsigned r = 0; r < csize; r++) {
-            const dim3 cta(cx * yasai_cd.x + r % yasai_cd.x,
-                           cy * yasai_cd.y + (r / yasai_cd.x) % yasai_cd.y,
-                           cz * yasai_cd.z + r / (yasai_cd.x * yasai_cd.y));
-            kernel.set_next_cta_id(cta);
-            const unsigned linear = cta.x + yasai_grid.x * (cta.y + yasai_grid.y * cta.z);
-            functionalCoreSim *core =
-                new functionalCoreSim(&kernel, gpgpu_ctx->the_gpgpusim->g_the_gpu, warp_size);
-            core->yasai_init(linear, r);
-            ctas.push_back(core);
-            state.smem.push_back(core->yasai_shared_memory());
-            state.cta_key.push_back(core->yasai_cta_key());
-            state.cores.push_back(core);
-            yasai_func::count_cta(false);
-          }
-          for (unsigned r = 0; r < csize; r++) ctas[r]->yasai_join_cluster(&state, r);
-          yasai_func::set_cluster(&state);
-          bool live = true;
-          // yasai: YASAI_HANG_ROUNDS=<n> stops a cluster that is still live after n rounds and
-          // prints where each warp is (a spin on a barrier that never completes).
-          static const unsigned long hang_rounds =
-              getenv("YASAI_HANG_ROUNDS") ? strtoul(getenv("YASAI_HANG_ROUNDS"), NULL, 10) : 0;
-          unsigned long rounds = 0;
-          while (live) {
-            live = false;
-            for (unsigned r = 0; r < csize; r++) {
-              yasai_func::set_current_rank(r);
-              live = ctas[r]->yasai_round() || live;
-            }
-            if (live && hang_rounds != 0 && ++rounds == hang_rounds) {
-              fprintf(stderr, "yasai: cluster (%u,%u,%u) still live after %lu rounds\n", cx, cy,
-                      cz, rounds);
-              for (unsigned r = 0; r < csize; r++) ctas[r]->yasai_dump_warps(stderr);
-              abort();
-            }
-          }
-          yasai_func::set_cluster(nullptr);
-          yasai_func::set_current_rank(0);
-          for (functionalCoreSim *core : ctas) delete core;
-          // yasai: functional mode runs one CTA or cluster at a time; its TMEM state (allocation
-          // permit, words) must not leak into the next CTA that reuses the same CTA id.
-          gpgpu_ctx->the_gpgpusim->g_the_gpu->get_tcgen05_tmem_manager().reset();
-          yasai_func::mbar_reset_all();
-          cta_launched += csize;
-        }
-    kernel.set_all_ctas_issued();
+  sim->cp_count = gpgpu_ctx->the_gpgpusim->g_the_gpu->checkpoint_insn_Y;
+  sim->cp_cta_resume = gpgpu_ctx->the_gpgpusim->g_the_gpu->checkpoint_CTA_t;
+  if (gpgpu_ctx->the_gpgpusim->g_the_gpu->checkpoint_option != 0) {
+    m_exclusive = true;
+    run_checkpointed();
+    finish();
+    return;
   }
 
+  m_coop = kernel.yasai_cooperative();
+  m_uses_tmem = kernel_func_info->yasai_uses_tmem();
+  m_exclusive = is_exclusive(kernel);
+  m_csize = kernel.cluster_size();
+  const dim3 cd = kernel.get_cluster_dim();
+  m_ncl = yasai_func::Dim3{(grid.x + cd.x - 1) / cd.x, (grid.y + cd.y - 1) / cd.y,
+                           (grid.z + cd.z - 1) / cd.z};
+  m_ncl_total = m_ncl.x * m_ncl.y * m_ncl.z;
+  const unsigned total_groups = m_csize > 1 ? m_ncl_total : grid.x * grid.y * grid.z;
+  // Co-resident limit in CTAs, from the device properties the application sees (set at launch,
+  // cudaLaunchInternalImpl); all of them are interleaved on however many functional cores
+  // exist. Launches made without it (CDP, OpenCL) use the functional cores' limit.
+  const unsigned nsm = gpgpu_ctx->func_sim->gpgpu_param_num_shaders > 0
+                           ? gpgpu_ctx->func_sim->gpgpu_param_num_shaders
+                           : 1;
+  const unsigned coresident = kernel.yasai_coresident() > 0
+                                  ? kernel.yasai_coresident()
+                                  : std::max(1u, max_cta_tot) * nsm;
+  unsigned ngroups = 1;
+  if (m_coop)
+    ngroups = total_groups;  // the launch checked that the grid fits
+  else if (!m_exclusive && yasai_env_int("YASAI_CTA_INTERLEAVE", 0) == 1)
+    ngroups = std::max(1u, coresident / m_csize);
+  ngroups = std::min(ngroups, std::max(1u, total_groups));
+  m_sms = kernel.yasai_reported_sms() > 0 ? kernel.yasai_reported_sms() : nsm;
+  m_interleaved = ngroups > 1;
+  if (m_coop) {
+    // Zeroes the grid barrier workspace for this launch (wsSize, barrier word).
+    gpgpu_ctx->the_gpgpusim->g_the_gpu->gpu_memset((size_t)kernel.yasai_grid_ws(), 0, 64);
+    printf("GPGPU-Sim PTX: cooperative launch of '%s': %u CTAs run together\n", m_name.c_str(),
+           total_groups * m_csize);
+  }
+  for (unsigned i = 0; i < ngroups; i++) {
+    group *g = new group();
+    if (!refill(*g, i)) {
+      delete g;
+      break;
+    }
+    m_groups.push_back(g);
+  }
+  if (m_groups.empty()) finish();
+}
+
+yasai_func_run::~yasai_func_run() {
+  for (group *g : m_groups)
+    if (g != nullptr) {
+      retire(*g);
+      delete g;
+    }
+  yasai_func::scope_set(nullptr);
+  yasai_func::scope_delete(m_scope);
+}
+
+unsigned yasai_func_run::virtual_smid(unsigned pos, unsigned r, unsigned cta) const {
+  // Co-resident CTAs are placed round-robin over the SMs, as hardware fills SMs breadth first;
+  // the CTAs of a cluster take consecutive SMs. A CTA run alone takes the SM of its index.
+  return (m_interleaved ? pos * m_csize + r : cta) % m_sms;
+}
+
+bool yasai_func_run::refill(group &g, unsigned pos) {
+  gpgpu_context *gpgpu_ctx = m_sim->gpgpu_ctx;
+  gpgpu_sim *gpu = gpgpu_ctx->the_gpgpusim->g_the_gpu;
+  g.cores.clear();
+  g.rounds = 0;
+  if (m_csize <= 1) {
+    while (!m_kernel.no_more_ctas_to_run()) {
+      const unsigned id = m_kernel.get_next_cta_id_single();
+      // CTA sampling executes only the representative CTAs (never for a cooperative launch,
+      // whose grid barrier counts every CTA).
+      if (!m_coop && !yasai_func::cta_is_representative(m_grid, id)) {
+        yasai_func::count_cta(true);
+        m_kernel.increment_cta_id();
+        continue;
+      }
+      yasai_func::count_cta(false);
+      // The core takes its own hardware CTA slot from the pool (yasai_acquire_cta_slot), so
+      // co-resident CTAs of this and of concurrent kernels hold distinct slots.
+      functionalCoreSim *core = new functionalCoreSim(&m_kernel, gpu, m_warp_size);
+      core->yasai_set_virtual_smid(virtual_smid(pos, 0, id));
+      core->yasai_init(id, 0);
+      g.cores.push_back(core);
+      return true;
+    }
+    return false;
+  }
+  // A launch with a cluster shape runs cluster by cluster. The CTAs of one cluster are created
+  // together, each with its own hardware CTA slot and therefore its own shared memory, joined to
+  // the group's ClusterState (distributed shared memory, remote mbarriers, barrier.cluster), and
+  // their warps are interleaved one round at a time until all exit. CTA sampling selects whole
+  // clusters: a cluster runs when its coordinates are representative in the grid of clusters.
+  const dim3 grid = m_kernel.get_grid_dim();
+  const dim3 cd = m_kernel.get_cluster_dim();
+  while (m_next_cluster < m_ncl_total) {
+    const unsigned cl_linear = m_next_cluster++;
+    const unsigned cx = cl_linear % m_ncl.x;
+    const unsigned cy = (cl_linear / m_ncl.x) % m_ncl.y;
+    const unsigned cz = cl_linear / (m_ncl.x * m_ncl.y);
+    if (!m_coop && !yasai_func::cta_is_representative(m_ncl, cl_linear)) {
+      for (unsigned r = 0; r < m_csize; r++) yasai_func::count_cta(true);
+      continue;
+    }
+    g.state = yasai_func::ClusterState();
+    g.state.size = m_csize;
+    for (unsigned r = 0; r < m_csize; r++) {
+      const dim3 cta(cx * cd.x + r % cd.x, cy * cd.y + (r / cd.x) % cd.y,
+                     cz * cd.z + r / (cd.x * cd.y));
+      m_kernel.set_next_cta_id(cta);
+      const unsigned linear = cta.x + grid.x * (cta.y + grid.y * cta.z);
+      functionalCoreSim *core = new functionalCoreSim(&m_kernel, gpu, m_warp_size);
+      core->yasai_set_virtual_smid(virtual_smid(pos, r, linear));
+      core->yasai_init(linear, r);
+      g.cores.push_back(core);
+      g.state.smem.push_back(core->yasai_shared_memory());
+      g.state.cta_key.push_back(core->yasai_cta_key());
+      g.state.cores.push_back(core);
+      yasai_func::count_cta(false);
+    }
+    for (unsigned r = 0; r < m_csize; r++) g.cores[r]->yasai_join_cluster(&g.state, r);
+    return true;
+  }
+  return false;
+}
+
+void yasai_func_run::retire(group &g) {
+  for (functionalCoreSim *core : g.cores) {
+    yasai_func::mbar_reset_cta(core->yasai_cta_key());
+    delete core;
+  }
+  g.cores.clear();
+}
+
+bool yasai_func_run::step() {
+  if (m_done) return true;
+  gpgpu_context *gpgpu_ctx = m_sim->gpgpu_ctx;
+  yasai_func::scope_set(m_scope);
+  // yasai: YASAI_HANG_ROUNDS=<n> stops a CTA or cluster that is still live after n rounds and
+  // prints where each warp is (a spin on a barrier that never completes).
+  static const unsigned long hang_rounds =
+      getenv("YASAI_HANG_ROUNDS") ? strtoul(getenv("YASAI_HANG_ROUNDS"), NULL, 10) : 0;
+  bool any = false;
+  for (unsigned gi = 0; gi < m_groups.size(); gi++) {
+    group *&g = m_groups[gi];
+    if (g == nullptr) continue;
+    bool live = false;
+    if (m_csize > 1) yasai_func::set_cluster(&g->state);
+    for (unsigned r = 0; r < g->cores.size(); r++) {
+      yasai_func::set_current_rank(r);
+      live = g->cores[r]->yasai_round() || live;
+    }
+    yasai_func::set_cluster(nullptr);
+    yasai_func::set_current_rank(0);
+    if (live) {
+      any = true;
+      if (hang_rounds != 0 && ++g->rounds == hang_rounds) {
+        fprintf(stderr, "yasai: kernel %s: CTA group still live after %lu rounds\n",
+                m_name.c_str(), hang_rounds);
+        for (functionalCoreSim *core : g->cores) core->yasai_dump_warps(stderr);
+        abort();
+      }
+      continue;
+    }
+    retire(*g);
+    // yasai: functional mode reuses CTA ids across launches and TMEM per CTA; an exclusive
+    // kernel resets the tensor memory and the mbarriers after each CTA or cluster, as before.
+    // (mbarriers of concurrently running CTAs are keyed by their CTA uids.)
+    if (m_exclusive) {
+      gpgpu_ctx->the_gpgpusim->g_the_gpu->get_tcgen05_tmem_manager().reset();
+      yasai_func::mbar_reset_all();
+    }
+#if (CUDART_VERSION >= 5000)
+    gpgpu_ctx->device_runtime->launch_all_device_kernels();
+#endif
+    if (refill(*g, gi)) {
+      any = true;
+    } else {
+      delete g;
+      g = nullptr;
+    }
+  }
+  if (!any) finish();
+  return m_done;
+}
+
+void yasai_func_run::run_checkpointed() {
+  gpgpu_context *gpgpu_ctx = m_sim->gpgpu_ctx;
+  gpgpu_sim *gpu = gpgpu_ctx->the_gpgpusim->g_the_gpu;
+  int cp_op = gpu->checkpoint_option;
+  int cp_kernel = gpu->checkpoint_kernel;
+  int cta_launched = 0;
   // we excute the kernel one CTA (Block) at the time, as synchronization
   // functions work block wise
-  while (!kernel.no_more_ctas_to_run()) {
-    unsigned temp = kernel.get_next_cta_id_single();
-
-    // yasai: CTA sampling executes only the representative CTAs.
-    if (!yasai_func::cta_is_representative(yasai_g, temp)) {
+  while (!m_kernel.no_more_ctas_to_run()) {
+    unsigned temp = m_kernel.get_next_cta_id_single();
+    if (!yasai_func::cta_is_representative(m_grid, temp)) {
       yasai_func::count_cta(true);
-      kernel.increment_cta_id();
+      m_kernel.increment_cta_id();
       cta_launched++;
       continue;
     }
     yasai_func::count_cta(false);
-
     if (cp_op == 0 ||
-        (cp_op == 1 && cta_launched < cp_cta_resume &&
-         kernel.get_uid() == cp_kernel) ||
-        kernel.get_uid() < cp_kernel)  // just fro testing
+        (cp_op == 1 && cta_launched < m_sim->cp_cta_resume &&
+         m_kernel.get_uid() == cp_kernel) ||
+        m_kernel.get_uid() < cp_kernel)  // just fro testing
     {
-      functionalCoreSim cta(
-          &kernel, gpgpu_ctx->the_gpgpusim->g_the_gpu,
-          gpgpu_ctx->the_gpgpusim->g_the_gpu->getShaderCoreConfig()->warp_size);
-      cta.execute(cp_count, temp);
-      gpgpu_ctx->the_gpgpusim->g_the_gpu->get_tcgen05_tmem_manager().reset();  // yasai: see above
+      functionalCoreSim cta(&m_kernel, gpu, m_warp_size);
+      cta.execute(m_sim->cp_count, temp);
+      gpu->get_tcgen05_tmem_manager().reset();
       yasai_func::mbar_reset_all();
-
 #if (CUDART_VERSION >= 5000)
       gpgpu_ctx->device_runtime->launch_all_device_kernels();
 #endif
     } else {
-      kernel.increment_cta_id();
+      m_kernel.increment_cta_id();
     }
     cta_launched++;
   }
-
   if (cp_op == 1) {
+    checkpoint *g_checkpoint = new checkpoint();
     char f1name[2048];
-    snprintf(f1name, 2048, "checkpoint_files/global_mem_%d.txt",
-             kernel.get_uid());
-    g_checkpoint->store_global_mem(
-        gpgpu_ctx->the_gpgpusim->g_the_gpu->get_global_memory(), f1name,
-        (char *)"%08x");
+    snprintf(f1name, 2048, "checkpoint_files/global_mem_%d.txt", m_kernel.get_uid());
+    g_checkpoint->store_global_mem(gpu->get_global_memory(), f1name, (char *)"%08x");
   }
+}
 
+void yasai_func_run::finish() {
+  if (m_done) return;
+  m_done = true;
+  gpgpu_context *gpgpu_ctx = m_sim->gpgpu_ctx;
+  yasai_func::scope_set(m_scope);
+  if (m_csize > 1) m_kernel.set_all_ctas_issued();
   // registering this kernel as done
-
   // openCL kernel simulation calls don't register the kernel so we don't
   // register its exit
-  if (!openCL) {
-    // extern stream_manager *g_stream_manager;
-    gpgpu_ctx->the_gpgpusim->g_stream_manager->register_finished_kernel(
-        kernel.get_uid());
+  if (m_coop) yasai_func::grid_ws_give(m_kernel.yasai_grid_ws());
+  if (!m_openCL) {
+    gpgpu_ctx->the_gpgpusim->g_stream_manager->register_finished_kernel(m_kernel.get_uid());
   }
-
-  yasai_func::kernel_end(yasai_name, yasai_g, yasai_b);
+  yasai_func::kernel_end(m_name, m_grid, m_block);
+  yasai_func::scope_set(nullptr);
 
   //******PRINTING*******
   printf("GPGPU-Sim: Done functional simulation (%u instructions simulated).\n",
-         g_ptx_sim_num_insn);
-  if (gpgpu_ptx_instruction_classification) {
-    StatDisp(g_inst_classification_stat[g_ptx_kernel_count]);
-    StatDisp(g_inst_op_classification_stat[g_ptx_kernel_count]);
+         m_sim->g_ptx_sim_num_insn);
+  if (m_sim->gpgpu_ptx_instruction_classification) {
+    StatDisp(m_sim->g_inst_classification_stat[m_sim->g_ptx_kernel_count]);
+    StatDisp(m_sim->g_inst_op_classification_stat[m_sim->g_ptx_kernel_count]);
   }
 
   // time_t variables used to calculate the total simulation time
@@ -3816,7 +3953,7 @@ void cuda_sim::gpgpu_cuda_ptx_sim_main_func(kernel_info_t &kernel,
       (unsigned)days, (unsigned)hrs, (unsigned)minutes, (unsigned)sec,
       (unsigned)elapsed_time);
   printf("gpgpu_simulation_rate = %u (inst/sec)\n",
-         (unsigned)(g_ptx_sim_num_insn / elapsed_time));
+         (unsigned)(m_sim->g_ptx_sim_num_insn / elapsed_time));
   fflush(stdout);
 }
 

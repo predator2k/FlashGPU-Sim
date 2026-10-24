@@ -245,10 +245,16 @@ unsigned ptx_thread_info::get_builtin(int builtin_id, unsigned dim_mod) {
     case ENVREG_REG: {
       int index = builtin_id >> 16;
       dim3 gdim = this->get_core()->get_kernel_info()->get_grid_dim();
+      // yasai: %envreg1:%envreg2 hold the grid barrier workspace of a cooperative launch
+      // (high and low 32 bits); 0 otherwise, so grid.sync traps as on hardware.
+      const kernel_info_t *kinfo = this->get_core()->get_kernel_info();
       switch (index) {
-        case 0:
         case 1:
+          return kinfo->yasai_cooperative() ? (unsigned)(kinfo->yasai_grid_ws() >> 32) : 0;
         case 2:
+          return kinfo->yasai_cooperative() ? (unsigned)(kinfo->yasai_grid_ws() & 0xffffffffu)
+                                            : 0;
+        case 0:
         case 3:
         case 4:
         case 5:
@@ -312,7 +318,15 @@ unsigned ptx_thread_info::get_builtin(int builtin_id, unsigned dim_mod) {
       feature_not_implemented("%pm");
       return 0;
     case SMID_REG:
+      // yasai: the virtual SM of the CTA in functional mode (see core_t::yasai_virtual_smid).
+      if (m_core != NULL && m_core->yasai_virtual_smid() != ~0u) return m_core->yasai_virtual_smid();
       return m_hw_sid;
+    case NSMID_REG: {
+      // yasai: the SM count the application sees (cudaDevAttrMultiProcessorCount).
+      const kernel_info_t *k = m_core != NULL ? m_core->get_kernel_info() : NULL;
+      if (k != NULL && k->yasai_reported_sms() > 0) return k->yasai_reported_sms();
+      return m_gpu->gpgpu_ctx->func_sim->gpgpu_param_num_shaders;
+    }
     case TID_REG:
       assert(dim_mod < 3);
       if (dim_mod == 0) return m_tid.x;

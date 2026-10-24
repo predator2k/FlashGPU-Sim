@@ -121,6 +121,13 @@ void *gpgpu_sim_thread_concurrent(void *ctx_ptr) {
     bool active = false;
     bool sim_cycles = false;
     ctx->the_gpgpusim->g_the_gpu->init();
+    // yasai: running and launched-but-not-started functional kernels (see below).
+    std::vector<yasai_func_run *> func_runs;
+    std::deque<kernel_info_t *> func_pending;
+    static const bool concurrency = [] {
+      const char *v = getenv("YASAI_KERNEL_CONCURRENCY");
+      return v == NULL || atoi(v) != 0;
+    }();
     do {
       // check if a kernel has completed
       // launch operation on device if one is pending and can be run
@@ -137,13 +144,38 @@ void *gpgpu_sim_thread_concurrent(void *ctx_ptr) {
         break;
 
       // functional simulation
-      if (ctx->the_gpgpusim->g_the_gpu->is_functional_sim()) {
-        kernel_info_t *kernel =
-            ctx->the_gpgpusim->g_the_gpu->get_functional_kernel();
-        assert(kernel);
-        ctx->the_gpgpusim->gpgpu_ctx->func_sim->gpgpu_cuda_ptx_sim_main_func(
-            *kernel);
-        ctx->the_gpgpusim->g_the_gpu->finish_functional_sim(kernel);
+      // yasai: every launched kernel becomes a yasai_func_run, and the runs are stepped one
+      // round each in turn, so kernels of different streams run at the same time (a kernel
+      // spinning on a flag that a kernel of another stream sets). An exclusive run runs alone,
+      // and YASAI_KERNEL_CONCURRENCY=0 runs one kernel at a time. Kernels start in launch order.
+      if (ctx->the_gpgpusim->g_the_gpu->is_functional_sim() || !func_runs.empty()) {
+        gpgpu_sim *gpu = ctx->the_gpgpusim->g_the_gpu;
+        for (kernel_info_t *k; (k = gpu->yasai_take_functional_kernel()) != NULL;)
+          func_pending.push_back(k);
+        while (!func_pending.empty()) {
+          kernel_info_t *k = func_pending.front();
+          bool exclusive_live = false;
+          for (yasai_func_run *r : func_runs) exclusive_live = exclusive_live || r->exclusive();
+          if (!func_runs.empty() &&
+              (!concurrency || exclusive_live || yasai_func_run::is_exclusive(*k)))
+            break;
+          func_pending.pop_front();
+          func_runs.push_back(
+              new yasai_func_run(ctx->the_gpgpusim->gpgpu_ctx->func_sim, *k, false));
+        }
+        // Each run executes up to 64 rounds per turn, so the stream bookkeeping between turns
+        // (operation() above) costs little.
+        for (size_t i = 0; i < func_runs.size();) {
+          bool done = false;
+          for (int round = 0; round < 64 && !done; round++) done = func_runs[i]->step();
+          if (done) {
+            delete func_runs[i];
+            func_runs.erase(func_runs.begin() + i);
+          } else {
+            i++;
+          }
+        }
+        if (func_runs.empty() && func_pending.empty()) gpu->yasai_end_functional();
       }
 
       // performance simulation

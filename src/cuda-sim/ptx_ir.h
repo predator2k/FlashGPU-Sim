@@ -1589,6 +1589,16 @@ class function_info {
   void get_reconvergence_pairs(gpgpu_recon_t *recon_points);
 
   unsigned get_function_size() { return m_instructions.size(); }
+  // yasai: whether the function allocates tensor memory (tcgen05.alloc); such kernels run one
+  // CTA at a time and alone, because the functional TMEM manager is one per process.
+  bool yasai_uses_tmem() {
+    if (m_yasai_uses_tmem < 0) {
+      m_yasai_uses_tmem = 0;
+      for (const ptx_instruction *pI : m_instructions)
+        if (pI->get_opcode() == TCGEN05_ALLOC_OP) m_yasai_uses_tmem = 1;
+    }
+    return m_yasai_uses_tmem == 1;
+  }
 
   void recognize_dynamic_shared_mem();
   void ptx_assemble();
@@ -1774,6 +1784,7 @@ class function_info {
   const symbol *m_return_var_sym;
   std::vector<const symbol *> m_args;
   std::list<ptx_instruction *> m_instructions;
+  int m_yasai_uses_tmem = -1;  // yasai: cache of yasai_uses_tmem (-1: not computed)
   std::vector<basic_block_t *> m_basic_blocks;
   std::list<std::pair<unsigned, unsigned> > m_back_edges;
   std::unordered_map<const symbol *, const symbol *> m_reg_alloc_aliases;

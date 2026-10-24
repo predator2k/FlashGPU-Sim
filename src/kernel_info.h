@@ -232,8 +232,32 @@ public:
     m_next_cta.z = m_grid_dim.z;
   }
 
+  // yasai: cooperative launch (cudaLaunchCooperativeKernel, cuLaunchCooperativeKernel or the
+  // cooperative launch attribute). All CTAs of the grid run at the same time, and
+  // %envreg1:%envreg2 give the grid barrier workspace ws (cooperative_groups' grid.sync
+  // counts arrivals in the word at ws + 4).
+  void set_yasai_cooperative(bool coop, unsigned long long ws) {
+    m_yasai_cooperative = coop;
+    m_yasai_grid_ws = ws;
+  }
+  bool yasai_cooperative() const { return m_yasai_cooperative; }
+  // yasai: CTAs of this launch that the reported device holds at once (its SM count times its
+  // per-SM limit for this kernel's block size, registers and shared memory); set at launch, 0
+  // when unknown. It may exceed the functional cores the simulator built.
+  void set_yasai_coresident(unsigned ctas) { m_yasai_coresident = ctas; }
+  unsigned yasai_coresident() const { return m_yasai_coresident; }
+  // yasai: SM count of the device as the application sees it (%nsmid, virtual %smid); set at
+  // launch, 0 when unknown.
+  void set_yasai_reported_sms(unsigned sms) { m_yasai_reported_sms = sms; }
+  unsigned yasai_reported_sms() const { return m_yasai_reported_sms; }
+  unsigned long long yasai_grid_ws() const { return m_yasai_grid_ws; }
+
 private:
   dim3 m_yasai_cluster_dim = dim3(1, 1, 1);  // yasai: see set_cluster_dim
+  bool m_yasai_cooperative = false;          // yasai: see set_yasai_cooperative
+  unsigned m_yasai_coresident = 0;           // yasai: see set_yasai_coresident
+  unsigned m_yasai_reported_sms = 0;         // yasai: see set_yasai_reported_sms
+  unsigned long long m_yasai_grid_ws = 0;    // yasai: grid barrier workspace (device address)
 
 public:
 };

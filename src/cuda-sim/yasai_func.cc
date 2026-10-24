@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -35,8 +36,6 @@ struct KernelCounters {
   std::chrono::steady_clock::time_point start;  // wall clock at kernel_begin
 };
 
-KernelCounters g_counters;
-
 // Trace state of the current kernel.
 struct TraceState {
   FILE *file = nullptr;                          // open .ywr file, or null when not tracing
@@ -48,15 +47,47 @@ struct TraceState {
   std::vector<char> buf;                         // pending output
 };
 
-TraceState g_trace;
 // Sequence number of the kernel launches of this process (names the trace files).
 uint64_t g_kernel_seq = 0;
-// Executed PCs of the current kernel with their count, PTX line and source (YASAI_TRACE_SRC).
-std::map<uint32_t, std::pair<uint64_t, std::string>> g_pc_src;
 
-// Kernel name and extents for the sidecar.
-std::string g_name;
-Dim3 g_grid, g_block;
+}  // namespace
+
+// Per-kernel state (see scope_new in yasai_func.h).
+struct KernelScope {
+  KernelCounters counters;  // per-kernel counters
+  TraceState trace;         // trace state
+  // Executed PCs of the kernel with their count, PTX line and source (YASAI_TRACE_SRC).
+  std::map<uint32_t, std::pair<uint64_t, std::string>> pc_src;
+  std::string name;         // kernel name for the sidecar
+  Dim3 grid, block;         // extents for the sidecar
+  bool launch_only = false;    // the kernel matches YASAI_LAUNCH_ONLY_REGEX
+  bool sample_kernel = false;  // the kernel is CTA-sampled by YASAI_CTA_SAMPLE_REGEX
+};
+
+namespace {
+
+KernelScope g_default_scope;           // scope when no run has selected one
+KernelScope *g_scope = &g_default_scope;  // selected scope
+
+}  // namespace
+
+KernelScope *scope_new() { return new KernelScope(); }
+void scope_delete(KernelScope *s) {
+  if (s != nullptr && s != &g_default_scope) delete s;
+}
+void scope_set(KernelScope *s) { g_scope = s != nullptr ? s : &g_default_scope; }
+
+// The per-kernel names below refer to the selected scope.
+#define g_counters (g_scope->counters)
+#define g_trace (g_scope->trace)
+#define g_pc_src (g_scope->pc_src)
+#define g_name (g_scope->name)
+#define g_grid (g_scope->grid)
+#define g_block (g_scope->block)
+#define g_launch_only (g_scope->launch_only)
+#define g_sample_kernel (g_scope->sample_kernel)
+
+namespace {
 
 // Appends the little-endian bytes of v to the pending output.
 template <typename T>
@@ -123,10 +154,8 @@ const Config &config() {
   return cfg;
 }
 
-// True while the current kernel matches YASAI_LAUNCH_ONLY_REGEX (set by kernel_begin).
-static bool g_launch_only = false;
-// True while the current kernel is CTA-sampled by YASAI_CTA_SAMPLE_REGEX (set by kernel_begin).
-static bool g_sample_kernel = false;
+// g_launch_only: the current kernel matches YASAI_LAUNCH_ONLY_REGEX; g_sample_kernel: it is
+// CTA-sampled by YASAI_CTA_SAMPLE_REGEX (both set by kernel_begin, in the selected scope).
 
 void kernel_begin(const std::string &name, Dim3 grid, Dim3 block) {
   g_counters = KernelCounters();
@@ -619,6 +648,40 @@ void mbar_canonical(uint64_t &cta_key, uint32_t &addr) {
 }
 
 void mbar_reset_all() { g_mbars.clear(); }
+
+namespace {
+std::mutex &grid_ws_mu() {
+  static std::mutex *m = new std::mutex;
+  return *m;
+}
+std::vector<uint64_t> &grid_ws_free() {
+  static std::vector<uint64_t> *v = new std::vector<uint64_t>;
+  return *v;
+}
+}  // namespace
+
+uint64_t grid_ws_take() {
+  std::lock_guard<std::mutex> lk(grid_ws_mu());
+  if (grid_ws_free().empty()) return 0;
+  const uint64_t ws = grid_ws_free().back();
+  grid_ws_free().pop_back();
+  return ws;
+}
+
+void grid_ws_give(uint64_t ws) {
+  if (ws == 0) return;
+  std::lock_guard<std::mutex> lk(grid_ws_mu());
+  grid_ws_free().push_back(ws);
+}
+
+void mbar_reset_cta(uint64_t cta_key) {
+  for (auto it = g_mbars.begin(); it != g_mbars.end();) {
+    if (it->first.first == cta_key)
+      it = g_mbars.erase(it);
+    else
+      ++it;
+  }
+}
 
 void mbar_init(uint64_t cta_key, uint32_t addr, uint32_t count) {
   mbar_canonical(cta_key, addr);

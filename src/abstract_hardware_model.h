@@ -1431,6 +1431,16 @@ class core_t {
   kernel_info_t *get_kernel_info() { return m_kernel; }
   class ptx_thread_info **get_thread_info() { return m_thread; }
   unsigned get_warp_size() const { return m_warp_size; }
+  // yasai: SM id that %smid reports for the CTA this core executes in functional mode (its
+  // co-resident placement over the reported SM count, yasai_func_run), or ~0u to report the
+  // simulator core's id.
+  unsigned yasai_virtual_smid() const { return m_yasai_virtual_smid; }
+  void yasai_set_virtual_smid(unsigned smid) { m_yasai_virtual_smid = smid; }
+
+ private:
+  unsigned m_yasai_virtual_smid = ~0u;  // yasai: see yasai_virtual_smid
+
+ public:
   void and_reduction(unsigned ctaid, unsigned barid, bool value) {
     reduction_storage[ctaid][barid] &= value;
   }
