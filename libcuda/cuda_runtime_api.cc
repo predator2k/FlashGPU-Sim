@@ -618,6 +618,64 @@ void cuda_runtime_api::cuobjdumpRegisterFatBinary(unsigned int handle,
 /*******************************************************************************
  * Add internal cuda runtime API call to accept gpgpu_context *
  *******************************************************************************/
+// yasai: device ordinals. With YASAI_NVML_DEVICES=n (n >= 1) a process sees the n devices of
+// its node, as one rank process of an n-GPU node does: every ordinal below n selects the one
+// simulated GPU, and ordinal i reports PCI bus YASAI_PCI_BUS_BASE + i and the matching UUID, as
+// the NVML stub does. A rank sets its own ordinal (torch.cuda.set_device(local_rank)) with a
+// common YASAI_PCI_BUS_BASE. One process drives one GPU: setting another ordinal after the first
+// allocation or kernel launch aborts, because a process that uses several GPUs is not modeled.
+// Without YASAI_NVML_DEVICES the process sees one device, as before.
+
+/// Number of device ordinals the process sees (YASAI_NVML_DEVICES), 0 when unset.
+/// @return The count, or 0 for the single-device default.
+static int yasai_ordinal_count() {
+  static const int n = [] {
+    const char *v = getenv("YASAI_NVML_DEVICES");
+    const int k = v ? atoi(v) : 0;
+    return k > 0 ? k : 0;
+  }();
+  return n;
+}
+
+/// Whether device is a valid ordinal: below YASAI_NVML_DEVICES when it is set, otherwise the
+/// simulator's own test (device <= num_devices).
+/// @param device Ordinal asked for.
+/// @param num_devices Devices of the simulator.
+/// @return True when the ordinal is valid.
+static bool yasai_ordinal_valid(int device, unsigned num_devices) {
+  const int n = yasai_ordinal_count();
+  if (n > 0) return device >= 0 && device < n;
+  return device <= int(num_devices);
+}
+
+/// Ordinal of the process's first allocation or kernel launch (-1 before it).
+static int g_yasai_used_ordinal = -1;
+
+/// Records the ordinal of the first allocation or kernel launch (YASAI_NVML_DEVICES only).
+/// @param ordinal Current ordinal.
+static void yasai_ordinal_note_use(int ordinal) {
+  if (yasai_ordinal_count() > 0 && g_yasai_used_ordinal < 0) g_yasai_used_ordinal = ordinal;
+}
+
+/// Aborts when the process switches to another ordinal after it used one.
+/// @param ordinal Ordinal being set.
+static void yasai_ordinal_check_switch(int ordinal) {
+  if (g_yasai_used_ordinal < 0 || ordinal == g_yasai_used_ordinal) return;
+  fprintf(stderr,
+          "yasai: cudaSetDevice(%d) after this process allocated or launched on device %d; "
+          "one process drives one simulated GPU (YASAI_NVML_DEVICES=%d gives it the ordinals "
+          "of a node, but a process using several GPUs is not modeled)\n",
+          ordinal, g_yasai_used_ordinal, yasai_ordinal_count());
+  abort();
+}
+
+/// PCI bus of ordinal 0 (YASAI_PCI_BUS_BASE, default 0xd0).
+/// @return The bus number.
+static unsigned yasai_pci_bus_base() {
+  const char *base_env = getenv("YASAI_PCI_BUS_BASE");
+  return base_env ? unsigned(strtoul(base_env, NULL, 0)) : 0xd0u;
+}
+
 cudaError_t cudaSetDeviceInternal(int device, gpgpu_context *gpgpu_ctx = NULL) {
   gpgpu_context *ctx;
   if (gpgpu_ctx) {
@@ -629,7 +687,8 @@ cudaError_t cudaSetDeviceInternal(int device, gpgpu_context *gpgpu_ctx = NULL) {
     announce_call(__my_func__);
   }
   // set the active device to run cuda
-  if (device <= ctx->GPGPUSim_Init()->num_devices()) {
+  if (yasai_ordinal_valid(device, ctx->GPGPUSim_Init()->num_devices())) {
+    if (yasai_ordinal_count() > 0) yasai_ordinal_check_switch(device);
     ctx->api->g_active_device = device;
     return g_last_cudaError = cudaSuccess;
   } else {
@@ -1172,7 +1231,7 @@ cudaGetDeviceCountInternal(int *count, gpgpu_context *gpgpu_ctx = NULL) {
     announce_call(__my_func__);
   }
   _cuda_device_id *dev = ctx->GPGPUSim_Init();
-  *count = dev->num_devices();
+  *count = yasai_ordinal_count() > 0 ? yasai_ordinal_count() : dev->num_devices();
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -1188,8 +1247,19 @@ __host__ cudaError_t CUDARTAPI cudaGetDevicePropertiesInternal(
     announce_call(__my_func__);
   }
   _cuda_device_id *dev = ctx->GPGPUSim_Init();
-  if (device <= dev->num_devices()) {
+  if (yasai_ordinal_valid(device, dev->num_devices())) {
     *prop = *dev->get_prop();
+    // yasai: the PCI location and the UUID agree with cudaDeviceGetPCIBusId and cuDeviceGetUuid
+    // (bus YASAI_PCI_BUS_BASE + device), so a library that tells GPUs apart by the properties
+    // (NVSHMEM's same-GPU detection) sees one GPU per rank process.
+    const unsigned base = yasai_pci_bus_base();
+    prop->pciDomainID = 0;
+    prop->pciBusID = int((base + unsigned(device)) & 0xff);
+    prop->pciDeviceID = 0;
+    memset(prop->uuid.bytes, 0, sizeof(prop->uuid.bytes));
+    prop->uuid.bytes[0] = 0x59;  // 'Y', as in cuDeviceGetUuid
+    prop->uuid.bytes[14] = (char)((base + unsigned(device)) & 0xff);
+    prop->uuid.bytes[15] = (char)(device & 0xff);
     return g_last_cudaError = cudaSuccess;
   } else {
     return g_last_cudaError = cudaErrorInvalidDevice;
@@ -1256,6 +1326,7 @@ static bool yasai_capture_wait_event(cudaStream_t stream, cudaEvent_t event);
 cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = NULL) {
   yasai_rec::Recorder &rec = yasai_rec::Recorder::get();
   gpgpu_context *ctx = gpgpu_ctx ? gpgpu_ctx : GPGPU_Context();
+  yasai_ordinal_note_use(ctx->api->g_active_device);
   // yasai: a launch into a capturing stream becomes a kernel node of the captured graph.
   if (!ctx->api->g_cuda_launch_stack.empty() &&
       yasai_capture_kernel(hostFun, ctx->api->g_cuda_launch_stack.back())) {
@@ -1450,6 +1521,7 @@ cudaError_t cudaMallocInternal(void **devPtr, size_t size,
     announce_call(__my_func__);
   }
   CUctx_st *context = GPGPUSim_Context(ctx);
+  yasai_ordinal_note_use(ctx->api->g_active_device);
   // yasai: memfd-backed host memory at the device address (yasai_vmm::malloc_device), unless
   // YASAI_DEVMEM_HOST=0.
   *devPtr = reinterpret_cast<void *>(
@@ -2209,7 +2281,7 @@ cudaDeviceGetAttributeInternal(int *value, enum cudaDeviceAttr attr, int device,
   const struct cudaDeviceProp *prop;
   _cuda_device_id *dev = ctx->GPGPUSim_Init();
 
-  if (device <= dev->num_devices()) {
+  if (yasai_ordinal_valid(device, dev->num_devices())) {
     prop = dev->get_prop();
     switch ((int)attr) {
       case 1:
@@ -2325,11 +2397,13 @@ cudaDeviceGetAttributeInternal(int *value, enum cudaDeviceAttr attr, int device,
       case 32:
         *value = 0;
         break;
-      case 33:
-      case 50:
-        *value = 0;  // dummy value
+      case 33:  // yasai: PCI bus of the ordinal, as cudaDeviceGetPCIBusId
+        *value = int((yasai_pci_bus_base() + unsigned(device)) & 0xff);
         break;
-      case 34:
+      case 50:  // PCI domain
+        *value = 0;
+        break;
+      case 34:  // PCI device
         *value = 0;
         break;
       case 35:
@@ -3492,9 +3566,9 @@ __host__ cudaError_t CUDARTAPI cudaDeviceGetPCIBusId(char *pciBusId, int len,
   // 0xd0) + device. The base must not be a bus of the host, because NCCL reads the device's
   // sysfs entry when one exists (bus 1 is a real controller on the lab hosts).
   if (pciBusId == NULL || len <= 0) return g_last_cudaError = cudaErrorInvalidValue;
-  const char *base_env = getenv("YASAI_PCI_BUS_BASE");
-  const unsigned base = base_env ? unsigned(strtoul(base_env, NULL, 0)) : 0xd0u;
-  snprintf(pciBusId, len, "0000:%02x:00.0", (base + device) & 0xff);
+  if (yasai_ordinal_count() > 0 && (device < 0 || device >= yasai_ordinal_count()))
+    return g_last_cudaError = cudaErrorInvalidDevice;
+  snprintf(pciBusId, len, "0000:%02x:00.0", (yasai_pci_bus_base() + device) & 0xff);
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -5948,10 +6022,16 @@ cudaPointerGetAttributes(cudaPointerAttributes *attributes, const void *ptr) {
 __host__ cudaError_t CUDARTAPI cudaDeviceCanAccessPeer(int *canAccessPeer,
                                                        int device,
                                                        int peerDevice) {
-  // yasai: one simulated device per process, so no peer access.
-  (void)device;
-  (void)peerDevice;
-  if (canAccessPeer) *canAccessPeer = 0;
+  // yasai: with YASAI_NVML_DEVICES, two different ordinals of the node reach each other when
+  // the NVML stub reports P2P (YASAI_NVML_P2P=1, device memory shared between the rank
+  // processes); otherwise one simulated device per process and no peer access.
+  if (canAccessPeer == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  const int n = yasai_ordinal_count();
+  const char *p2p = getenv("YASAI_NVML_P2P");
+  *canAccessPeer = (n > 0 && device >= 0 && device < n && peerDevice >= 0 && peerDevice < n &&
+                    device != peerDevice && p2p && atoi(p2p) != 0)
+                       ? 1
+                       : 0;
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -6675,6 +6755,13 @@ CUresult CUDAAPI cuDeviceGet(CUdevice *device, int ordinal) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
+  // yasai: with YASAI_NVML_DEVICES the handle is the ordinal itself (see yasai_ordinal_count).
+  if (yasai_ordinal_count() > 0) {
+    if (device == NULL || ordinal < 0 || ordinal >= yasai_ordinal_count())
+      return CUDA_ERROR_INVALID_DEVICE;
+    *device = ordinal;
+    return CUDA_SUCCESS;
+  }
   int deviceI = -1;
   cudaError_t e = cudaGetDevice(&deviceI);
   assert(e == cudaSuccess);
@@ -6856,11 +6943,12 @@ CUresult CUDAAPI cuCtxGetCurrent(CUcontext *pctx) {
 }
 #endif /* CUDART_VERSION >= 4000 */
 
+// yasai: the device of the current context is the current ordinal (cudaGetDevice).
 CUresult CUDAAPI cuCtxGetDevice(CUdevice *device) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  if (device == NULL) return CUDA_ERROR_INVALID_VALUE;
+  int d = 0;
+  cudaGetDevice(&d);
+  *device = d;
   return CUDA_SUCCESS;
 }
 
@@ -7300,20 +7388,18 @@ CUresult CUDAAPI cuMemAllocManaged(CUdeviceptr *dptr, size_t bytesize,
 
 #if CUDART_VERSION >= 4010
 
+// yasai: the driver forms of cudaDeviceGetByPCIBusId and cudaDeviceGetPCIBusId.
 CUresult CUDAAPI cuDeviceGetByPCIBusId(CUdevice *dev, const char *pciBusId) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  int d = 0;
+  if (cudaDeviceGetByPCIBusId(&d, pciBusId) != cudaSuccess) return CUDA_ERROR_INVALID_VALUE;
+  *dev = d;
   return CUDA_SUCCESS;
 }
 
+// yasai: see cuDeviceGetByPCIBusId.
 CUresult CUDAAPI cuDeviceGetPCIBusId(char *pciBusId, int len, CUdevice dev) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  return cudaDeviceGetPCIBusId(pciBusId, len, int(dev)) == cudaSuccess ? CUDA_SUCCESS
+                                                                        : CUDA_ERROR_INVALID_VALUE;
 }
 
 CUresult CUDAAPI cuIpcGetEventHandle(CUipcEventHandle *pHandle, CUevent event) {
@@ -8726,13 +8812,12 @@ CUresult CUDAAPI cuSurfObjectGetResourceDesc(CUDA_RESOURCE_DESC *pResDesc,
 #endif /* CUDART_VERSION >= 5000 */
 
 #if CUDART_VERSION >= 4000
+// yasai: the driver form of cudaDeviceCanAccessPeer.
 CUresult CUDAAPI cuDeviceCanAccessPeer(int *canAccessPeer, CUdevice dev,
                                        CUdevice peerDev) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  return cudaDeviceCanAccessPeer(canAccessPeer, int(dev), int(peerDev)) == cudaSuccess
+             ? CUDA_SUCCESS
+             : CUDA_ERROR_INVALID_VALUE;
 }
 
 CUresult CUDAAPI cuDeviceGetP2PAttribute(int *value,
