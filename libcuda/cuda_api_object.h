@@ -123,8 +123,10 @@ struct CUctx_st {
       if (s != NULL) {
         function_info *f = s->get_pc();
         assert(f != NULL);
-        auto [new_iter, success] = m_kernel_lookup.emplace(hostFun, f);
-        assert(success);
+        // yasai: cuModuleGetFunction registers the function_info pointer as the host key, so a
+        // module image loaded again (Triton and DeepGEMM load the same image per device or per
+        // call) registers the same key; the latest definition is kept.
+        m_kernel_lookup[hostFun] = f;
       } else {
         // yasai: with lazy PTX loading the kernel's file is parsed at its first launch.
         if (yasai_func::g_lazy_load_name == nullptr)

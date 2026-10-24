@@ -1,4 +1,5 @@
 #include "yasai_fakeenv_rec.h"
+#include "yasai_jit_image.h"
 #include "../src/yasai_subprocess.h"
 #include <dlfcn.h>
 // This file created from cuda_runtime_api.h distributed with CUDA 1.1
@@ -768,6 +769,33 @@ static CUresult load_module_from_ptx_file(CUmodule *module,
 }
 
 static CUresult load_module_from_cuda_library_ptx(CUmodule *module,
+                                                  const char *caller);
+
+// yasai: cuModuleLoadData and cuModuleLoadDataEx load the image they are given (Triton,
+// DeepGEMM and CuTe DSL modules): a PTX image directly, a fat binary through its embedded PTX,
+// an ELF cubin through the PTX that the JIT caches keep (yasai_jit_image.h). The PTX sidecar of
+// GPGPUSIM_CUDA_LIBRARY_PTX / PTX_SIM_KERNELFILE, when its file exists, still takes precedence; an image
+// without PTX falls back to it as before.
+//   module  receives the module handle
+//   image   the image the caller passed
+//   caller  name of the API function (for the log)
+static CUresult yasai_load_module_image(CUmodule *module, const void *image, const char *caller) {
+  // setup_environment always exports PTX_SIM_KERNELFILE=_1.ptx, so the sidecar counts only
+  // when its file exists.
+  const std::string sidecar = get_cuda_library_ptx_path();
+  if (!sidecar.empty() && file_exists(sidecar))
+    return load_module_from_cuda_library_ptx(module, caller);
+  gpgpu_context *ctx = GPGPU_Context();
+  if (!ctx) return CUDA_ERROR_INVALID_HANDLE;
+  const unsigned cap = GPGPUSim_Context(ctx)->get_device()->get_gpgpu()->get_config().get_forced_max_capability();
+  std::string how;
+  const std::string ptx = yasai_jit::ptx_for_image(image, cap, &how);
+  printf("GPGPU-Sim PTX: %s: %s\n", caller, how.c_str());
+  if (ptx.empty()) return CUDA_ERROR_NO_BINARY_FOR_GPU;
+  return load_module_from_ptx_file(module, ptx, caller);
+}
+
+static CUresult load_module_from_cuda_library_ptx(CUmodule *module,
                                                   const char *caller) {
   const std::string ptx_path = get_cuda_library_ptx_path();
   if (ptx_path.empty()) {
@@ -779,6 +807,12 @@ static CUresult load_module_from_cuda_library_ptx(CUmodule *module,
     return CUDA_ERROR_INVALID_VALUE;
   }
   return load_module_from_ptx_file(module, ptx_path, caller);
+}
+
+// yasai: indexes the PTX of a library registered after start-up (defined after the lazy
+// loading code).
+extern "C" {
+static void yasai_register_library_ptx(gpgpu_context *ctx, unsigned handle, void *fatCubin);
 }
 
 // Internal implementation for cudaRegisterFatBiaryInternal
@@ -873,6 +907,7 @@ void **cudaRegisterFatBiaryInternal_impl(
     assert(fat_cubin_handle >= 1);
     if (fat_cubin_handle == 1) ctx_cuobjdumpInit_func(ctx);
     ctx->api->cuobjdumpRegisterFatBinary(fat_cubin_handle, filename, context);
+    yasai_register_library_ptx(ctx, fat_cubin_handle, fatCubin);
 
     return (void **)fat_cubin_handle;
   }
@@ -4896,6 +4931,72 @@ bool yasai_lazy_load_name(const char *name) {
 }
 }  // namespace
 
+// yasai: a library that registers fat binaries but is not named in PYTORCH_BIN (a module that
+// FlashInfer or sglang compiled at run time and loaded with dlopen, or a framework extension)
+// used to have no PTX: the PTX of PYTORCH_BIN is extracted once, at the first registration.
+// Now the library file of every registered fat binary is found with dladdr; the first time a
+// library is seen, the PTX files that cuobjdump extracts from it (one architecture, selected as
+// for PYTORCH_BIN) are indexed for lazy loading like the PYTORCH_BIN files, so its kernels are
+// parsed at their first launch. YASAI_DYNAMIC_LIB_PTX=0 turns this off.
+//   ctx       simulator context
+//   handle    fat binary handle of this registration
+//   fatCubin  the fat binary wrapper the library passed (its address locates the library)
+static void yasai_register_library_ptx(gpgpu_context *ctx, unsigned handle, void *fatCubin) {
+  const char *off = getenv("YASAI_DYNAMIC_LIB_PTX");
+  if (fatCubin == NULL || !yasai_lazy_enabled() || (off != NULL && atoi(off) == 0)) return;
+  Dl_info info;
+  if (!dladdr(fatCubin, &info) || info.dli_fname == NULL || info.dli_fname[0] == '\0') return;
+  char resolved[4096];
+  const std::string path = realpath(info.dli_fname, resolved) ? resolved : info.dli_fname;
+  static std::set<std::string> seen;
+  static std::set<std::string> listed;
+  static bool listed_init = false;
+  if (!listed_init) {
+    listed_init = true;
+    if (const char *pb = getenv("PYTORCH_BIN")) {
+      std::string list(pb);
+      size_t start = 0;
+      while (start <= list.size()) {
+        const size_t end = std::min(list.find(':', start), list.size());
+        if (end > start) {
+          const std::string b = list.substr(start, end - start);
+          listed.insert(realpath(b.c_str(), resolved) ? std::string(resolved) : b);
+        }
+        start = end + 1;
+      }
+    }
+    char exe[4096];
+    const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (n > 0) {
+      exe[n] = '\0';
+      listed.insert(realpath(exe, resolved) ? std::string(resolved) : std::string(exe));
+    }
+  }
+  if (listed.count(path) || !seen.insert(path).second) return;
+  const unsigned cap =
+      GPGPUSim_Context(ctx)->get_device()->get_gpgpu()->get_config().get_forced_max_capability();
+  const std::vector<std::string> files = yasai_jit::ptx_files_of_library(path, cap);
+  printf("GPGPU-Sim PTX: library %s registered after start-up: %zu PTX files indexed\n",
+         path.c_str(), files.size());
+  if (files.empty()) return;
+  yasai_lazy_ptx_t L;
+  L.handle = handle;
+  for (const std::string &f : files) {
+    const int idx = int(L.files.size());
+    L.files.push_back(f);
+    L.archs.push_back(yasai_jit::arch_of_ptx_file(f));
+    L.loaded.push_back(false);
+    std::ifstream in(f);
+    std::string line;
+    while (std::getline(in, line)) {
+      const std::string nm = yasai_ptx_decl_name(line);
+      if (!nm.empty()) L.owner.emplace(nm, idx);
+    }
+  }
+  g_yasai_lazy.push_back(std::move(L));
+  yasai_func::g_lazy_load_name = yasai_lazy_load_name;
+}
+
 void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
   CUctx_st *context = GPGPUSim_Context(this);
   if (api->fatbin_registered[handle]) return;
@@ -6494,8 +6595,7 @@ CUresult CUDAAPI cuModuleLoadData(CUmodule *module, const void *image) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  (void)image;
-  return load_module_from_cuda_library_ptx(module, __my_func__);
+  return yasai_load_module_image(module, image, __my_func__);
 }
 
 CUresult CUDAAPI cuModuleLoadDataEx(CUmodule *module, const void *image,
@@ -6505,11 +6605,10 @@ CUresult CUDAAPI cuModuleLoadDataEx(CUmodule *module, const void *image,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  (void)image;
   (void)numOptions;
   (void)options;
   (void)optionValues;
-  return load_module_from_cuda_library_ptx(module, __my_func__);
+  return yasai_load_module_image(module, image, __my_func__);
 }
 
 CUresult CUDAAPI cuModuleLoadFatBinary(CUmodule *module, const void *fatCubin) {
