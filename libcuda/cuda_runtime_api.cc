@@ -5846,11 +5846,37 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
       }
       selected_files.push_back(ptx_filename);
     }
-    if (!yasai_base_after_suffix.empty())
-      printf("GPGPU-Sim PTX: %zu base-architecture PTX files kept after the suffixed ones\n",
-             yasai_base_after_suffix.size());
-    selected_files.insert(selected_files.end(), yasai_base_after_suffix.begin(),
-                          yasai_base_after_suffix.end());
+    // yasai: a base file is kept only when it declares a name that no suffixed file declares
+    // (a library whose base and suffixed files hold the same kernels stays a single-file load).
+    if (!yasai_base_after_suffix.empty()) {
+      std::set<std::string> suffixed_names;
+      for (size_t i = first_of_library; i < selected_files.size(); ++i) {
+        std::ifstream in(selected_files[i]);
+        std::string line;
+        while (std::getline(in, line)) {
+          const std::string n = yasai_ptx_decl_name(line);
+          if (!n.empty()) suffixed_names.insert(n);
+        }
+      }
+      size_t kept = 0;
+      for (const std::string &f : yasai_base_after_suffix) {
+        std::ifstream in(f);
+        std::string line;
+        bool adds = false;
+        while (!adds && std::getline(in, line)) {
+          const std::string n = yasai_ptx_decl_name(line);
+          adds = !n.empty() && suffixed_names.count(n) == 0;
+        }
+        if (adds) {
+          selected_files.push_back(f);
+          ++kept;
+        } else {
+          printf("GPGPU-Sim PTX: Skipping %s (suffix version available)\n", f.c_str());
+        }
+      }
+      if (kept)
+        printf("GPGPU-Sim PTX: %zu base-architecture PTX files kept after the suffixed ones\n", kept);
+    }
   }
   for (const auto &ov : lib_override) {
     const std::string &lib = library.first;
