@@ -768,10 +768,42 @@ void ptx_recognizer::add_double_operand(const char *d1, const char *d2) {
   g_operands.push_back(operand_info(s1, s2, gpgpu_ctx));
 }
 
+// yasai: the marker name that carries an integer literal from the grammar to the
+// add_Nvector_operand functions (TMA coordinates may be literals: {0, %r1, %r2}).
+//   value: the literal
+//   returns a new string "$yasai_lit:<value>"
+char *ptx_recognizer::tex_literal_name(long long value) {
+  return strdup(("$yasai_lit:" + std::to_string(value)).c_str());
+}
+
+// yasai: a tex-style vector operand with literal components becomes a component vector (as the
+// generic vector operand builds it), so get_vector_operand_values reads the literals.
+//   names: component names, literals as tex_literal_name markers
+//   returns false (nothing pushed) when no component is a literal
+bool ptx_recognizer::add_vector_with_literals(std::initializer_list<const char *> names) {
+  static const char kMark[] = "$yasai_lit:";
+  bool any = false;
+  for (const char *n : names) any = any || (n && strncmp(n, kMark, sizeof kMark - 1) == 0);
+  if (!any) return false;
+  std::vector<operand_info> components;
+  for (const char *n : names) {
+    if (strncmp(n, kMark, sizeof kMark - 1) == 0) {
+      components.push_back(operand_info((long long)strtoll(n + sizeof kMark - 1, NULL, 10), gpgpu_ctx));
+      continue;
+    }
+    const symbol *sym = g_current_symbol_table->lookup(n);
+    parse_assert(sym != NULL, "vector component missing declaration.");
+    components.push_back(operand_info(sym, gpgpu_ctx));
+  }
+  g_operands.push_back(operand_info(components, gpgpu_ctx));
+  return true;
+}
+
 void ptx_recognizer::add_1vector_operand(const char *d1) {
   // handles the single element vector operand ({%v1}) found in tex.1d
   // instructions
   PTX_PARSE_GPPRINTF("add_1vector_operand");
+  if (add_vector_with_literals({d1})) return;
   const symbol *s1 = g_current_symbol_table->lookup(d1);
   parse_assert(s1 != NULL, "component(s) missing declarations.");
   g_operands.push_back(operand_info(s1, NULL, NULL, NULL, gpgpu_ctx));
@@ -779,6 +811,7 @@ void ptx_recognizer::add_1vector_operand(const char *d1) {
 
 void ptx_recognizer::add_2vector_operand(const char *d1, const char *d2) {
   PTX_PARSE_GPPRINTF("add_2vector_operand");
+  if (add_vector_with_literals({d1, d2})) return;
   const symbol *s1 = g_current_symbol_table->lookup(d1);
   const symbol *s2 = g_current_symbol_table->lookup(d2);
   parse_assert(s1 != NULL && s2 != NULL,
@@ -789,6 +822,7 @@ void ptx_recognizer::add_2vector_operand(const char *d1, const char *d2) {
 void ptx_recognizer::add_3vector_operand(const char *d1, const char *d2,
                                          const char *d3) {
   PTX_PARSE_GPPRINTF("add_3vector_operand");
+  if (add_vector_with_literals({d1, d2, d3})) return;
   const symbol *s1 = g_current_symbol_table->lookup(d1);
   const symbol *s2 = g_current_symbol_table->lookup(d2);
   const symbol *s3 = g_current_symbol_table->lookup(d3);
@@ -800,6 +834,7 @@ void ptx_recognizer::add_3vector_operand(const char *d1, const char *d2,
 void ptx_recognizer::add_4vector_operand(const char *d1, const char *d2,
                                          const char *d3, const char *d4) {
   PTX_PARSE_GPPRINTF("add_4vector_operand");
+  if (add_vector_with_literals({d1, d2, d3, d4})) return;
   const symbol *s1 = g_current_symbol_table->lookup(d1);
   const symbol *s2 = g_current_symbol_table->lookup(d2);
   const symbol *s3 = g_current_symbol_table->lookup(d3);
@@ -816,6 +851,7 @@ void ptx_recognizer::add_5vector_operand(const char *d1, const char *d2,
                                          const char *d3, const char *d4,
                                          const char *d5) {
   PTX_PARSE_GPPRINTF("add_5vector_operand");
+  if (add_vector_with_literals({d1, d2, d3, d4, d5})) return;
   const symbol *s1 = g_current_symbol_table->lookup(d1);
   const symbol *s2 = g_current_symbol_table->lookup(d2);
   const symbol *s3 = g_current_symbol_table->lookup(d3);
@@ -836,6 +872,7 @@ void ptx_recognizer::add_8vector_operand(const char *d1, const char *d2,
                                          const char *d5, const char *d6,
                                          const char *d7, const char *d8) {
   PTX_PARSE_GPPRINTF("add_8vector_operand");
+  if (add_vector_with_literals({d1, d2, d3, d4, d5, d6, d7, d8})) return;
   const symbol *s1 = g_current_symbol_table->lookup(d1);
   const symbol *s2 = g_current_symbol_table->lookup(d2);
   const symbol *s3 = g_current_symbol_table->lookup(d3);

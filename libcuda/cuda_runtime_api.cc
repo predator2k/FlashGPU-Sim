@@ -9060,6 +9060,39 @@ CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
   return CUDA_SUCCESS;
 }
 
+// yasai: dynamic shared memory per block when numBlocks blocks are resident on one SM: the SM's
+// shared memory divided among them, at most the per-block opt-in limit, less the kernel's static
+// shared memory (CuTe DSL's HardwareInfo asks for it before choosing a cluster count).
+//   dynamicSmemSize: receives the bytes; func: function; numBlocks: resident blocks per SM;
+//   blockSize: threads per block (does not change the result here)
+extern "C" CUresult CUDAAPI cuOccupancyAvailableDynamicSMemPerBlock(size_t *dynamicSmemSize,
+                                                                    CUfunction func, int numBlocks,
+                                                                    int blockSize) {
+  if (dynamicSmemSize == NULL || func == NULL || numBlocks <= 0 || blockSize <= 0)
+    return CUDA_ERROR_INVALID_VALUE;
+  function_info *entry = reinterpret_cast<function_info *>(func);
+  gpgpu_sim *gpu = GPGPUSim_Context(GPGPU_Context())->get_device()->get_gpgpu();
+  const struct gpgpu_ptx_sim_info *kinfo = entry->get_kernel_info();
+  const size_t static_smem = kinfo ? kinfo->smem : 0;
+  const size_t per_block = std::min<size_t>(size_t(gpu->shared_mem_size()) / size_t(numBlocks),
+                                            size_t(gpu->shared_mem_per_block_optin()));
+  *dynamicSmemSize = per_block > static_smem ? per_block - static_smem : 0;
+  return CUDA_SUCCESS;
+}
+
+// yasai: the runtime form of cuOccupancyAvailableDynamicSMemPerBlock.
+//   dynamicSmemSize, numBlocks, blockSize: as there; func: host function of the kernel
+extern "C" cudaError_t CUDARTAPI cudaOccupancyAvailableDynamicSMemPerBlock(
+    size_t *dynamicSmemSize, const void *func, int numBlocks, int blockSize) {
+  function_info *entry = GPGPUSim_Context(GPGPU_Context())->get_kernel((const char *)func);
+  if (entry == NULL) return g_last_cudaError = cudaErrorInvalidDeviceFunction;
+  return g_last_cudaError = cuOccupancyAvailableDynamicSMemPerBlock(
+                                dynamicSmemSize, reinterpret_cast<CUfunction>(entry), numBlocks,
+                                blockSize) == CUDA_SUCCESS
+                                ? cudaSuccess
+                                : cudaErrorInvalidValue;
+}
+
 // yasai: cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags with the default flag.
 //   numBlocks, func, blockSize, dynamicSMemSize: as there
 CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessor(

@@ -627,10 +627,11 @@ void function_info::alloc_dyn_shared_mem(int shared_mem_size) {
       "GPGPU-Sim PTX: Kernel '%s' : smem(static)=%u, smem(dynamic)=%d, total_smem=%u\n",
       m_name.c_str(), declared_smem, shared_mem_size, total_smem);
   } else {
-    symtab->dump_until_top();
-    printf("GPGPU-Sim PTX: Error -- dynamic shared memory size specified "
-           "but no local dynamic shared memory symbol found in kernel\n");
-    abort();
+    // yasai: a kernel that never names an extern .shared array may still be launched with
+    // dynamic shared memory (ThunderKittens' test wrappers request it for every kernel); CUDA
+    // reserves it and nothing reads it, so the launch goes on.
+    printf("GPGPU-Sim PTX: kernel '%s' has no dynamic shared memory symbol; the %d bytes "
+           "requested at launch are not used\n", m_name.c_str(), shared_mem_size);
   }
 }
 

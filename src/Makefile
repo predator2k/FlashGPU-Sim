@@ -80,9 +80,14 @@ clean:
 	rm -f *.o core *~ *.a Makefile.makedepend Makefile.makedepend.bak
 
 $(OUTPUT_DIR)/%.$(OEXT): %.cc
-	$(CPP) $(OPTFLAGS) $(CXXFLAGS) -o $(OUTPUT_DIR)/$*.$(OEXT) -c $*.cc
+	$(CPP) $(OPTFLAGS) $(CXXFLAGS) -MMD -MP -o $(OUTPUT_DIR)/$*.$(OEXT) -c $*.cc
 
 option_parser.$(OEXT): option_parser.h
 
 include $(OUTPUT_DIR)/Makefile.makedepend
 
+# yasai: -MMD -MP writes <object>.d with every header and .def file the object includes
+# (opcodes.def, the generated ptx.tab.h, instructions.h, ptx_parser_decode.def), so an
+# edit of one rebuilds every object that includes it; makedepend missed headers in other
+# directories.
+-include $(wildcard $(OUTPUT_DIR)/*.d)

@@ -333,6 +333,19 @@ bool is_tcgen05_mbarrier_arrive_one(const ptx_instruction *pI) {
 }
 } // namespace
 
+// yasai: the state destination of mbarrier.arrive (CuTe DSL writes "mbarrier.arrive.expect_tx
+// %rd, [bar], tx"). Only phase-parity waits are modeled, and they do not read the state, so a
+// zero token is written; a wait on a state token (test_wait/try_wait without .parity) stops at
+// its own assertion.
+//   pI: the arrive instruction; thread: the arriving thread
+static void yasai_write_arrive_state(const ptx_instruction *pI, ptx_thread_info *thread) {
+  const operand_info &state_op = pI->dst();
+  if (state_op.name() == "_") return;
+  ptx_reg_t token;
+  token.u64 = 0;
+  thread->set_operand_value(state_op, token, B64_TYPE, thread, pI);
+}
+
 void handle_mbarrier_inst(const ptx_instruction *pIin,
                           ptx_thread_info *thread) {
   ptx_instruction *pI = const_cast<ptx_instruction *>(pIin);
@@ -515,9 +528,7 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
     auto expected_tx_count = 0;
     if (is_arrive && is_expect_tx) {
       assert(pI->get_num_operands() == 3);
-      const operand_info &phase_op = pI->dst();
-      assert(phase_op.name() == "_" &&
-             "Only support sink reg for mbarrier.arrive");
+      yasai_write_arrive_state(pI, thread);
 
       addr = get_u32_value(pI->src1());
       expected_tx_count = get_u32_value(pI->src2());
@@ -534,9 +545,7 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
 
     } else if (is_arrive) {
       assert(pI->get_num_operands() == 3 || pI->get_num_operands() == 2);
-      const operand_info &phase_op = pI->dst();
-      assert(phase_op.name() == "_" &&
-             "Only support sink reg for mbarrier.arrive");
+      yasai_write_arrive_state(pI, thread);
 
       addr = get_u32_value(pI->src1());
       if (pI->get_num_operands() == 3) {

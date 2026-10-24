@@ -94,6 +94,10 @@ static void handle_ld_st_matrix_inst_impl(const ptx_instruction *pI,
     case X4_OPTION:
       num_matrixs = 4;
       break;
+    case CTA_OPTION:
+      // yasai: .shared::cta (ThunderKittens' stmatrix) names the CTA's shared memory, the
+      // space that .shared already means.
+      break;
     case B8_TYPE:
     case B16_TYPE:
       // Scalar type is consumed below from pI->get_scalar_type(). Depending on
