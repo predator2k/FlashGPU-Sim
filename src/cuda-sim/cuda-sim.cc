@@ -3531,6 +3531,13 @@ void cuda_sim::gpgpu_cuda_ptx_sim_main_func(kernel_info_t &kernel,
   printf(
       "GPGPU-Sim: Performing Functional Simulation, executing kernel %s...\n",
       kernel.name().c_str());
+  // yasai: a kernel executes while holding the PTX load mutex, so a host thread that parses and
+  // assembles the PTX of another kernel (per-kernel pieces, a module image, a late library) waits
+  // until this kernel ends. Assembly appends to the process-wide PC table (s_g_pc_to_insn, a
+  // std::vector) and g_pc_to_finfo that execution reads; a concurrent append reallocated the
+  // table under the executing warp (segfault in core_t::getExecuteWarp). Lazy loads made by this
+  // thread (function bodies in call_impl) take the recursive mutex again.
+  std::lock_guard<std::recursive_mutex> yasai_exec_lock(yasai_func::ptx_load_mutex());
 
   // using a shader core object for book keeping, it is not needed but as most
   // function built for performance simulation need it we use it here
