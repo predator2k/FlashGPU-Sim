@@ -9,6 +9,59 @@
 #include "../src/cuda-sim/ptx_parser.h"
 #include "../src/gpgpusim_entrypoint.h"
 #include "cuda_api_object.h"
+#include <cassert>
+
+class ptx_instruction;
+
+// yasai: the PC -> instruction table with stable storage. It was a std::vector, so an append
+// (assembly of a function: a kernel piece loaded by a host thread, a function body loaded lazily
+// by the simulation thread inside call_impl) could reallocate it while another thread read an
+// entry. Entries live in chunks of kChunk pointers that are never moved; the chunk directory has
+// a fixed size. An append writes the entry and then publishes the new size (release); a reader
+// that sees a PC below size() (acquire) sees its entry. Appends are serialized by the PTX load
+// mutex (yasai_func::ptx_load_mutex).
+class yasai_pc_table {
+ public:
+  static const unsigned kChunkBits = 20;                  // 1M entries per chunk
+  static const size_t kChunk = size_t(1) << kChunkBits;   // entries per chunk
+  static const size_t kMaxChunks = size_t(1) << 14;       // directory size: 16G entries
+  yasai_pc_table() : m_size(0) {
+    for (size_t c = 0; c < kMaxChunks; ++c) m_chunks[c].store(nullptr, std::memory_order_relaxed);
+  }
+  ~yasai_pc_table() {
+    for (size_t c = 0; c < kMaxChunks; ++c) delete[] m_chunks[c].load(std::memory_order_relaxed);
+  }
+  yasai_pc_table(const yasai_pc_table &) = delete;
+  yasai_pc_table &operator=(const yasai_pc_table &) = delete;
+  // Number of entries (PCs) published.
+  size_t size() const { return m_size.load(std::memory_order_acquire); }
+  // Kept for the callers of the std::vector interface; storage grows by chunks.
+  //   n: ignored
+  void reserve(size_t n) { (void)n; }
+  // Appends the instruction of the next PC (NULL for the slots inside a multi-slot instruction).
+  //   p: instruction or NULL
+  void push_back(ptx_instruction *p) {
+    const size_t i = m_size.load(std::memory_order_relaxed);
+    const size_t c = i >> kChunkBits;
+    assert(c < kMaxChunks);
+    ptx_instruction **chunk = m_chunks[c].load(std::memory_order_relaxed);
+    if (chunk == nullptr) {
+      chunk = new ptx_instruction *[kChunk]();
+      m_chunks[c].store(chunk, std::memory_order_release);
+    }
+    chunk[i & (kChunk - 1)] = p;
+    m_size.store(i + 1, std::memory_order_release);
+  }
+  // Instruction of PC i (i < size()).
+  //   i: PC
+  ptx_instruction *operator[](size_t i) const {
+    return m_chunks[i >> kChunkBits].load(std::memory_order_acquire)[i & (kChunk - 1)];
+  }
+
+ private:
+  std::atomic<size_t> m_size;                           // published entries
+  std::atomic<ptx_instruction **> m_chunks[kMaxChunks];  // chunk directory
+};
 
 class gpgpu_context {
  public:
@@ -45,8 +98,7 @@ class gpgpu_context {
   unsigned long long g_ptx_cta_info_uid;
   unsigned symbol_sm_next_uid;  // uid for symbol
   unsigned function_info_sm_next_uid;
-  std::vector<ptx_instruction *>
-      s_g_pc_to_insn;  // a direct mapping from PC to instruction
+  yasai_pc_table s_g_pc_to_insn;  // a direct mapping from PC to instruction (yasai: stable)
   bool ptx_register_allocator_enabled;
   bool ptx_register_allocator_stats;
   bool ptx_reorder_enabled;

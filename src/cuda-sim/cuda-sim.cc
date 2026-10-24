@@ -654,23 +654,9 @@ void function_info::ptx_assemble() {
   // MAX_INST_SIZE*m_instructions.size());
   gpgpu_ctx->s_g_pc_to_insn.reserve(MAX_INST_SIZE * m_instructions.size());
   // yasai: PTX is parsed while kernels run (per-kernel pieces from host threads, lazy function
-  // bodies from the simulation thread), and warps fetch instructions from this vector without
-  // a lock. A reallocation by push_back would free the array under a fetching warp, so the
-  // vector reserves a large capacity once, at the first assembly, before any kernel runs:
-  // YASAI_PC_RESERVE entries (default 2^28; only touched pages take memory).
-  {
-    static bool reserved = false;
-    if (!reserved) {
-      reserved = true;
-      const char *e = getenv("YASAI_PC_RESERVE");
-      const size_t want = e ? strtoull(e, nullptr, 0) : (size_t(1) << 28);
-      if (gpgpu_ctx->s_g_pc_to_insn.capacity() < want) gpgpu_ctx->s_g_pc_to_insn.reserve(want);
-    }
-    if (gpgpu_ctx->s_g_pc_to_insn.size() + MAX_INST_SIZE * (m_instructions.size() + 1) >
-        gpgpu_ctx->s_g_pc_to_insn.capacity())
-      printf("GPGPU-Sim PTX: WARNING: instruction memory exceeds YASAI_PC_RESERVE; it is "
-             "reallocated, which is unsafe while kernels run\n");
-  }
+  // bodies from the simulation thread), and warps fetch instructions from this table without
+  // a lock. The table (yasai_pc_table in gpgpu_context.h) never moves its entries, so appends
+  // are safe under fetching warps; it replaces the one-time reserve of YASAI_PC_RESERVE.
   for (i = m_instructions.begin(); i != m_instructions.end(); i++) {
     ptx_instruction *pI = *i;
     if (pI->is_label()) {
@@ -3562,13 +3548,6 @@ void cuda_sim::gpgpu_cuda_ptx_sim_main_func(kernel_info_t &kernel,
   printf(
       "GPGPU-Sim: Performing Functional Simulation, executing kernel %s...\n",
       kernel.name().c_str());
-  // yasai: a kernel executes while holding the PTX load mutex, so a host thread that parses and
-  // assembles the PTX of another kernel (per-kernel pieces, a module image, a late library) waits
-  // until this kernel ends. Assembly appends to the process-wide PC table (s_g_pc_to_insn, a
-  // std::vector) and g_pc_to_finfo that execution reads; a concurrent append reallocated the
-  // table under the executing warp (segfault in core_t::getExecuteWarp). Lazy loads made by this
-  // thread (function bodies in call_impl) take the recursive mutex again.
-  std::lock_guard<std::recursive_mutex> yasai_exec_lock(yasai_func::ptx_load_mutex());
 
   // using a shader core object for book keeping, it is not needed but as most
   // function built for performance simulation need it we use it here
