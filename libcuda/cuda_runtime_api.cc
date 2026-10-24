@@ -6799,20 +6799,65 @@ kernel_info_t *cuda_runtime_api::gpgpu_cuda_ptx_sim_init_grid(
  *******************************************************************************/
 //***extra api for pytorch***
 
+// yasai: name of a driver API result code, or NULL for a code outside the table.
+//   error: result code
+static const char *yasai_cu_error_name(CUresult error) {
+  switch (error) {
+#define YASAI_CU_ERR(e) \
+  case e:               \
+    return #e;
+    YASAI_CU_ERR(CUDA_SUCCESS)
+    YASAI_CU_ERR(CUDA_ERROR_INVALID_VALUE)
+    YASAI_CU_ERR(CUDA_ERROR_OUT_OF_MEMORY)
+    YASAI_CU_ERR(CUDA_ERROR_NOT_INITIALIZED)
+    YASAI_CU_ERR(CUDA_ERROR_DEINITIALIZED)
+    YASAI_CU_ERR(CUDA_ERROR_NO_DEVICE)
+    YASAI_CU_ERR(CUDA_ERROR_INVALID_DEVICE)
+    YASAI_CU_ERR(CUDA_ERROR_INVALID_IMAGE)
+    YASAI_CU_ERR(CUDA_ERROR_INVALID_CONTEXT)
+    YASAI_CU_ERR(CUDA_ERROR_NO_BINARY_FOR_GPU)
+    YASAI_CU_ERR(CUDA_ERROR_INVALID_PTX)
+    YASAI_CU_ERR(CUDA_ERROR_INVALID_SOURCE)
+    YASAI_CU_ERR(CUDA_ERROR_FILE_NOT_FOUND)
+    YASAI_CU_ERR(CUDA_ERROR_INVALID_HANDLE)
+    YASAI_CU_ERR(CUDA_ERROR_NOT_FOUND)
+    YASAI_CU_ERR(CUDA_ERROR_NOT_READY)
+    YASAI_CU_ERR(CUDA_ERROR_ILLEGAL_ADDRESS)
+    YASAI_CU_ERR(CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES)
+    YASAI_CU_ERR(CUDA_ERROR_LAUNCH_FAILED)
+    YASAI_CU_ERR(CUDA_ERROR_NOT_PERMITTED)
+    YASAI_CU_ERR(CUDA_ERROR_NOT_SUPPORTED)
+    YASAI_CU_ERR(CUDA_ERROR_UNKNOWN)
+#undef YASAI_CU_ERR
+    default:
+      return NULL;
+  }
+}
+
+// yasai: the name of the result code (CUDA_ERROR_...), also as its description; callers such
+// as Transformer Engine format the returned string, so it is always set. A code outside the
+// table gives CUDA_ERROR_INVALID_VALUE and "unknown error".
+//   error: result code; pStr: receives the string
 CUresult CUDAAPI cuGetErrorString(CUresult error, const char **pStr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  if (pStr == NULL) return CUDA_ERROR_INVALID_VALUE;
+  const char *name = yasai_cu_error_name(error);
+  *pStr = name ? name : "unknown error";
+  return name ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 
+// yasai: the name of the result code (CUDA_ERROR_...).
+//   error: result code; pStr: receives the name
 CUresult CUDAAPI cuGetErrorName(CUresult error, const char **pStr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  if (pStr == NULL) return CUDA_ERROR_INVALID_VALUE;
+  const char *name = yasai_cu_error_name(error);
+  *pStr = name ? name : "CUDA_ERROR_UNKNOWN";
+  return name ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 
 CUresult CUDAAPI cuInit(unsigned int Flags) {
