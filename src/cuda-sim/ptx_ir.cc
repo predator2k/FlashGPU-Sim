@@ -604,8 +604,9 @@ void function_info::connect_basic_blocks()  // iterate across m_basic_blocks of
     // around it to the exit block, so the warp would not reconverge after an assert check
     // (FlashMLA's decode kernels then compute wrong results).
     const unsigned trap_next = pI->get_m_instr_mem_index() + pI->inst_size();
-    // yasai: labels after the trap (Triton's "$L__tmp19:" and "$L__func_end0:") occupy an
-    // instruction slot that belongs to no basic block, so "no block follows" is the test.
+    // yasai: "no block follows" is the test: the slot after the trap is empty at the end of the
+    // function (labels such as Triton's "$L__func_end0:" take no slot), and a filled slot always
+    // belongs to a basic block.
     const bool trap_at_end =
         pI->get_opcode() == TRAP_OP && !pI->has_pred() &&
         !(trap_next < m_instr_mem_size && m_instr_mem[trap_next] &&
