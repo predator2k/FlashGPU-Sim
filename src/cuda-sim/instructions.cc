@@ -2031,9 +2031,30 @@ void tcgen05_fence_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   flash_gpgpu_sim::handle_tcgen05_fence_inst(pI, thread);
 }
 
+// yasai: writes the pending cp.async copies of thread to shared memory, oldest first: every
+// committed group except the keep_groups most recent ones and, when keep_groups is 0 and
+// all_open is set, the copies not committed yet (cp.async.wait_all, cp.async.mbarrier.arrive and
+// thread exit complete every prior cp.async of the thread).
+void yasai_cp_async_complete(ptx_thread_info *thread, const ptx_instruction *pI,
+                             size_t keep_groups, bool all_open) {
+  memory_space *smem = thread->m_shared_mem;
+  while (thread->m_cp_async_committed.size() > keep_groups) {
+    for (const auto &c : thread->m_cp_async_committed.front())
+      smem->write(c.smem_addr, c.size, c.data, thread, pI);
+    thread->m_cp_async_committed.pop_front();
+  }
+  if (keep_groups == 0 && all_open) {
+    for (const auto &c : thread->m_cp_async_open)
+      smem->write(c.smem_addr, c.size, c.data, thread, pI);
+    thread->m_cp_async_open.clear();
+  }
+}
+
 void cp_async_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   const int opcode = pI->get_opcode();
   if (opcode == CP_ASYNC_MBARRIER_ARRIVE_OP) {
+    // yasai: the arrive is triggered once all prior cp.async of the thread are complete.
+    yasai_cp_async_complete(thread, pI, 0, true);
     assert(pI->get_num_operands() == 1);
     assert(pI->membar_level() == CTA_OPTION);
     assert(pI->get_type() == B64_TYPE);
@@ -2051,10 +2072,28 @@ void cp_async_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     return;
   }
 
-  if (opcode == CP_ASYNC_COMMIT_OP || opcode == CP_ASYNC_WAIT_OP) return;
-
+  // yasai: commit_group closes the open copies into a group (an empty group too);
+  // wait_group N completes all but the N most recent groups; wait_all is commit plus wait 0.
+  bool commit = opcode == CP_ASYNC_COMMIT_OP, wait_group = false;
   for (int opt : pI->get_options()) {
-    if (opt == COMMIT_GROUP_OPTION || opt == WAIT_GROUP_OPTION) return;
+    if (opt == COMMIT_GROUP_OPTION) commit = true;
+    if (opt == WAIT_GROUP_OPTION) wait_group = true;
+  }
+  if (commit) {
+    thread->m_cp_async_committed.push_back(std::move(thread->m_cp_async_open));
+    thread->m_cp_async_open.clear();
+    return;
+  }
+  if (opcode == CP_ASYNC_WAIT_OP) {
+    yasai_cp_async_complete(thread, pI, 0, true);
+    return;
+  }
+  if (wait_group) {
+    size_t keep = 0;
+    if (pI->get_num_operands() > 0 && pI->operand_lookup(0).is_literal())
+      keep = (size_t)pI->operand_lookup(0).get_literal_value().u64;
+    yasai_cp_async_complete(thread, pI, keep, false);
+    return;
   }
 
   const operand_info &dst = pI->dst();
@@ -2108,7 +2147,14 @@ void cp_async_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
   unsigned char buf[16] = {0};
   if (source_bytes > 0) gmem->read(gmem_addr, source_bytes, buf);
-  smem->write(smem_addr, cp_size, buf, thread, pI);
+  // yasai: the shared-memory write waits for the completion of the copy (see
+  // ptx_thread_info::m_cp_async_open).
+  (void)smem;
+  ptx_thread_info::yasai_cp_async_copy copy;
+  copy.smem_addr = smem_addr;
+  copy.size = cp_size;
+  memcpy(copy.data, buf, sizeof copy.data);
+  thread->m_cp_async_open.push_back(copy);
   // yasai: YASAI_CPASYNC_DEBUG=<n> prints the first n cp.async copies.
   static const long cp_debug = getenv("YASAI_CPASYNC_DEBUG") ? atol(getenv("YASAI_CPASYNC_DEBUG")) : 0;
   static long cp_printed = 0;
@@ -4219,6 +4265,7 @@ void ex2_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 }
 
 void exit_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  yasai_cp_async_complete(thread, pI, 0, true);  // yasai: copies still land after an exit
   thread->set_done();
   thread->exitCore();
   thread->registerExit();
@@ -6041,6 +6088,7 @@ void rem_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 void ret_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   bool empty = thread->callstack_pop();
   if (empty) {
+    yasai_cp_async_complete(thread, pI, 0, true);  // yasai: copies still land after the return
     thread->set_done();
     thread->exitCore();
     thread->registerExit();
