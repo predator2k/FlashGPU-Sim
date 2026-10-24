@@ -75,8 +75,10 @@ class gpgpu_context {
                                                          unsigned source_num);
   class symbol_table *gpgpu_ptx_sim_load_ptx_from_filename(
       const char *filename);
+  // yasai: compile_only runs ptxas with --compile-only (a piece that declares functions it does
+  // not define, see the lazy function bodies of cuda_runtime_api.cc).
   void gpgpu_ptx_info_load_from_filename(const char *filename,
-                                         const char *arch_str);
+                                         const char *arch_str, bool compile_only = false);
   void gpgpu_ptxinfo_load_from_string(const char *p_for_info,
                                       unsigned source_num,
                                       unsigned sm_version = 20,

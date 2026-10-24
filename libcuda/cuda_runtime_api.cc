@@ -4617,7 +4617,7 @@ bool yasai_lazy_enabled() {
   return e == NULL || atoi(e) != 0;
 }
 
-// Name declared by a file-scope PTX line (".entry", ".global" or ".const" definition), or "".
+// Name declared by a file-scope PTX line (".entry", ".func", ".global" or ".const"), or "".
 std::string yasai_ptx_decl_name(const std::string &line) {
   size_t p = 0;
   auto word = [&](const char *w) {
@@ -4632,6 +4632,19 @@ std::string yasai_ptx_decl_name(const std::string &line) {
   if (line.empty() || line[0] != '.') return "";
   if (word(".extern")) return "";
   word(".visible") || word(".weak");
+  // yasai: a .func (definition or forward declaration), so that a function body can be parsed
+  // lazily at its first call (per-kernel mode): the name follows the optional return list.
+  if (word(".func")) {
+    if (p < line.size() && line[p] == '(') {
+      const size_t c = line.find(')', p);
+      if (c == std::string::npos) return "";
+      p = c + 1;
+      while (p < line.size() && isspace((unsigned char)line[p])) ++p;
+    }
+    size_t e = p;
+    while (e < line.size() && (isalnum((unsigned char)line[e]) || line[e] == '_' || line[e] == '$')) ++e;
+    return line.substr(p, e - p);
+  }
   const bool entry = word(".entry");
   if (!entry && !(word(".global") || word(".const"))) return "";
   if (entry) {
@@ -4861,6 +4874,139 @@ void yasai_ptx_called(const std::string &t, size_t b, size_t e,
 // Total bytes of PTX parsed by the per-kernel loader (printed with each piece).
 size_t g_yasai_piece_bytes = 0;
 
+// True when per-kernel loading also defers function bodies to their first call
+// (YASAI_PTX_LAZY_FUNC unset or nonzero). Otherwise a kernel's piece holds every function it
+// reaches, through calls and through the function pointers of the file's initializers.
+bool yasai_lazy_func_enabled() {
+  const char *e = getenv("YASAI_PTX_LAZY_FUNC");
+  return e == NULL || atoi(e) != 0;
+}
+
+// Header of a .func definition item: its text up to the body's opening brace, as a
+// declaration ending in a semicolon.
+//   t: PTX text; it: a YASAI_PTX_FUNC_DEF item
+std::string yasai_ptx_func_proto(const std::string &t, const yasai_ptx_item_t &it) {
+  size_t p = it.begin;
+  while (p < it.end) {
+    if (t.compare(p, 2, "//") == 0 || t.compare(p, 2, "/*") == 0) {
+      const size_t q = yasai_ptx_skip_space(t, p);
+      p = q > p ? q : p + 1;
+    } else if (t[p] == '{') {
+      break;
+    } else {
+      ++p;
+    }
+  }
+  size_t e = p;
+  while (e > it.begin && isspace((unsigned char)t[e - 1])) --e;
+  return t.substr(it.begin, e - it.begin) + "\n;";
+}
+
+// The same declaration with external linkage (".extern .func ..."), for ptxas: a kernel's
+// self-contained copy then names every function of the file without defining it, which
+// ptxas accepts with --compile-only.
+//   proto: a .func declaration (with or without linkage words), ending in a semicolon
+std::string yasai_ptx_extern_proto(const std::string &proto) {
+  size_t f = proto.find(".func");
+  if (f == std::string::npos) return proto;
+  return ".extern " + proto.substr(f);
+}
+
+// Per-kernel loading with lazy function bodies (YASAI_PTX_LAZY_FUNC, default on). Function
+// bodies are parsed only when a call first reaches them (call_impl asks for the callee by name,
+// for direct calls and for indirect calls through function tables such as NCCL's
+// ncclDevFuncTable alike), so a kernel that can reach every function of a large module (NCCL's
+// ncclDevKernel_Generic) parses only the functions it runs. The pieces are:
+//   * the file's first piece: the header directives, every file-scope variable and directive,
+//     a declaration of every function of the file (its forward declaration, or the header of
+//     its definition), and the requested kernel's .entry when name is a kernel;
+//   * a later kernel: the header directives and its .entry;
+//   * a function: the header directives and its definition.
+// ptxas runs once per kernel on the header, the variables, the kernel and an external
+// declaration of every function (--compile-only), so it reports the kernel's own resource use.
+// Returns true when something was parsed.
+//   ctx: simulator context; L: index of the fat binary; i: file index; name: kernel, function or
+//   variable
+bool yasai_lazy_load_piece_lazyfunc(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i,
+                                    const char *name) {
+  const std::string target = name;
+  if (L.funcs_loaded[i].count(target)) return false;
+  std::ifstream in(L.files[i]);
+  std::stringstream ss;
+  ss << in.rdbuf();
+  const std::string t = ss.str();
+  const std::vector<yasai_ptx_item_t> items = yasai_ptx_split(t);
+  int entry_item = -1, func_item = -1;
+  for (int k = 0; k < (int)items.size(); ++k) {
+    if (items[k].kind == YASAI_PTX_ENTRY && items[k].name == target) entry_item = k;
+    if (items[k].kind == YASAI_PTX_FUNC_DEF && items[k].name == target) func_item = k;
+  }
+  if (entry_item < 0 && func_item < 0 && L.vars_loaded[i]) return false;  // variable, parsed
+  const bool first = !L.vars_loaded[i];
+  std::string parse_text, ptxas_text;
+  for (int k = 0; k < (int)items.size(); ++k) {
+    const yasai_ptx_item_t &it = items[k];
+    std::string part, ptxas_part;
+    switch (it.kind) {
+      case YASAI_PTX_HEADER:
+        part = ptxas_part = t.substr(it.begin, it.end - it.begin);
+        break;
+      case YASAI_PTX_DEBUG:
+        break;
+      case YASAI_PTX_OTHER:
+        ptxas_part = t.substr(it.begin, it.end - it.begin);
+        if (first) part = ptxas_part;
+        break;
+      case YASAI_PTX_FUNC_DECL: {
+        const std::string d = t.substr(it.begin, it.end - it.begin);
+        ptxas_part = yasai_ptx_extern_proto(d);
+        if (first) part = d;
+        break;
+      }
+      case YASAI_PTX_FUNC_DEF: {
+        const std::string d = yasai_ptx_func_proto(t, it);
+        ptxas_part = yasai_ptx_extern_proto(d);
+        if (k == func_item) part = t.substr(it.begin, it.end - it.begin);
+        else if (first) part = d;
+        break;
+      }
+      case YASAI_PTX_ENTRY:
+        if (k == entry_item) part = ptxas_part = t.substr(it.begin, it.end - it.begin);
+        break;
+    }
+    if (!part.empty()) parse_text.append(part).push_back('\n');
+    if (!ptxas_part.empty()) ptxas_text.append(ptxas_part).push_back('\n');
+  }
+  const int piece = L.pieces[i]++;
+  const std::string parse_file = L.files[i] + ".k" + std::to_string(piece) + ".ptx";
+  {
+    std::ofstream out(parse_file);
+    out << parse_text;
+  }
+  g_yasai_piece_bytes += parse_text.size();
+  printf("GPGPU-Sim PTX: parsing %s %s of %s (piece %d: %zu of %zu bytes; %zu bytes parsed in "
+         "pieces so far)\n",
+         entry_item >= 0 ? "kernel" : (func_item >= 0 ? "function" : "the variables of"),
+         entry_item >= 0 || func_item >= 0 ? target.c_str() : "", L.files[i].c_str(), piece,
+         parse_text.size(), t.size(), g_yasai_piece_bytes);
+  CUctx_st *context = GPGPUSim_Context(ctx);
+  symbol_table *symtab = ctx->gpgpu_ptx_sim_load_ptx_from_filename(parse_file.c_str());
+  context->add_binary(symtab, L.handle);
+  ctx->api->load_static_globals(symtab, STATIC_ALLOC_LIMIT, context->get_device()->get_gpgpu());
+  ctx->api->load_constants(symtab, STATIC_ALLOC_LIMIT, context->get_device()->get_gpgpu());
+  L.vars_loaded[i] = true;
+  if (entry_item >= 0 || func_item >= 0) L.funcs_loaded[i].insert(target);
+  if (entry_item >= 0) {
+    const std::string ptxas_file = L.files[i] + ".k" + std::to_string(piece) + ".full.ptx";
+    {
+      std::ofstream out(ptxas_file);
+      out << ptxas_text;
+    }
+    ctx->gpgpu_ptx_info_load_from_filename(ptxas_file.c_str(), L.archs[i].c_str(), true);
+  }
+  return true;
+}
+
 // Per-kernel loading: parses from file i of L only what name needs. For a kernel that is the
 // .entry, the .func definitions it reaches (directly, or through the function pointers in the
 // file's variable initializers), and, in the file's first piece, the file-scope variables and
@@ -4871,6 +5017,7 @@ size_t g_yasai_piece_bytes = 0;
 // resource usage is the kernel's. Returns true when something was parsed.
 //   ctx: simulator context; L: index of the fat binary; i: file index; name: kernel or variable
 bool yasai_lazy_load_piece(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i, const char *name) {
+  if (yasai_lazy_func_enabled()) return yasai_lazy_load_piece_lazyfunc(ctx, L, i, name);
   std::string target = name;
   if (L.funcs_loaded[i].count(target)) return false;
   std::ifstream in(L.files[i]);
@@ -5210,7 +5357,12 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
   }
 
   // yasai: lazy loading (see yasai_lazy_ptx_t): index the files and parse none of them now.
-  if (!use_selected_ptx_override && selected_files.size() > 1 && yasai_lazy_enabled()) {
+  // yasai: a single selected file is indexed too when it is a YASAI_PTX_LIB_OVERRIDE file (NCCL's
+  // merged rdc module), whose whole-file parse would take tens of GB.
+  const bool single_override =
+      selected_files.size() == 1 && yasai_override_arch().count(selected_files[0]) > 0;
+  if (!use_selected_ptx_override && (selected_files.size() > 1 || single_override) &&
+      yasai_lazy_enabled()) {
     yasai_lazy_ptx_t L;
     L.handle = handle;
     for (auto &f : selected_files) {
