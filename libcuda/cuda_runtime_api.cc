@@ -5191,7 +5191,7 @@ enum yasai_ptx_item_kind_t {
   YASAI_PTX_ENTRY,      // .entry definition with a body
   YASAI_PTX_FUNC_DEF,   // .func definition with a body
   YASAI_PTX_FUNC_DECL,  // .func prototype, including .extern .func
-  YASAI_PTX_DEBUG,      // .section of debug information: never parsed
+  YASAI_PTX_DEBUG,      // .section of debug information: never parsed, given to ptxas
   YASAI_PTX_OTHER       // file-scope variable or other directive: in the first piece only
 };
 
@@ -5463,6 +5463,9 @@ bool yasai_lazy_load_piece_lazyfunc(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int
         part = ptxas_part = t.substr(it.begin, it.end - it.begin);
         break;
       case YASAI_PTX_DEBUG:
+        // ptxas only: line information (.loc ... function_name $L__info_stringN) refers to
+        // labels of the .debug_str section, which ptxas rejects as unresolved without it
+        ptxas_part = t.substr(it.begin, it.end - it.begin);
         break;
       case YASAI_PTX_OTHER:
         ptxas_part = t.substr(it.begin, it.end - it.begin);
@@ -5567,6 +5570,7 @@ bool yasai_lazy_load_piece(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i, const
         to_ptxas = to_parse = true;
         break;
       case YASAI_PTX_DEBUG:
+        to_ptxas = true;  // ptxas only: .loc function_name labels live in .debug_str
         break;
       case YASAI_PTX_OTHER:
         to_ptxas = true;
