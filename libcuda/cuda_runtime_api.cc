@@ -10153,6 +10153,55 @@ extern "C" cudaError_t CUDARTAPI cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                                                                 blockSize, dynamicSMemSize, 0);
 }
 
+// yasai: cudaOccupancyMaxActiveClusters: clusters of the launch's cluster shape that fit at once,
+// from the per-SM occupancy of the kernel at the launch's block size and dynamic shared memory,
+// times the SM count, divided by the cluster size. The real API also accounts for how clusters
+// map to GPCs; the simulator's configuration has no GPC limit on cluster placement.
+// Transformer Engine imports it.
+//   numClusters: receives the count; func: kernel host stub; launchConfig: grid, block, dynamic
+//   shared memory and attributes (cudaLaunchAttributeClusterDimension gives the cluster shape)
+extern "C" cudaError_t CUDARTAPI cudaOccupancyMaxActiveClusters(int *numClusters, const void *func,
+                                                               const cudaLaunchConfig_t *launchConfig) {
+  if (g_debug_execution >= 3) {
+    announce_call(__my_func__);
+  }
+  if (numClusters == NULL || func == NULL || launchConfig == NULL)
+    return g_last_cudaError = cudaErrorInvalidValue;
+  unsigned cluster = 1;
+  for (unsigned i = 0; i < launchConfig->numAttrs; ++i)
+    if (launchConfig->attrs[i].id == cudaLaunchAttributeClusterDimension)
+      cluster = launchConfig->attrs[i].val.clusterDim.x * launchConfig->attrs[i].val.clusterDim.y *
+                launchConfig->attrs[i].val.clusterDim.z;
+  if (cluster == 0) return g_last_cudaError = cudaErrorInvalidValue;
+  const dim3 b = launchConfig->blockDim;
+  int per_sm = 0;
+  const cudaError_t e = cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
+      &per_sm, (const char *)func, (int)(b.x * b.y * b.z), launchConfig->dynamicSmemBytes, 0);
+  if (e != cudaSuccess) return e;
+  const int sms = (int)GPGPUSim_Context(GPGPU_Context())->get_device()->get_gpgpu()->get_config().num_shader();
+  *numClusters = per_sm * sms / (int)cluster;
+  return g_last_cudaError = cudaSuccess;
+}
+
+// yasai: TMA im2col tensor maps are not modeled; the call reports CUDA_ERROR_NOT_SUPPORTED.
+// cuDNN's runtime-compiled engine library imports it (for its im2col convolution kernels), so
+// the symbol must exist for the library to load.
+//   arguments: as in the CUDA driver API
+extern "C" CUresult CUDAAPI cuTensorMapEncodeIm2col(
+    CUtensorMap *tensorMap, CUtensorMapDataType tensorDataType, cuuint32_t tensorRank,
+    void *globalAddress, const cuuint64_t *globalDim, const cuuint64_t *globalStrides,
+    const int *pixelBoxLowerCorner, const int *pixelBoxUpperCorner, cuuint32_t channelsPerPixel,
+    cuuint32_t pixelsPerColumn, const cuuint32_t *elementStrides, CUtensorMapInterleave interleave,
+    CUtensorMapSwizzle swizzle, CUtensorMapL2promotion l2Promotion,
+    CUtensorMapFloatOOBfill oobFill) {
+  (void)tensorMap; (void)tensorDataType; (void)tensorRank; (void)globalAddress; (void)globalDim;
+  (void)globalStrides; (void)pixelBoxLowerCorner; (void)pixelBoxUpperCorner;
+  (void)channelsPerPixel; (void)pixelsPerColumn; (void)elementStrides; (void)interleave;
+  (void)swizzle; (void)l2Promotion; (void)oobFill;
+  printf("GPGPU-Sim PTX: cuTensorMapEncodeIm2col is not supported (im2col TMA is not modeled)\n");
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+
 // ---- yasai: CUDA graphs: stream capture records operations, a graph launch replays them -----
 // Capture: while a stream is being captured, every kernel launch, cudaMemcpyAsync,
 // cudaMemsetAsync, cudaLaunchHostFunc and cudaEventRecord issued to it becomes a node of the
