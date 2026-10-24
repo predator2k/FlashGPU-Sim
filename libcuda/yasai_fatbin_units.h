@@ -12,6 +12,7 @@
 #define YASAI_FATBIN_UNITS_H_INCLUDED
 
 #include <string>
+#include <vector>
 
 namespace yasai_fatbin {
 
@@ -36,6 +37,21 @@ std::string unit_of_ptx_file(const std::string &ptx_file, const std::string &elf
 /// @param fat_cubin The fat binary wrapper of the registration.
 /// @return The unit, or "" when it cannot be located.
 std::string unit_of_fatbin(const void *fat_cubin);
+
+/// Settles the PTX files that `cuobjdump -xptx all` extracted from the ELF files into dir.
+/// cuobjdump names a file after its source file, so files of two translation units compiled
+/// from sources of one name (or of two libraries) overwrite each other: every name listed more
+/// than once is extracted again from its own fat binary and stored as
+/// "<library key>.<number>.<arch>.ptx". Every listed file is recorded with its (ELF file,
+/// cuobjdump number), which unit_of_ptx_file then uses.
+/// @param elf_paths ELF files, in extraction order.
+/// @param names For each ELF file, the PTX file names of `cuobjdump -lptx`, in its order.
+/// @param dir Directory the files were extracted into.
+/// @param run Shell command runner (returns the exit status).
+/// @return For each ELF file, its file names after renaming, in listing order.
+std::vector<std::vector<std::string>> settle_listing(
+    const std::vector<std::string> &elf_paths, const std::vector<std::vector<std::string>> &names,
+    const std::string &dir, int (*run)(const char *));
 
 /// Records an ELF file whose extracted PTX files unit_of_ptx_file may be asked about (the
 /// PYTORCH_BIN libraries, libraries registered after start-up).

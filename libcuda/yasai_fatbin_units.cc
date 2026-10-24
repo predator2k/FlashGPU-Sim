@@ -1,7 +1,9 @@
 // yasai: translation units of a library's fat binaries (see yasai_fatbin_units.h).
 #include "yasai_fatbin_units.h"
 
+#include <dirent.h>
 #include <dlfcn.h>
+#include <sys/stat.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -29,6 +31,8 @@ struct blob_t {
   uint64_t vaddr = 0;       ///< virtual address of its header (as linked)
   unsigned first_ptx = 0;   ///< cuobjdump number of its first PTX entry
   unsigned n_ptx = 0;       ///< number of its PTX entries
+  uint64_t file_off = 0;    ///< file offset of its header
+  uint64_t bytes = 0;       ///< header plus payload size
 };
 
 /// The fat binaries of one ELF file.
@@ -43,6 +47,8 @@ struct state_t {
   std::mutex mu;                                 ///< guards the maps
   std::map<std::string, elf_info_t> elf;         ///< ELF path -> its fat binaries
   std::set<std::string> noted;                   ///< ELF files noted with note_elf
+  std::map<std::string, std::pair<std::string, unsigned>> listed;  ///< extracted PTX file
+                                                 ///< (canonical path) -> (ELF file, number)
 };
 
 /// The process-wide state.
@@ -117,6 +123,8 @@ elf_info_t read_elf(const std::string &path) {
       blob_t b;
       b.vaddr = addr + p;
       b.first_ptx = next_ptx;
+      b.file_off = off + p;
+      b.bytes = hsz + fsz;
       size_t e = p + hsz;
       const size_t end = p + hsz + fsz;
       while (e + 16 <= end && end <= d.size()) {
@@ -180,6 +188,19 @@ std::string unit_of_ptx_number(const std::string &elf_path, unsigned ptx_number)
 }
 
 std::string unit_of_ptx_file(const std::string &ptx_file, const std::string &elf_path) {
+  {
+    std::pair<std::string, unsigned> where;
+    bool found = false;
+    {
+      std::lock_guard<std::mutex> lock(st().mu);
+      auto it = st().listed.find(canonical(ptx_file));
+      if (it != st().listed.end()) {
+        where = it->second;
+        found = true;
+      }
+    }
+    if (found) return unit_of_ptx_number(where.first, where.second);
+  }
   // "<name>.<n>.sm_XX.ptx": the number is the dot-separated field before ".sm_"
   const std::string base = base_name(ptx_file);
   const size_t sm = base.rfind(".sm_");
@@ -237,6 +258,67 @@ void note_elf(const std::string &elf_path) {
   const std::string path = canonical(elf_path);
   std::lock_guard<std::mutex> lock(st().mu);
   st().noted.insert(path);
+}
+
+std::vector<std::vector<std::string>> settle_listing(
+    const std::vector<std::string> &elf_paths, const std::vector<std::vector<std::string>> &names,
+    const std::string &dir, int (*run)(const char *)) {
+  std::map<std::string, int> count;  // listed name -> times listed in dir
+  for (const auto &v : names)
+    for (const std::string &n : v) ++count[n];
+  std::vector<std::vector<std::string>> out = names;
+  const std::string split_dir = dir + "/yasai_fatbin_split";
+  for (size_t e = 0; e < elf_paths.size() && e < names.size(); ++e) {
+    const std::string elf = canonical(elf_paths[e]);
+    elf_info_t info;
+    {
+      std::lock_guard<std::mutex> lock(st().mu);
+      info = elf_locked(elf);
+    }
+    const std::string key = yasai_scope::library_unit(elf);
+    std::map<size_t, std::string> blob_dir;  // fat binary number -> its extraction directory
+    for (size_t i = 0; i < names[e].size(); ++i) {
+      const unsigned number = unsigned(i + 1);
+      const std::string &name = names[e][i];
+      if (count[name] > 1 && info.ok) {
+        // The name was overwritten by another listed file: extract this entry from its own
+        // fat binary and store it under a unique numbered name.
+        size_t k = info.blobs.size();
+        for (size_t b = 0; b < info.blobs.size(); ++b)
+          if (number >= info.blobs[b].first_ptx &&
+              number < info.blobs[b].first_ptx + info.blobs[b].n_ptx)
+            k = b;
+        const size_t sm = name.rfind(".sm_");
+        if (k < info.blobs.size() && sm != std::string::npos) {
+          if (!blob_dir.count(k)) {
+            const std::string bd = split_dir + "/" + key + "." + std::to_string(k);
+            mkdir(split_dir.c_str(), 0755);
+            mkdir(bd.c_str(), 0755);
+            std::vector<char> bytes(info.blobs[k].bytes);
+            std::ifstream in(elf, std::ios::binary);
+            in.seekg(std::streamoff(info.blobs[k].file_off));
+            in.read(bytes.data(), std::streamsize(bytes.size()));
+            const std::string fb = bd + "/blob.fatbin";
+            std::ofstream(fb, std::ios::binary).write(bytes.data(), std::streamsize(bytes.size()));
+            const std::string cmd = "cd '" + bd +
+                                    "' && $CUDA_INSTALL_PATH/bin/cuobjdump -xptx all blob.fatbin "
+                                    "> /dev/null 2>&1";
+            run(cmd.c_str());
+            blob_dir[k] = bd;
+          }
+          const std::string renamed = key + "." + std::to_string(number) + name.substr(sm);
+          if (rename((blob_dir[k] + "/" + name).c_str(), (dir + "/" + renamed).c_str()) == 0) {
+            printf("GPGPU-Sim PTX: %s is listed %d times; entry %u of %s is %s\n", name.c_str(),
+                   count[name], number, elf.c_str(), renamed.c_str());
+            out[e][i] = renamed;
+          }
+        }
+      }
+      std::lock_guard<std::mutex> lock(st().mu);
+      st().listed[canonical(dir + "/" + out[e][i])] = std::make_pair(elf, number);
+    }
+  }
+  return out;
 }
 
 }  // namespace yasai_fatbin

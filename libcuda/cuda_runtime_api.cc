@@ -4686,6 +4686,31 @@ void cuda_runtime_api::extract_ptx_files_using_cuobjdump_internal(
           exit(0);
         }
       }
+      // yasai: files are named after their source files, so translation units compiled from
+      // sources of one name overwrite each other; those are extracted again from their own fat
+      // binaries under numbered names, and every file is recorded with its fat binary
+      // (yasai_fatbin_units.h). The list file then names the settled files.
+      std::vector<std::vector<std::string>> names(binaries.size());
+      for (size_t k = 0; k < binaries.size(); ++k) {
+        char one_list[1024];
+        snprintf(one_list, sizeof one_list, "_cuobjdump_list_one_XXXXXX");
+        const int fd1 = mkstemp(one_list);
+        if (fd1 >= 0) close(fd1);
+        snprintf(command, sizeof(command),
+                 "$CUDA_INSTALL_PATH/bin/cuobjdump -lptx %s | cut -d \":\" -f 2 | "
+                 "awk '{$1=$1}1' > %s",
+                 binaries[k].c_str(), one_list);
+        yasai_system(command);
+        std::ifstream one(one_list);
+        for (std::string l; std::getline(one, l);)
+          if (!l.empty()) names[k].push_back(l);
+        unlink(one_list);
+      }
+      const std::vector<std::vector<std::string>> settled =
+          yasai_fatbin::settle_listing(binaries, names, ".", yasai_system);
+      std::ofstream relist(ptx_list_file_name, std::ios::trunc);
+      for (const auto &v : settled)
+        for (const std::string &n : v) relist << n << "\n";
     }
   }
 
