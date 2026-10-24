@@ -30,6 +30,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include "host_window.h"
 #include "cuda-sim.h"
 #include <shared_mutex>
 #include <mutex>
@@ -955,7 +956,10 @@ void gpgpu_t::memcpy_to_gpu(size_t dst_start_addr, const void *src,
         count, (unsigned long long)src, (unsigned long long)dst_start_addr, m_global_mem);
     fflush(stdout);
   }
-  m_global_mem->write(dst_start_addr, count, src, NULL, NULL);
+  {
+    host_window::copy_zero_skip_scope copy;  // yasai: zero-over-zero pieces may be skipped
+    m_global_mem->write(dst_start_addr, count, src, NULL, NULL);
+  }
 
   // Copy into the performance model.
   // extern gpgpu_sim* g_the_gpu;
@@ -990,6 +994,7 @@ void gpgpu_t::memcpy_gpu_to_gpu(size_t dst, size_t src, size_t count) {
            count, (unsigned long long)src, (unsigned long long)dst);
     fflush(stdout);
   }
+  host_window::copy_zero_skip_scope copy;  // yasai: zero-over-zero bytes may be skipped
   for (unsigned n = 0; n < count; n++) {
     unsigned char tmp;
     m_global_mem->read(src + n, 1, &tmp);
@@ -1010,6 +1015,7 @@ void gpgpu_t::gpu_memset(size_t dst_start_addr, int c, size_t count) {
     fflush(stdout);
   }
   unsigned char c_value = (unsigned char)c;
+  host_window::copy_zero_skip_scope copy;  // yasai: zero-over-zero bytes may be skipped
   for (unsigned n = 0; n < count; n++)
     m_global_mem->write(dst_start_addr + n, 1, &c_value, NULL, NULL);
   if (g_debug_execution >= 3) {

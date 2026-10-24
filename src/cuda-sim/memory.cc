@@ -129,7 +129,11 @@ void memory_space_impl<BSIZE>::write(mem_addr_t addr, size_t length,
              thread->get_ctaid().z, pI->get_source());
     printf("\n");
   }
-  if (m_host_window && host_window::try_write(addr, length, data)) return;
+  // yasai: weak st.global, memset and copies may skip zero-over-zero stores (try_write).
+  if (m_host_window &&
+      host_window::try_write(addr, length, data,
+                             pI ? pI->is_weak_store() : host_window::in_copy_zero_skip_scope()))
+    return;
   mem_addr_t index = addr >> m_log2_block_size;
 
   if ((addr + length) <= (index + 1) * BSIZE) {

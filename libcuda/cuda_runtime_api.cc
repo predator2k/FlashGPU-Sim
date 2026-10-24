@@ -4098,6 +4098,12 @@ static void yasai_share_device_range(const void *ptr, size_t bytes) {
 // segment before the registration pins its pages.
 //   addr: first address; bytes: length
 //   returns 0
+// yasai: number of zero-over-zero stores skipped so far (host_window::zero_skipped_count), for
+// the zero_commit and zero_store_order checks.
+extern "C" unsigned long long yasai_devmem_zero_skipped() {
+  return host_window::zero_skipped_count();
+}
+
 extern "C" int yasai_devmem_prepare_pin(const void *addr, size_t bytes) {
   yasai_share_device_range(addr, bytes);
   return 0;

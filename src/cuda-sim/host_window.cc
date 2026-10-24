@@ -123,18 +123,24 @@ void load16(const void *p, void *out) {
 }
 #endif
 
-/// Whether stores of zero over zero are skipped (YASAI_DEVMEM_ZERO_ELIDE, default 1; 0 stores
-/// every byte). A store of the value the memory already holds changes no byte, so skipping it
-/// is exact; it keeps a kernel or a copy that writes zeros into never-written memory (for example
-/// weight post-processing of zero dummy weights) from committing host pages.
-/// @return True unless YASAI_DEVMEM_ZERO_ELIDE=0.
+/// Whether stores of zero over zero may be skipped (see try_write): YASAI_DEVMEM_ZERO_ELIDE is
+/// not 0 and no warp trace is recorded (YASAI_TRACE_DIR unset or empty), so a trace run stores
+/// every byte.
+/// @return True unless YASAI_DEVMEM_ZERO_ELIDE=0 or YASAI_TRACE_DIR is set.
 bool zero_elide() {
   static const bool on = [] {
     const char *v = getenv("YASAI_DEVMEM_ZERO_ELIDE");
-    return !(v && v[0] == '0');
+    const char *t = getenv("YASAI_TRACE_DIR");
+    return !(v && v[0] == '0') && !(t && t[0]);
   }();
   return on;
 }
+
+/// Number of stores skipped by skip_zero_store (see yasai_devmem_zero_skipped).
+std::atomic<uint64_t> g_zero_skipped{0};
+
+/// Depth of copy_zero_skip_scope objects on this thread.
+thread_local int t_copy_scope = 0;
 
 /// Whether every byte of a buffer is zero.
 /// @param p Buffer.
@@ -256,36 +262,52 @@ void read(uint64_t addr, size_t bytes, void *out) {
   memcpy(out, p, bytes);
 }
 
+/// Performs a weak store or a copy into device memory, skipping the parts where both the stored
+/// bytes and the memory are zero (the memory then already holds the value). The caller has
+/// checked that skipping is allowed (see try_write).
+/// @param addr Device (identity-mapped host) address.
+/// @param bytes Length in bytes.
+/// @param in Source buffer.
+static void skip_zero_store(uint64_t addr, size_t bytes, const void *in) {
+  if (bytes <= 16) {
+    unsigned char cur[16];
+    if (all_zero(in, bytes)) {
+      read(addr, bytes, cur);  // never writes (MOVDQA for 16 bytes), so no page is committed
+      if (all_zero(cur, bytes)) {
+        g_zero_skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+    }
+    write(addr, bytes, in);
+    return;
+  }
+  // Long writes (copies, not single atomic operations): page by page.
+  const unsigned char *src = static_cast<const unsigned char *>(in);
+  unsigned char *dst = reinterpret_cast<unsigned char *>(addr);
+  std::atomic_thread_fence(std::memory_order_release);
+  size_t off = 0;
+  while (off < bytes) {
+    size_t n = kElideChunk - ((addr + off) % kElideChunk);
+    if (n > bytes - off) n = bytes - off;
+    if (all_zero(src + off, n) && all_zero(dst + off, n))
+      g_zero_skipped.fetch_add(1, std::memory_order_relaxed);
+    else
+      memcpy(dst + off, src + off, n);
+    off += n;
+  }
+  std::atomic_thread_fence(std::memory_order_release);
+}
+
+copy_zero_skip_scope::copy_zero_skip_scope() { ++t_copy_scope; }
+
+copy_zero_skip_scope::~copy_zero_skip_scope() { --t_copy_scope; }
+
+bool in_copy_zero_skip_scope() { return t_copy_scope > 0; }
+
+uint64_t zero_skipped_count() { return g_zero_skipped.load(std::memory_order_relaxed); }
+
 void write(uint64_t addr, size_t bytes, const void *in) {
   void *p = reinterpret_cast<void *>(addr);
-  if (zero_elide()) {
-    if (bytes <= 16) {
-      // A zero store over zero changes nothing: read the current value without writing.
-      unsigned char cur[16];
-      if (all_zero(in, bytes)) {
-        read(addr, bytes, cur);
-        if (all_zero(cur, bytes)) {
-          std::atomic_thread_fence(std::memory_order_release);
-          return;
-        }
-      }
-    } else {
-      // Long writes (copies, which are not single atomic operations): page by page, skip the
-      // pages where both source and destination are zero.
-      const unsigned char *src = static_cast<const unsigned char *>(in);
-      unsigned char *dst = static_cast<unsigned char *>(p);
-      std::atomic_thread_fence(std::memory_order_release);
-      size_t off = 0;
-      while (off < bytes) {
-        size_t n = kElideChunk - ((addr + off) % kElideChunk);
-        if (n > bytes - off) n = bytes - off;
-        if (!(all_zero(src + off, n) && all_zero(dst + off, n))) memcpy(dst + off, src + off, n);
-        off += n;
-      }
-      std::atomic_thread_fence(std::memory_order_release);
-      return;
-    }
-  }
   if (atomic_size(addr, bytes)) {
     switch (bytes) {
       case 1: { uint8_t v; memcpy(&v, in, 1); __atomic_store_n(static_cast<uint8_t *>(p), v, __ATOMIC_RELEASE); return; }
@@ -321,11 +343,17 @@ bool try_read(uint64_t addr, size_t bytes, void *out) {
   return true;
 }
 
-bool try_write(uint64_t addr, size_t bytes, const void *in) {
+bool try_write(uint64_t addr, size_t bytes, const void *in, bool weak) {
   range_info r;
   if (!lookup(addr, bytes, &r)) return false;
   if (r.kind == range_kind::multicast) {
     if (g_mc_write) g_mc_write(r.mc, r.mc_offset + (addr - r.base), bytes, in);
+    return true;
+  }
+  // yasai: the zero-store skip comes last, after every hook that must see the store (an
+  // unordered FIO window's buffering goes before it), and only for device memory.
+  if (weak && r.kind == range_kind::device && zero_elide()) {
+    skip_zero_store(addr, bytes, in);
     return true;
   }
   write(addr, bytes, in);

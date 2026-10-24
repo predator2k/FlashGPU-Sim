@@ -1317,6 +1317,9 @@ class ptx_instruction : public warp_inst_t {
   bool is_cluster_barrier() const { return m_opcode == BAR_OP && m_yasai_cluster_scope; }
   // yasai: the instruction carries .cluster or .shared::cluster.
   bool has_cluster_scope() const { return m_yasai_cluster_scope; }
+  // yasai: a weak st (no .release, .relaxed, .acq_rel, .sc, .volatile, .mmio or .async), whose
+  // store of zeros over zeros device memory may skip (host_window::try_write).
+  bool is_weak_store() const { return m_yasai_weak_store; }
   // yasai: the packed 16-bit type is bf16x2 (get_type() still answers F16X2_TYPE).
   bool is_bf16x2() const { return m_bf16x2; }
   // yasai: packed small-float format of the instruction (E4M3X2_TYPE, E5M2X2_TYPE, E2M1X2_TYPE,
@@ -1435,6 +1438,7 @@ class ptx_instruction : public warp_inst_t {
   unsigned m_clamp_mode;
   bool m_relu = false;    // yasai: see is_relu()
   bool m_yasai_cluster_scope = false;  // yasai: see has_cluster_scope()
+  bool m_yasai_weak_store = false;     // yasai: see is_weak_store()
   bool m_bf16x2 = false;  // yasai: see is_bf16x2()
   int m_yasai_packed_kind = 0;  // yasai: see packed_minifloat()
   unsigned m_left_mode;

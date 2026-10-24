@@ -97,9 +97,7 @@ void read(uint64_t addr, size_t bytes, void *out);
 
 /// Writes host memory for a kernel store; aligned 1, 2, 4 and 8 byte accesses are single atomic
 /// (release) stores, and a release fence follows every store so earlier stores of the kernel are
-/// visible no later than this one. A store of zeros over memory that already holds zeros is
-/// skipped (page by page for writes longer than 16 bytes), so never-written pages stay
-/// uncommitted; YASAI_DEVMEM_ZERO_ELIDE=0 stores every byte.
+/// visible no later than this one.
 /// @param addr Host address.
 /// @param bytes Length in bytes.
 /// @param in Source buffer.
@@ -114,12 +112,36 @@ void write(uint64_t addr, size_t bytes, const void *in);
 bool try_read(uint64_t addr, size_t bytes, void *out);
 
 /// Serves a store when a registered range holds it (identity ranges through write(), multicast
-/// ranges through the multicast write hook, which stores to every device).
+/// ranges through the multicast write hook, which stores to every device). With `weak` set, a
+/// store into device memory whose bytes and target are both zero is skipped (page by page for
+/// writes longer than 16 bytes): the memory already holds the value, and the never-written pages
+/// of cudaMalloc memory stay uncommitted. Callers set `weak` only for a weak st (no .release,
+/// .relaxed, .volatile or .mmio) and for memset and copies (copy_zero_skip_scope), never for
+/// atomics, reductions or ordered stores. YASAI_DEVMEM_ZERO_ELIDE=0 or YASAI_TRACE_DIR turns the
+/// skip off.
 /// @param addr First address of the access.
 /// @param bytes Length in bytes.
 /// @param in Source buffer.
+/// @param weak The store may be skipped when it stores zeros over zeros.
 /// @return True when the access was served; false when no range holds it.
-bool try_write(uint64_t addr, size_t bytes, const void *in);
+bool try_write(uint64_t addr, size_t bytes, const void *in, bool weak = false);
+
+/// Marks this thread's stores as memset or copy stores while the object lives, so that
+/// memory_space_impl::write passes `weak` to try_write for stores without an instruction.
+struct copy_zero_skip_scope {
+  /// Enters the scope.
+  copy_zero_skip_scope();
+  /// Leaves the scope.
+  ~copy_zero_skip_scope();
+};
+
+/// Whether this thread is inside a copy_zero_skip_scope.
+/// @return True inside the scope.
+bool in_copy_zero_skip_scope();
+
+/// Number of stores (or 4 KiB pieces of long writes) skipped as zero over zero so far.
+/// @return The count.
+uint64_t zero_skipped_count();
 
 /// Atomic compare-and-swap of a naturally aligned 2, 4 or 8 byte word in host memory.
 /// @param addr Host address of the word.

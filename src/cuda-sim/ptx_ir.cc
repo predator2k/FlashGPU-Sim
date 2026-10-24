@@ -1914,6 +1914,22 @@ ptx_instruction::ptx_instruction(
   m_source.erase(std::remove(m_source.begin(), m_source.end(), '\t'),
                  m_source.end());
 
+  // yasai: see is_weak_store(). st.volatile lexes as plain ST_OP, so the qualifiers are taken
+  // from the instruction text as well as from the options.
+  if (opcode == ST_OP) {
+    bool ordered = false;
+    for (int o : options)
+      if (o == RELEASE_OPTION || o == RELAXED_OPTION || o == ACQ_REL_OPTION || o == SC_OPTION)
+        ordered = true;
+    const size_t b = m_source.find("st");
+    const size_t e = m_source.find_first_of(" ", b);
+    const std::string head = b == std::string::npos ? m_source : m_source.substr(b, e - b);
+    for (const char *q : {".release", ".relaxed", ".acq_rel", ".sc", ".volatile", ".mmio",
+                          ".async"})
+      if (head.find(q) != std::string::npos) ordered = true;
+    m_yasai_weak_store = !ordered;
+  }
+
   // yasai: an indirect call (register target) has no static callee to inspect.
   if (opcode == CALL_OP && func_addr().is_function_address()) {
     const operand_info &target = func_addr();
