@@ -439,8 +439,12 @@ void tensor_mma_impl(const ptx_instruction *pI, core_t *core,
 
   const operand_info &dst = pI->operand_lookup(0);
 
-  // yasai: the sparse form (mma.sp, lexed as this opcode) has its own model.
-  if (pI->get_source() && strstr(pI->get_source(), "mma.sp") != NULL) {
+  // yasai: the sparse form (mma.sp, lexed as this opcode, or .sp{::ordered_metadata} after
+  // .kind as nvcc writes the block-scaled sparse mma) has its own model.
+  bool yasai_sparse = pI->get_source() && strstr(pI->get_source(), "mma.sp") != NULL;
+  for (int opt : pI->get_options())
+    if (opt == MMA_SP_OPTION) yasai_sparse = true;
+  if (yasai_sparse) {
     tensor_mma_sp_impl(pI, core, inst, M, N, K, tid);
     return;
   }
