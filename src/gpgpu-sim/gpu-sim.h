@@ -863,6 +863,16 @@ class gpgpu_sim : public gpgpu_t {
   virtual void createSIMTCluster() = 0;
 
  public:
+  // yasai: builds the SIMT core clusters if they were not built yet (see yasai_eager_clusters).
+  void ensure_clusters() {
+    if (m_cluster == NULL) createSIMTCluster();
+  }
+  // yasai: whether the SIMT core clusters exist.
+  bool has_clusters() const { return m_cluster != NULL; }
+
+ protected:
+
+ public:
   unsigned long long gpu_sim_insn;
   unsigned long long gpu_tot_sim_insn;
   unsigned long long gpu_sim_insn_last_update;
@@ -945,7 +955,15 @@ class exec_gpgpu_sim : public gpgpu_sim {
  public:
   exec_gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
       : gpgpu_sim(config, ctx) {
-    createSIMTCluster();
+    // yasai: in functional mode (PTX_SIM_MODE_FUNC=1 when the device is created) no kernel runs
+    // on the timing model, whose SIMT core clusters hold about 3.3 GB per process for the
+    // RTX 5090 configuration (170 SMs); they are then built only at the first timing launch
+    // (gpgpu_sim::launch). YASAI_FUNC_EAGER_CLUSTERS=1 builds them at once as before.
+    const char *func = getenv("PTX_SIM_MODE_FUNC");
+    const char *eager = getenv("YASAI_FUNC_EAGER_CLUSTERS");
+    const bool lazy = func != NULL && atoi(func) == 1 && !(eager != NULL && atoi(eager) != 0);
+    m_cluster = NULL;
+    if (!lazy) createSIMTCluster();
   }
 
   virtual void createSIMTCluster();

@@ -1277,6 +1277,7 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
 /////////////////////////////////////////////////////////////////////////////
 
 void gpgpu_sim::launch(kernel_info_t *kinfo) {
+  ensure_clusters();  // yasai: a timing launch needs the core clusters (built lazily)
   unsigned kernelID = kinfo->get_uid();
   unsigned long long streamID = kinfo->get_streamID();
 
@@ -1750,7 +1751,7 @@ bool gpgpu_sim::active() {
       (gpu_completed_cta >= m_config.gpu_max_completed_cta_opt))
     return false;
   if (m_config.gpu_deadlock_detect && gpu_deadlock) return false;
-  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
+  for (unsigned i = 0; m_cluster && i < m_shader_config->n_simt_clusters; i++)
     if (m_cluster[i]->get_not_completed() > 0) return true;
   ;
   for (unsigned i = 0; i < m_memory_config->m_n_mem; i++)
@@ -1803,7 +1804,7 @@ void gpgpu_sim::init() {
 
   reinit_clock_domains();
   gpgpu_ctx->func_sim->set_param_gpgpu_num_shaders(m_config.num_shader());
-  for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++)
+  for (unsigned i = 0; m_cluster && i < m_shader_config->n_simt_clusters; i++)
     m_cluster[i]->reinit();
   m_shader_stats->new_grid();
   // initialize the control-flow, memory access, memory latency logger
@@ -1855,6 +1856,7 @@ PowerscalingCoefficients *gpgpu_sim::get_scaling_coeffs() {
 }
 
 void gpgpu_sim::print_stats(unsigned long long streamID) {
+  if (!has_clusters()) return;  // yasai: no timing kernel ran (functional mode)
   gpgpu_ctx->stats->ptx_file_line_stats_write_file();
   gpu_print_stat(streamID);
 
@@ -1877,6 +1879,7 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
 }
 
 void gpgpu_sim::deadlock_check() {
+  if (!has_clusters()) return;  // yasai: no timing kernel ran (functional mode)
   if (m_config.gpu_deadlock_detect && gpu_deadlock) {
     fflush(stdout);
     printf(
@@ -2119,7 +2122,7 @@ void gpgpu_sim::set_cache_config(std::string kernel_name) {
 void gpgpu_sim::change_cache_config(FuncCache cache_config) {
   if (cache_config != m_shader_config->m_L1D_config.get_cache_status()) {
     printf("FLUSH L1 Cache at configuration change between kernels\n");
-    for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+    for (unsigned i = 0; m_cluster && i < m_shader_config->n_simt_clusters; i++) {
       m_cluster[i]->cache_invalidate();
     }
   }
@@ -2897,6 +2900,7 @@ unsigned long long g_single_step =
     0;  // set this in gdb to single step the pipeline
 
 void gpgpu_sim::aggregate_cluster_stats() {
+  if (!has_clusters()) return;  // yasai: no timing kernel ran (functional mode)
   m_shader_stats->clear_accumulator();
   for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
     m_cluster[i]->aggregate_stats();
