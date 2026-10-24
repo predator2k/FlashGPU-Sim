@@ -34,6 +34,7 @@
 #include "half.h"
 
 #include <assert.h>
+#include <ctype.h>
 #include "opcodes.h"
 
 #include <list>
@@ -364,7 +365,12 @@ class ptx_version {
     m_sm_version_str = sm_ver;
     check_target_extension(ext);
     check_target_extension(ext2);
-    sscanf(sm_ver, "%u", &m_sm_version);
+    // yasai: the target is "sm_120" (or "sm_120a"); the number follows the "sm_" prefix. A
+    // plain sscanf of the whole string read 0, so every kernel reported architecture 0.
+    const char *digits = sm_ver;
+    while (*digits != '\0' && !isdigit((unsigned char)*digits)) ++digits;
+    m_sm_version = 0;
+    sscanf(digits, "%u", &m_sm_version);
     m_sm_version_valid = true;
   }
   float ver() const {
