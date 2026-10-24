@@ -5724,6 +5724,13 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
       }
     }
 
+    // yasai: with lazy loading the base files are kept, after the suffixed ones: a library
+    // compiled for sm_100 and, for some of its modules only, sm_100a (PyTorch built with
+    // TORCH_CUDA_ARCH_LIST 10.0) has most kernels in the base files, and skipping them left
+    // FillFunctor and the other common kernels without PTX. The lazy index keeps the first
+    // definition of a name, so a kernel present in both comes from the suffixed file.
+    std::vector<std::string> yasai_base_after_suffix;
+    const bool keep_base = has_suffix && yasai_lazy_enabled();
     for (auto &ptx_filename : vf[selected_version]) {
       // Skip base version if suffix version exists
       if (has_suffix) {
@@ -5739,6 +5746,10 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
               break;
             }
           }
+          if (is_base && keep_base) {
+            yasai_base_after_suffix.push_back(ptx_filename);
+            continue;
+          }
           if (is_base) {
             printf("GPGPU-Sim PTX: Skipping %s (suffix version available)\n",
                    ptx_filename.c_str());
@@ -5748,6 +5759,11 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
       }
       selected_files.push_back(ptx_filename);
     }
+    if (!yasai_base_after_suffix.empty())
+      printf("GPGPU-Sim PTX: %zu base-architecture PTX files kept after the suffixed ones\n",
+             yasai_base_after_suffix.size());
+    selected_files.insert(selected_files.end(), yasai_base_after_suffix.begin(),
+                          yasai_base_after_suffix.end());
   }
   for (const auto &ov : lib_override) {
     const std::string &lib = library.first;
