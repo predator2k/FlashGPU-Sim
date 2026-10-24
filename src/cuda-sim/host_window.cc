@@ -1,5 +1,6 @@
 // host_window.cc: see host_window.h.
 #include "host_window.h"
+#include "fio_window.h"
 
 #include <atomic>
 #include <cstdio>
@@ -339,7 +340,12 @@ bool try_read(uint64_t addr, size_t bytes, void *out) {
     else memset(out, 0, bytes);
     return true;
   }
+  // yasai: an unordered FIO window drains its due writes into shared memory before the read, then
+  // overlays this process's own pending writes so the issuing kernel reads them in program order.
+  const bool fio = fio_window::any();
+  if (fio) fio_window::before_load(addr, bytes);
   read(addr, bytes, out);
+  if (fio) fio_window::overlay(addr, bytes, out);
   return true;
 }
 
@@ -350,6 +356,10 @@ bool try_write(uint64_t addr, size_t bytes, const void *in, bool weak) {
     if (g_mc_write) g_mc_write(r.mc, r.mc_offset + (addr - r.base), bytes, in);
     return true;
   }
+  // yasai: a store into an unordered FIO window is buffered (made visible later, out of order),
+  // not written now. It goes before the zero-store skip, so the window model and the FIO transport
+  // record see every store, zeros over zeros included.
+  if (fio_window::any() && fio_window::on_store(addr, bytes, in)) return true;
   // yasai: the zero-store skip comes last, after every hook that must see the store (an
   // unordered FIO window's buffering goes before it), and only for device memory.
   if (weak && r.kind == range_kind::device && zero_elide()) {
