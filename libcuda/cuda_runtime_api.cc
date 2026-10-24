@@ -147,6 +147,7 @@
 #include "builtin_types.h"
 #include "driver_types.h"
 #include "cuda_api.h"
+#include "yasai_dark_api.h"
 #if defined(__has_include)
 #if __has_include("cudaProfiler.h")
 #include "cudaProfiler.h"
@@ -4553,19 +4554,16 @@ typedef int (*ExportedFunction)();
 
 static ExportedFunction exportTable[3] = {&dummy0, &dummy0, &dummy0};
 
+// yasai: the driver's private export tables (yasai_dark_api.cc); the former placeholder returned
+// a three-entry table of dummies for every UUID (exportTable above, no longer used).
 __host__ cudaError_t CUDARTAPI cudaGetExportTable(
     const void **ppExportTable, const cudaUUID_t *pExportTableId) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("cudaGetExportTable: UUID = ");
-  for (int s = 0; s < 16; s++) {
-    printf("%#2x ", (unsigned char)(pExportTableId->bytes[s]));
-  }
-  *ppExportTable = &exportTable;
-
-  printf("\n");
-  return g_last_cudaError = cudaSuccess;
+  const CUresult r = yasai_dark_api::get_export_table(
+      ppExportTable, reinterpret_cast<const CUuuid *>(pExportTableId));
+  return g_last_cudaError = (r == CUDA_SUCCESS ? cudaSuccess : cudaErrorInvalidValue);
 }
 
 #endif
@@ -9526,9 +9524,8 @@ CUresult CUDAAPI cuGetExportTable(const void **ppExportTable,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  cudaError_t e = cudaGetExportTable(ppExportTable, pExportTableId);
-  assert(e == cudaSuccess);
-  return CUDA_SUCCESS;
+  // yasai: an unknown table is an error the runtime handles (it used to assert success).
+  return yasai_dark_api::get_export_table(ppExportTable, pExportTableId);
 }
 
 #if defined(CUDART_VERSION_INTERNAL) || \
