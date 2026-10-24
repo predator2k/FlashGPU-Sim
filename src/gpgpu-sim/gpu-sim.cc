@@ -84,7 +84,6 @@ class gpgpu_sim_wrapper {};
 #include <iostream>
 #include <sstream>
 #include <string>
-#include "../cuda-sim/fio_window.h"
 
 // #define MAX(a, b) (((a) > (b)) ? (a) : (b)) //redefined
 
@@ -1460,9 +1459,6 @@ unsigned gpgpu_sim::finished_kernel() {
 }
 
 void gpgpu_sim::set_kernel_done(kernel_info_t *kernel) {
-  // yasai: a kernel boundary is a FIO window flush point only in kernel-end-flush mode
-  // (YASAI_FIO_WINDOW_KERNEL_FLUSH=1); in the default strict mode this is a no-op.
-  fio_window::on_kernel_end();
   unsigned uid = kernel->get_uid();
   last_uid = uid;
   unsigned long long streamID = kernel->get_streamID();

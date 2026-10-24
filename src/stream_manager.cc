@@ -31,6 +31,7 @@
 #include "cuda-sim/cuda-sim.h"
 #include "gpgpu-sim/gpu-sim.h"
 #include "gpgpusim_entrypoint.h"
+#include "cuda-sim/fio_window.h"
 
 #include <unistd.h>
 #include <condition_variable>
@@ -279,6 +280,7 @@ bool stream_operation::do_operation(gpgpu_sim *gpu) {
         }
         gpu->set_cache_config(m_kernel->name());
         gpu->functional_launch(m_kernel);
+        fio_window::on_kernel_start();  // yasai: the GPU is busy (FIO window idle stepping)
       } else {  // Performance Sim
         if (gpu->can_start_kernel() && m_kernel->m_launch_latency == 0) {
           if (g_debug_execution >= 3) {
@@ -288,6 +290,7 @@ bool stream_operation::do_operation(gpgpu_sim *gpu) {
           }
           gpu->set_cache_config(m_kernel->name());
           gpu->launch(m_kernel);
+          fio_window::on_kernel_start();  // yasai: the GPU is busy (FIO window idle stepping)
         } else {
           if (m_kernel->m_launch_latency) m_kernel->m_launch_latency--;
           if (g_debug_execution >= 3)
@@ -426,6 +429,9 @@ bool stream_manager::register_finished_kernel(unsigned grid_uid) {
       //            printf("kernel %d finishes, retires from stream %d\n",
       //            grid_uid, stream->get_uid()); kernel_stat.flush();
       //            kernel_stat.close();
+      // yasai: a kernel end (FIO window: idle stepping once no kernel runs, or delivery of every
+      // pending write in the kernel-end-flush mode), before the host can see the completion.
+      fio_window::on_kernel_end();
       stream->record_next_done();
       m_grid_id_to_stream.erase(grid_uid);
       kernel->notify_parent_finished();
