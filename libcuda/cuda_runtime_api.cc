@@ -225,6 +225,17 @@ void register_ptx_function(const char *name, function_info *impl) {
 #endif
 #endif
 
+// yasai: simulated device memory size in bytes from YASAI_DEVICE_MEM_MB, or fallback when unset.
+// Device memory is host memory in this simulator; the size is only what queries report
+// (totalGlobalMem, cudaMemGetInfo, cuMemGetInfo, cuDeviceTotalMem), which frameworks use to size
+// their caches (vLLM's KV cache is gpu_memory_utilization times the total).
+//   fallback  the value reported when YASAI_DEVICE_MEM_MB is not set
+static size_t yasai_device_mem_bytes(size_t fallback) {
+  const char *v = getenv("YASAI_DEVICE_MEM_MB");
+  if (v == NULL || *v == '\0') return fallback;
+  return (size_t)strtoull(v, NULL, 0) << 20;
+}
+
 struct _cuda_device_id *gpgpu_context::GPGPUSim_Init() {
   _cuda_device_id *the_device = the_gpgpusim->the_cude_device;
   if (!the_device) {
@@ -235,7 +246,7 @@ struct _cuda_device_id *gpgpu_context::GPGPUSim_Init() {
              g_gpgpusim_version_string);
     prop->major = the_gpu->compute_capability_major();
     prop->minor = the_gpu->compute_capability_minor();
-    prop->totalGlobalMem = 0x80000000 /* 2 GB */;
+    prop->totalGlobalMem = yasai_device_mem_bytes(0x80000000 /* 2 GB */);
     prop->memPitch = 0;
     if (prop->major >= 2) {
       prop->maxThreadsPerBlock = 1024;
@@ -3178,8 +3189,9 @@ __host__ cudaError_t CUDARTAPI cudaMemGetInfo(size_t *free, size_t *total) {
     announce_call(__my_func__);
   }
   // placeholder; should interact with cudaMalloc and cudaFree?
-  *free = 10000000000;
-  *total = 10000000000;
+  // yasai: the size is YASAI_DEVICE_MEM_MB when set; free is reported equal to total.
+  *free = yasai_device_mem_bytes(10000000000);
+  *total = yasai_device_mem_bytes(10000000000);
 
   return g_last_cudaError = cudaSuccess;
 }
@@ -6305,7 +6317,7 @@ CUresult CUDAAPI cuDeviceTotalMem(size_t *bytes, CUdevice dev) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  *bytes = 20000000000;  // dummy value
+  *bytes = yasai_device_mem_bytes(20000000000);  // dummy value unless YASAI_DEVICE_MEM_MB
   return CUDA_SUCCESS;
 }
 #endif /* CUDART_VERSION >= 3020 */
@@ -6786,7 +6798,11 @@ CUresult CUDAAPI cuMemGetInfo(size_t *free, size_t *total) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: as cudaMemGetInfo (Triton and vLLM's driver-API paths query it).
+  size_t f = 0, t = 0;
+  cudaMemGetInfo(&f, &t);
+  if (free) *free = f;
+  if (total) *total = t;
   return CUDA_SUCCESS;
 }
 
