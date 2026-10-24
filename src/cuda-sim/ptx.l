@@ -86,12 +86,12 @@ and	TC; yylval->int_value = AND_OP; return OPCODE;
 andn	TC; yylval->int_value = ANDN_OP; return OPCODE;
 atom	TC; yylval->int_value = ATOM_OP; return OPCODE;
 bar.warp 	TC; yylval->int_value = NOP_OP; return OPCODE;
-	/* yasai: parsed so that NCCL's modules load; nanosleep is a no-op in functional execution
-	   and multimem (NVLS kernels, disabled in fakeenv runs) is never executed. */
+	/* yasai: nanosleep is a no-op in functional execution; multimem.* operate on the memory every
+	   device bound to a multicast object (NVLS, shared_devmem). */
 nanosleep	TC; yylval->int_value = NOP_OP; return OPCODE;
-multimem\.ld_reduce	TC; yylval->int_value = NOP_OP; return OPCODE;
-multimem\.red	TC; yylval->int_value = NOP_OP; return OPCODE;
-multimem\.st	TC; yylval->int_value = NOP_OP; return OPCODE;
+multimem\.ld_reduce	TC; yylval->int_value = MULTIMEM_LD_REDUCE_OP; return OPCODE;
+multimem\.red	TC; yylval->int_value = MULTIMEM_RED_OP; return OPCODE;
+multimem\.st	TC; yylval->int_value = MULTIMEM_ST_OP; return OPCODE;
 bar 	TC; yylval->int_value = BAR_OP; return OPCODE;
 barrier	TC; yylval->int_value = BAR_OP; return OPCODE;
 mbarrier 	TC; yylval->int_value = MBAR_OP; return OPCODE;

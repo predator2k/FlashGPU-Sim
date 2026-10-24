@@ -161,6 +161,7 @@ typedef enum CUoutput_mode_enum {
 #include "../src/abstract_hardware_model.h"
 #include "../src/cuda-sim/cuda-sim.h"
 #include "../src/cuda-sim/host_window.h"
+#include "yasai_vmm.h"
 #include "../src/cuda-sim/ptx_ir.h"
 #include "../src/cuda-sim/ptx_loader.h"
 #include "../src/cuda-sim/ptx_parser.h"
@@ -292,6 +293,18 @@ CUctx_st *GPGPUSim_Context(gpgpu_context *ctx) {
     the_context = ctx->the_gpgpusim->the_context;
   }
   return the_context;
+}
+
+gpgpu_context *GPGPU_Context();
+
+// yasai: defined further down; the driver cuIpc* functions forward to them.
+extern "C" __host__ cudaError_t CUDARTAPI cudaIpcGetEventHandle(cudaIpcEventHandle_t *handle, cudaEvent_t event);
+extern "C" __host__ cudaError_t CUDARTAPI cudaIpcOpenEventHandle(cudaEvent_t *event, cudaIpcEventHandle_t handle);
+extern "C" __host__ cudaError_t CUDARTAPI cudaIpcCloseMemHandle(void *devPtr);
+
+/// yasai: simulated GPU of the current context (used by yasai_vmm.cc).
+gpgpu_t *yasai_current_gpu() {
+  return GPGPUSim_Context(GPGPU_Context())->get_device()->get_gpgpu();
 }
 
 gpgpu_context *GPGPU_Context() {
@@ -1374,7 +1387,10 @@ cudaError_t cudaMallocInternal(void **devPtr, size_t size,
     announce_call(__my_func__);
   }
   CUctx_st *context = GPGPUSim_Context(ctx);
-  *devPtr = context->get_device()->get_gpgpu()->gpu_malloc(size);
+  // yasai: memfd-backed host memory at the device address (yasai_vmm::malloc_device), unless
+  // YASAI_DEVMEM_HOST=0.
+  *devPtr = reinterpret_cast<void *>(
+      yasai_vmm::malloc_device(context->get_device()->get_gpgpu(), size));
   if (g_debug_execution >= 3) {
     printf("GPGPU-Sim PTX: cudaMallocing %zu bytes starting at 0x%llx..\n",
            size, (unsigned long long)*devPtr);
@@ -2338,8 +2354,10 @@ cudaDeviceGetAttributeInternal(int *value, enum cudaDeviceAttr attr, int device,
       case 101:  // cudaDevAttrDirectManagedMemAccessFromHost
         *value = 1;
         break;
-      case 102:  // Unassigned
-      case 103:  // Unassigned
+      case 102:  // yasai: CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED (cuMem*)
+      case 103:  // yasai: CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED
+        *value = 1;
+        break;
       case 104:  // Unassigned
       case 105:  // Unassigned
         *value = 0;
@@ -2397,8 +2415,8 @@ cudaDeviceGetAttributeInternal(int *value, enum cudaDeviceAttr attr, int device,
       case 124:  // cudaDevAttrReserved124
         *value = 0;
         break;
-      case 125:  // cudaDevAttrIpcEventSupport
-        *value = 0;
+      case 125:  // cudaDevAttrIpcEventSupport (yasai: events in shared memory)
+        *value = 1;
         break;
       case 126:  // cudaDevAttrMemSyncDomainCount
         *value = 0;
@@ -2414,8 +2432,9 @@ cudaDeviceGetAttributeInternal(int *value, enum cudaDeviceAttr attr, int device,
       case 131:  // cudaDevAttrNumaId
         *value = 0;
         break;
-      case 132:  // cudaDevAttrReserved132
-        *value = 0;
+      case 132:  // yasai: CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED (shared_devmem multicast);
+                 // YASAI_MULTICAST=0 turns it off
+        *value = (getenv("YASAI_MULTICAST") && atoi(getenv("YASAI_MULTICAST")) == 0) ? 0 : 1;
         break;
       case 133:  // cudaDevAttrMpsEnabled
         *value = 0;
@@ -3018,7 +3037,8 @@ __host__ cudaError_t CUDARTAPI cudaFree(void *devPtr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  // TODO...  manage g_global_mem space?
+  // yasai: unmaps the allocation's segment (device addresses are not reused).
+  yasai_vmm::free_device(reinterpret_cast<uint64_t>(devPtr));
   return g_last_cudaError = cudaSuccess;
 }
 __host__ cudaError_t CUDARTAPI cudaFreeHost(void *ptr) {
@@ -3512,13 +3532,18 @@ __host__ cudaError_t CUDARTAPI cudaUserObjectRelease(cudaUserObject_t, unsigned 
   return g_last_cudaError = cudaSuccess;
 }
 
+// yasai: legacy IPC (yasai_vmm, shared_devmem): the handle carries the ref of the allocation's
+// memfd; the peer maps that segment at a fresh device address of its own.
 __host__ cudaError_t CUDARTAPI cudaIpcGetMemHandle(cudaIpcMemHandle_t *handle,
                                                    void *devPtr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  cuda_not_implemented(__my_func__, __LINE__);
-  return g_last_cudaError = cudaErrorUnknown;
+  if (!handle) return g_last_cudaError = cudaErrorInvalidValue;
+  if (!yasai_vmm::ipc_get_mem_handle(yasai_current_gpu(), handle,
+                                     reinterpret_cast<uint64_t>(devPtr)))
+    return g_last_cudaError = cudaErrorInvalidValue;
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t cudaIpcOpenMemHandle(void **devPtr,
@@ -3527,8 +3552,12 @@ __host__ cudaError_t cudaIpcOpenMemHandle(void **devPtr,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  cuda_not_implemented(__my_func__, __LINE__);
-  return g_last_cudaError = cudaErrorUnknown;
+  (void)flags;
+  uint64_t p = 0;
+  if (!devPtr || !yasai_vmm::ipc_open_mem_handle(yasai_current_gpu(), &handle, &p))
+    return g_last_cudaError = cudaErrorInvalidValue;
+  *devPtr = reinterpret_cast<void *>(p);
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI
@@ -5525,12 +5554,12 @@ cudaPointerGetAttributes(cudaPointerAttributes *attributes, const void *ptr) {
   if (attributes == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   const uint64_t a = reinterpret_cast<uint64_t>(ptr);
   memset(attributes, 0, sizeof(*attributes));
-  if (host_window::contains(a, 1)) {
+  if (yasai_vmm::is_pinned_host(a)) {
     attributes->type = cudaMemoryTypeHost;
     attributes->device = 0;
     attributes->devicePointer = const_cast<void *>(ptr);
     attributes->hostPointer = const_cast<void *>(ptr);
-  } else if (a >= GLOBAL_HEAP_START && a < 0x500000000000ull) {
+  } else if ((a >= GLOBAL_HEAP_START && a < 0x500000000000ull) || host_window::contains(a, 1)) {
     attributes->type = cudaMemoryTypeDevice;
     attributes->device = 0;
     attributes->devicePointer = const_cast<void *>(ptr);
@@ -5557,8 +5586,10 @@ __host__ cudaError_t CUDARTAPI cudaDeviceEnablePeerAccess(int peerDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  cuda_not_implemented(__my_func__, __LINE__);
-  return g_last_cudaError = cudaErrorUnknown;
+  // yasai: memory shared between rank processes needs no peer enablement.
+  (void)peerDevice;
+  (void)flags;
+  return g_last_cudaError = cudaSuccess;
 }
 
 cudaError_t CUDARTAPI cudaSetValidDevices(int *device_arr, int len) {
@@ -5589,7 +5620,17 @@ cudaError_t CUDARTAPI cudaFuncGetAttributes(struct cudaFuncAttributes *attr,
 }
 
 cudaError_t CUDARTAPI cudaEventCreateWithFlags(cudaEvent_t *event, int flags) {
-  CUevent_st *e = new CUevent_st(flags == cudaEventBlockingSync);
+  CUevent_st *e = new CUevent_st((flags & cudaEventBlockingSync) != 0);
+  // yasai: an interprocess event keeps its counters in shared memory (cudaIpcGetEventHandle).
+  if (flags & cudaEventInterprocess) {
+    unsigned int *counters = nullptr;
+    char ref[64];
+    if (!yasai_vmm::ipc_event_create(&counters, ref)) {
+      delete e;
+      return g_last_cudaError = cudaErrorMemoryAllocation;
+    }
+    e->set_shared(counters, ref);
+  }
   g_timer_events[e->get_uid()] = e;
 #if CUDART_VERSION >= 3000
   *event = e;
@@ -6779,7 +6820,10 @@ CUresult CUDAAPI cuMemAlloc(CUdeviceptr *dptr, size_t bytesize) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: the cudaMalloc allocator.
+  void *p = nullptr;
+  if (!dptr || cudaMalloc(&p, bytesize) != cudaSuccess) return CUDA_ERROR_OUT_OF_MEMORY;
+  *dptr = CUdeviceptr(reinterpret_cast<uint64_t>(p));
   return CUDA_SUCCESS;
 }
 
@@ -6797,7 +6841,7 @@ CUresult CUDAAPI cuMemFree(CUdeviceptr dptr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  cudaFree(reinterpret_cast<void *>(dptr));
   return CUDA_SUCCESS;
 }
 
@@ -6806,7 +6850,12 @@ CUresult CUDAAPI cuMemGetAddressRange(CUdeviceptr *pbase, size_t *psize,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: cudaMalloc allocations, cuMem mappings and host windows.
+  uint64_t base = 0;
+  size_t size = 0;
+  if (!yasai_vmm::address_range(uint64_t(dptr), &base, &size)) return CUDA_ERROR_NOT_FOUND;
+  if (pbase) *pbase = CUdeviceptr(base);
+  if (psize) *psize = size;
   return CUDA_SUCCESS;
 }
 
@@ -6890,8 +6939,11 @@ CUresult CUDAAPI cuIpcGetEventHandle(CUipcEventHandle *pHandle, CUevent event) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime IPC functions.
+  return cudaIpcGetEventHandle(reinterpret_cast<cudaIpcEventHandle_t *>(pHandle),
+                               reinterpret_cast<cudaEvent_t>(event)) == cudaSuccess
+             ? CUDA_SUCCESS
+             : CUDA_ERROR_INVALID_HANDLE;
 }
 
 CUresult CUDAAPI cuIpcOpenEventHandle(CUevent *phEvent,
@@ -6899,16 +6951,23 @@ CUresult CUDAAPI cuIpcOpenEventHandle(CUevent *phEvent,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime IPC functions.
+  cudaIpcEventHandle_t h;
+  memcpy(&h, &handle, sizeof(h));
+  return cudaIpcOpenEventHandle(reinterpret_cast<cudaEvent_t *>(phEvent), h) == cudaSuccess
+             ? CUDA_SUCCESS
+             : CUDA_ERROR_INVALID_VALUE;
 }
 
 CUresult CUDAAPI cuIpcGetMemHandle(CUipcMemHandle *pHandle, CUdeviceptr dptr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime IPC functions.
+  return cudaIpcGetMemHandle(reinterpret_cast<cudaIpcMemHandle_t *>(pHandle),
+                             reinterpret_cast<void *>(dptr)) == cudaSuccess
+             ? CUDA_SUCCESS
+             : CUDA_ERROR_INVALID_VALUE;
 }
 
 CUresult CUDAAPI cuIpcOpenMemHandle(CUdeviceptr *pdptr, CUipcMemHandle handle,
@@ -6916,7 +6975,12 @@ CUresult CUDAAPI cuIpcOpenMemHandle(CUdeviceptr *pdptr, CUipcMemHandle handle,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: forwards to the runtime IPC functions.
+  cudaIpcMemHandle_t h;
+  memcpy(&h, &handle, sizeof(h));
+  void *p = nullptr;
+  if (!pdptr || cudaIpcOpenMemHandle(&p, h, Flags) != cudaSuccess) return CUDA_ERROR_INVALID_VALUE;
+  *pdptr = CUdeviceptr(reinterpret_cast<uint64_t>(p));
   return CUDA_SUCCESS;
 }
 
@@ -6924,8 +6988,10 @@ CUresult CUDAAPI cuIpcCloseMemHandle(CUdeviceptr dptr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime IPC functions.
+  return cudaIpcCloseMemHandle(reinterpret_cast<void *>(dptr)) == cudaSuccess
+             ? CUDA_SUCCESS
+             : CUDA_ERROR_INVALID_VALUE;
 }
 
 #endif /* CUDART_VERSION >= 4010 */
@@ -7403,8 +7469,9 @@ CUresult CUDAAPI cuPointerGetAttribute(void *data,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: answered from the allocation, mapping and host window tables.
+  return CUresult(yasai_vmm::pointer_attribute(data, int(attribute), uint64_t(ptr),
+                                               GPGPUSim_Context(GPGPU_Context())));
 }
 #endif /* CUDART_VERSION >= 4000 */
 
@@ -7478,7 +7545,11 @@ CUresult CUDAAPI cuPointerGetAttributes(unsigned int numAttributes,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: attributes that do not apply leave their value untouched, as the driver does.
+  for (unsigned i = 0; i < numAttributes; i++)
+    if (data && data[i])
+      yasai_vmm::pointer_attribute(data[i], int(attributes[i]), uint64_t(ptr),
+                                   GPGPUSim_Context(GPGPU_Context()));
   return CUDA_SUCCESS;
 }
 #endif /* CUDART_VERSION >= 7000 */
@@ -9387,16 +9458,31 @@ __host__ cudaError_t CUDARTAPI cudaFreeAsync(void *devPtr, cudaStream_t hStream)
   return cudaFree(devPtr);
 }
 
+// yasai: an opened IPC event shares the exporter's counters, so cudaStreamWaitEvent and
+// cudaEventSynchronize in this process wait for records made in the other.
 __host__ cudaError_t CUDARTAPI cudaIpcOpenEventHandle(cudaEvent_t *event, cudaIpcEventHandle_t handle) {
-  cuda_error_not_impl;
+  unsigned int *counters = nullptr;
+  char ref[64];
+  if (!event || !yasai_vmm::ipc_event_open(&handle, &counters, ref))
+    return g_last_cudaError = cudaErrorInvalidValue;
+  CUevent_st *e = new CUevent_st(false);
+  e->set_shared(counters, ref);
+  g_timer_events[e->get_uid()] = e;
+  *event = e;
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI cudaIpcGetEventHandle(cudaIpcEventHandle_t *handle, cudaEvent_t event) {
-  cuda_error_not_impl;
+  CUevent_st *e = get_event(event);
+  if (!handle || !e || !e->shared_name()[0]) return g_last_cudaError = cudaErrorInvalidResourceHandle;
+  yasai_vmm::ipc_event_handle(handle, e->shared_name());
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI cudaIpcCloseMemHandle(void *devPtr) {
-  cuda_error_not_impl;
+  if (!yasai_vmm::ipc_close_mem_handle(reinterpret_cast<uint64_t>(devPtr)))
+    return g_last_cudaError = cudaErrorInvalidValue;
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ __cudart_builtin__ cudaError_t CUDARTAPI cudaGetDeviceProperties_v2(struct cudaDeviceProp *prop, int device) {

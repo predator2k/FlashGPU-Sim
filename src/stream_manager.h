@@ -30,6 +30,7 @@
 #define STREAM_MANAGER_H_INCLUDED
 
 #include <pthread.h>
+#include <stdio.h>
 #include <time.h>
 #include <list>
 #include "abstract_hardware_model.h"
@@ -56,20 +57,41 @@ struct CUevent_st {
     m_done = false;
   }
   void update(double cycle, time_t clk) {
-    m_updates++;
+    if (m_shared) __atomic_fetch_add(&m_shared[1], 1u, __ATOMIC_ACQ_REL);
+    else m_updates++;
     m_wallclock = clk;
     m_gpu_tot_sim_cycle = cycle;
     m_done = true;
   }
   // void set_done() { assert(!m_done); m_done=true; }
   int get_uid() const { return m_uid; }
-  unsigned num_updates() const { return m_updates; }
-  bool done() const { return m_updates == m_issued; }
+  unsigned num_updates() const {
+    return m_shared ? __atomic_load_n(&m_shared[1], __ATOMIC_ACQUIRE) : m_updates;
+  }
+  bool done() const { return num_updates() == num_issued(); }
   time_t clock() const { return m_wallclock; }
-  void issue() { m_issued++; }
-  unsigned int num_issued() const { return m_issued; }
+  void issue() {
+    if (m_shared) __atomic_fetch_add(&m_shared[0], 1u, __ATOMIC_ACQ_REL);
+    else m_issued++;
+  }
+  unsigned int num_issued() const {
+    return m_shared ? __atomic_load_n(&m_shared[0], __ATOMIC_ACQUIRE) : m_issued;
+  }
+  /// yasai: makes the event interprocess: its issue and update counts live in shared memory
+  /// (two 32-bit counters: [0] issued, [1] updates) that peer processes map through
+  /// cudaIpcOpenEventHandle. The segment name goes into the IPC event handle.
+  /// @param counters The two counters in a shared mapping.
+  /// @param name Name of the shared memory segment.
+  void set_shared(unsigned int *counters, const char *name) {
+    m_shared = counters;
+    snprintf(m_shared_name, sizeof(m_shared_name), "%s", name);
+  }
+  /// yasai: name of the shared segment of an interprocess event ("" otherwise).
+  const char *shared_name() const { return m_shared_name; }
 
  private:
+  unsigned int *m_shared = nullptr;  ///< yasai: shared counters of an interprocess event
+  char m_shared_name[64] = {0};      ///< yasai: their segment name
   int m_uid;
   bool m_blocking;
   bool m_done;

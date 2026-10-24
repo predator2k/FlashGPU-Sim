@@ -91,10 +91,7 @@ void memory_space_impl<BSIZE>::write_only(mem_addr_t offset, mem_addr_t index,
                                           size_t length, const void *data) {
   if (m_host_window) {
     const mem_addr_t addr = (index << m_log2_block_size) + offset;
-    if (host_window::contains(addr, length)) {
-      host_window::write(addr, length, data);
-      return;
-    }
+    if (host_window::try_write(addr, length, data)) return;
   }
   get_or_init_block(index).write(offset, length, (const unsigned char *)data);
 }
@@ -104,10 +101,7 @@ void memory_space_impl<BSIZE>::write(mem_addr_t addr, size_t length,
                                      const void *data,
                                      class ptx_thread_info *thread,
                                      const ptx_instruction *pI) {
-  if (m_host_window && host_window::contains(addr, length)) {
-    host_window::write(addr, length, data);
-    return;
-  }
+  if (m_host_window && host_window::try_write(addr, length, data)) return;
   mem_addr_t index = addr >> m_log2_block_size;
 
   if ((addr + length) <= (index + 1) * BSIZE) {
@@ -206,10 +200,7 @@ void memory_space_impl<BSIZE>::read_single_block(mem_addr_t blk_idx,
 template <unsigned BSIZE>
 void memory_space_impl<BSIZE>::read(mem_addr_t addr, size_t length,
                                     void *data) const {
-  if (m_host_window && host_window::contains(addr, length)) {
-    host_window::read(addr, length, data);
-    return;
-  }
+  if (m_host_window && host_window::try_read(addr, length, data)) return;
   mem_addr_t index = addr >> m_log2_block_size;
   if ((addr + length) <= (index + 1) * BSIZE) {
     // fast route for intra-block access
