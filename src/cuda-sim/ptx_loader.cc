@@ -680,6 +680,28 @@ void gpgpu_context::gpgpu_ptx_info_load_from_filename(const char *filename,
     }
   }
 
+  // yasai: ptxas also prints advisories ("ptxas <file>, line N; info : Advisory: ...", for
+  // example for mma.sp without ::ordered_metadata), which the ptxinfo grammar does not know;
+  // they carry no resource information and are dropped.
+  {
+    std::ifstream in(ptxas_filename);
+    std::string line, kept;
+    bool dropped = false;
+    while (std::getline(in, line)) {
+      if (line.find("Advisory:") != std::string::npos) {
+        dropped = true;
+        continue;
+      }
+      kept += line;
+      kept += '\n';
+    }
+    in.close();
+    if (dropped) {
+      std::ofstream out(ptxas_filename, std::ios::trunc);
+      out << kept;
+    }
+  }
+
   FILE *ptxinfo_in;
   ptxinfo->g_ptxinfo_filename = strdup(ptxas_filename.c_str());
   ptxinfo_in = fopen(ptxinfo->g_ptxinfo_filename, "r");

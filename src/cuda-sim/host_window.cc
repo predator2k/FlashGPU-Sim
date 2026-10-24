@@ -46,6 +46,40 @@ bool atomic_size(uint64_t addr, size_t bytes) {
   return (bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8) && (addr % bytes) == 0;
 }
 
+#if defined(__x86_64__)
+/// 16-byte compare-and-swap (lock cmpxchg16b), atomic across processes.
+/// @param p 16-byte aligned address.
+/// @param e In: expected low and high words; out: the words found.
+/// @param lo Desired low word.
+/// @param hi Desired high word.
+/// @return True when the swap happened.
+bool cas16(void *p, uint64_t e[2], uint64_t lo, uint64_t hi) {
+  bool ok;
+  asm volatile("lock cmpxchg16b %1\n\tsete %0"
+               : "=q"(ok), "+m"(*static_cast<volatile unsigned __int128 *>(p)), "+a"(e[0]),
+                 "+d"(e[1])
+               : "b"(lo), "c"(hi)
+               : "memory", "cc");
+  return ok;
+}
+#endif
+
+/// Whether a 16-byte access is a single atomic operation here (aligned, x86-64). NCCL's LL and
+/// LL128 protocols and vector loads/stores of packed data and flags need the whole vector to
+/// become visible at once.
+/// @param addr Address.
+/// @param bytes Size.
+/// @return True for aligned 16-byte accesses on x86-64.
+bool atomic16(uint64_t addr, size_t bytes) {
+#if defined(__x86_64__)
+  return bytes == 16 && (addr % 16) == 0;
+#else
+  (void)addr;
+  (void)bytes;
+  return false;
+#endif
+}
+
 /// Finds the range that holds [addr, addr + bytes); the caller holds ranges_mu().
 /// @param addr First address.
 /// @param bytes Length.
@@ -120,6 +154,14 @@ void read(uint64_t addr, size_t bytes, void *out) {
       default: { uint64_t v = __atomic_load_n(static_cast<uint64_t *>(p), __ATOMIC_ACQUIRE); memcpy(out, &v, 8); return; }
     }
   }
+#if defined(__x86_64__)
+  if (atomic16(addr, bytes)) {
+    uint64_t e[2] = {0, 0};
+    cas16(p, e, 0, 0);  // stores 0 over 0 (no change) or returns the current value
+    memcpy(out, e, 16);
+    return;
+  }
+#endif
   std::atomic_thread_fence(std::memory_order_acquire);
   memcpy(out, p, bytes);
 }
@@ -134,6 +176,16 @@ void write(uint64_t addr, size_t bytes, const void *in) {
       default: { uint64_t v; memcpy(&v, in, 8); __atomic_store_n(static_cast<uint64_t *>(p), v, __ATOMIC_RELEASE); return; }
     }
   }
+#if defined(__x86_64__)
+  if (atomic16(addr, bytes)) {
+    uint64_t d[2];
+    memcpy(d, in, 16);
+    uint64_t e[2] = {0, 0};
+    while (!cas16(p, e, d[0], d[1])) {
+    }
+    return;
+  }
+#endif
   std::atomic_thread_fence(std::memory_order_release);
   memcpy(p, in, bytes);
   std::atomic_thread_fence(std::memory_order_release);

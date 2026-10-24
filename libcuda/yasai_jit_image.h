@@ -41,15 +41,6 @@ std::string ptx_for_image(const void *image, unsigned max_capability, std::strin
 ///   max_capability  highest preferred PTX architecture (0: all count as at most it)
 std::vector<std::string> ptx_files_of_library(const std::string &path, unsigned max_capability);
 
-/// Path of piece n of a PTX file for per-kernel loading: in this process's directory
-/// <work>/pieces (see YASAI_JIT_WORK), named <pid>-<hash of the source path>-<source name>.k<n><suffix>.
-/// Pieces used to be written next to the source PTX, so rank processes that load one shared
-/// file (NCCL's merged module) wrote the same piece files at the same time.
-///   source  the PTX file the piece is cut from
-///   piece   piece number within that file
-///   suffix  ".ptx" (the parsed piece) or ".full.ptx" (the ptxas copy)
-std::string piece_path(const std::string &source, int piece, const std::string &suffix);
-
 /// Architecture ("sm_XX", with suffix letters) named in an extracted PTX file name, or "".
 ///   ptx_file        a file name of the form <name>.<n>.sm_<arch>.ptx
 std::string arch_of_ptx_file(const std::string &ptx_file);

@@ -104,6 +104,10 @@ void tensor_mma_generic_impl(const ptx_instruction *pI, core_t *core,
                              warp_inst_t inst, int M, int N, int K,
                              unsigned tid);
 
+// yasai: sparse mma.sp{::ordered_metadata} (mma_sparse.cc): A structured-sparse with metadata.
+void tensor_mma_sp_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst, int M, int N,
+                        int K, unsigned tid);
+
 void tensor_mma_s8_impl(const ptx_instruction *pI, core_t *core,
                         warp_inst_t inst, int M, int N, int K, bool saturate,
                         unsigned tid, const operand_info &dst);

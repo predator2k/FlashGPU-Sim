@@ -128,6 +128,7 @@
 #include <sys/stat.h>
 #include <vector>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #ifdef OPENGL_SUPPORT
 #define GL_GLEXT_PROTOTYPES
@@ -1958,11 +1959,10 @@ cudaMemsetAsyncInternal(void *mem, int c, size_t count, cudaStream_t stream = 0,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("GPGPU-Sim PTX: WARNING: Asynchronous memset not supported (%s)\n",
-         __my_func__);
-  CUctx_st *context = GPGPUSim_Context(ctx);
-  gpgpu_t *gpu = context->get_device()->get_gpgpu();
-  gpu->gpu_memset((size_t)mem, c, count);
+  // yasai: the memset is a stream operation, so it runs after the work queued before it on the
+  // stream and before the work queued after it.
+  ctx->the_gpgpusim->g_stream_manager->push(stream_operation::memset_op(
+      (size_t)mem, c, count, (struct CUstream_st *)stream));
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -3079,9 +3079,22 @@ __host__ cudaError_t CUDARTAPI cudaMallocArray(
   return cudaMallocArrayInternal(array, desc, width, height);
 }
 
+// yasai: managed allocations (cudaMallocManaged), which cudaFree releases as host memory.
+static std::set<void *> g_yasai_managed;
+// yasai: guards g_yasai_managed.
+static std::mutex g_yasai_managed_mutex;
+
 __host__ cudaError_t CUDARTAPI cudaFree(void *devPtr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_yasai_managed_mutex);
+    if (g_yasai_managed.erase(devPtr)) {
+      host_window::remove(reinterpret_cast<uint64_t>(devPtr));
+      free(devPtr);
+      return g_last_cudaError = cudaSuccess;
+    }
   }
   // yasai: unmaps the allocation's segment (device addresses are not reused).
   yasai_vmm::free_device(reinterpret_cast<uint64_t>(devPtr));
@@ -4896,6 +4909,19 @@ void yasai_ptx_called(const std::string &t, size_t b, size_t e,
 // Total bytes of PTX parsed by the per-kernel loader (printed with each piece).
 size_t g_yasai_piece_bytes = 0;
 
+// Path of a per-kernel piece file: in YASAI_PTX_PIECE_DIR, else in the current directory, named
+// after the source file, the process and the piece number. Several rank processes load pieces
+// of one shared source file (NCCL's merged module) at the same time, so the pieces may not be
+// written next to the source file under a common name.
+//   src: source PTX file; piece: piece number; suffix: ".ptx" or ".full.ptx"
+std::string yasai_piece_path(const std::string &src, int piece, const char *suffix) {
+  const char *d = getenv("YASAI_PTX_PIECE_DIR");
+  const size_t slash = src.rfind('/');
+  const std::string base = slash == std::string::npos ? src : src.substr(slash + 1);
+  return std::string(d && *d ? d : ".") + "/" + base + ".p" + std::to_string(getpid()) + ".k" +
+         std::to_string(piece) + suffix;
+}
+
 // True when per-kernel loading also defers function bodies to their first call
 // (YASAI_PTX_LAZY_FUNC unset or nonzero). Otherwise a kernel's piece holds every function it
 // reaches, through calls and through the function pointers of the file's initializers.
@@ -5000,7 +5026,7 @@ bool yasai_lazy_load_piece_lazyfunc(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int
     if (!ptxas_part.empty()) ptxas_text.append(ptxas_part).push_back('\n');
   }
   const int piece = L.pieces[i]++;
-  const std::string parse_file = yasai_jit::piece_path(L.files[i], piece, ".ptx");
+  const std::string parse_file = yasai_piece_path(L.files[i], piece, ".ptx");
   {
     std::ofstream out(parse_file);
     out << parse_text;
@@ -5019,7 +5045,7 @@ bool yasai_lazy_load_piece_lazyfunc(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int
   L.vars_loaded[i] = true;
   if (entry_item >= 0 || func_item >= 0) L.funcs_loaded[i].insert(target);
   if (entry_item >= 0) {
-    const std::string ptxas_file = yasai_jit::piece_path(L.files[i], piece, ".full.ptx");
+    const std::string ptxas_file = yasai_piece_path(L.files[i], piece, ".full.ptx");
     {
       std::ofstream out(ptxas_file);
       out << ptxas_text;
@@ -5096,7 +5122,7 @@ bool yasai_lazy_load_piece(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i, const
     if (to_parse) parse_text.append(t, it.begin, it.end - it.begin).push_back('\n');
   }
   const int piece = L.pieces[i]++;
-  const std::string parse_file = yasai_jit::piece_path(L.files[i], piece, ".ptx");
+  const std::string parse_file = yasai_piece_path(L.files[i], piece, ".ptx");
   {
     std::ofstream out(parse_file);
     out << parse_text;
@@ -5115,7 +5141,7 @@ bool yasai_lazy_load_piece(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i, const
   for (const std::string &f : reached) L.funcs_loaded[i].insert(f);
   if (entry_item >= 0) {
     L.funcs_loaded[i].insert(target);
-    const std::string ptxas_file = yasai_jit::piece_path(L.files[i], piece, ".full.ptx");
+    const std::string ptxas_file = yasai_piece_path(L.files[i], piece, ".full.ptx");
     {
       std::ofstream out(ptxas_file);
       out << ptxas_text;
@@ -5342,6 +5368,38 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
     break;
   }
 
+  }
+  // yasai: an override for a library that carries no PTX of its own adds its file. A library
+  // built with separable compilation (bitsandbytes) keeps the PTX in its objects' relocatable
+  // device code and registers only device-linked cubins, so cuobjdump lists no PTX for it and
+  // the loop above never sees it. The architecture comes from the file's .target line.
+  for (const auto &ov : lib_override) {
+    bool listed = false;
+    for (const auto &library : by_library) {
+      const std::string &lib = library.first;
+      const size_t base = lib.rfind('/') == std::string::npos ? 0 : lib.rfind('/') + 1;
+      listed = listed || lib.compare(base, ov.first.size(), ov.first) == 0;
+    }
+    if (listed) continue;
+    std::ifstream in(ov.second);
+    std::string line, arch;
+    while (arch.empty() && std::getline(in, line)) {
+      const size_t t = line.find(".target");
+      const size_t sm = line.find("sm_", t == std::string::npos ? line.size() : t);
+      if (t != std::string::npos && sm != std::string::npos) {
+        size_t e = sm + 3;
+        while (e < line.size() && isalnum((unsigned char)line[e])) ++e;
+        arch = line.substr(sm, e - sm);
+      }
+    }
+    if (arch.empty()) {
+      printf("GPGPU-Sim PTX: override %s has no .target line, skipped\n", ov.second.c_str());
+      continue;
+    }
+    yasai_override_arch()[ov.second] = arch;
+    selected_files.push_back(ov.second);
+    printf("GPGPU-Sim PTX: %s carries no PTX; %s (%s) added for it\n", ov.first.c_str(),
+           ov.second.c_str(), arch.c_str());
   }
 
   // Parse the selected files (if any)
@@ -5731,6 +5789,42 @@ cudaError_t CUDARTAPI cudaHostAlloc(void **pHost, size_t bytes,
 cudaError_t CUDARTAPI cudaHostGetDevicePointer(void **pDevice, void *pHost,
                                                unsigned int flags) {
   return cudaHostGetDevicePointerInternal(pDevice, pHost, flags);
+}
+
+// yasai: managed memory is mapped host memory, which kernels access in place (device address ==
+// host address), so the host and the device see one copy as with unified memory. cudaFree
+// releases it. bitsandbytes (paged optimizers) uses it.
+//   devPtr: receives the allocation; size: bytes; flags: cudaMemAttachGlobal or
+//   cudaMemAttachHost (both give the same mapping here)
+__host__ cudaError_t CUDARTAPI cudaMallocManaged(void **devPtr, size_t size, unsigned int flags) {
+  if (g_debug_execution >= 3) {
+    announce_call(__my_func__);
+  }
+  (void)flags;
+  if (devPtr == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  const cudaError_t e = cudaHostAllocInternal(devPtr, size, cudaHostAllocMapped);
+  if (e != cudaSuccess) return e;
+  std::lock_guard<std::mutex> lock(g_yasai_managed_mutex);
+  g_yasai_managed.insert(*devPtr);
+  return g_last_cudaError = cudaSuccess;
+}
+
+// yasai: prefetching moves managed pages between host and device on a real GPU. Here managed
+// memory is one host copy that kernels access in place, so there is nothing to move; the call
+// only checks its arguments.
+//   devPtr: start of the range; count: bytes; location: destination; flags: must be 0;
+//   stream: stream the prefetch would be ordered on
+__host__ cudaError_t CUDARTAPI cudaMemPrefetchAsync(const void *devPtr, size_t count,
+                                                    struct cudaMemLocation location,
+                                                    unsigned int flags, cudaStream_t stream) {
+  if (g_debug_execution >= 3) {
+    announce_call(__my_func__);
+  }
+  (void)count;
+  (void)location;
+  (void)stream;
+  if (devPtr == NULL || flags != 0) return g_last_cudaError = cudaErrorInvalidValue;
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI
@@ -6665,7 +6759,9 @@ CUresult CUDAAPI cuCtxGetCurrent(CUcontext *pctx) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: the one context of the simulated device.
+  if (!pctx) return CUDA_ERROR_INVALID_VALUE;
+  *pctx = (CUcontext)GPGPUSim_Context(GPGPU_Context());
   return CUDA_SUCCESS;
 }
 #endif /* CUDART_VERSION >= 4000 */
@@ -7927,30 +8023,52 @@ CUresult CUDAAPI cuStreamBatchMemOp(CUstream stream, unsigned int count,
 
 /** @} */ /* END CUDA_EVENT */
 
+// yasai: function attributes from the kernel's ptxas information and the device configuration
+// (CUfunction values are function_info pointers). Triton reads NUM_REGS, LOCAL_SIZE_BYTES and
+// MAX_DYNAMIC_SHARED_SIZE_BYTES for every kernel it loads; attributes the simulator has no
+// meaning for (cache mode, cluster preferences) read 0.
+//   pi: receives the value; attrib: attribute; hfunc: function
 CUresult CUDAAPI cuFuncGetAttribute(int *pi, CUfunction_attribute attrib,
                                     CUfunction hfunc) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  // yasai: answered from the kernel's PTX information (as cudaFuncGetAttributes). Triton reads
-  // NUM_REGS, LOCAL_SIZE_BYTES and MAX_THREADS_PER_BLOCK after cuModuleGetFunction and refuses to
-  // launch when the thread limit is 0. The CUfunction of a module function is its host key.
   if (pi == NULL) return CUDA_ERROR_INVALID_VALUE;
-  *pi = 0;
-  struct cudaFuncAttributes attr;
-  memset(&attr, 0, sizeof(attr));
-  if (hfunc == NULL ||
-      cudaFuncGetAttributesInternal(&attr, reinterpret_cast<const char *>(hfunc)) != cudaSuccess)
-    return CUDA_ERROR_INVALID_HANDLE;
-  switch ((int)attrib) {
-    case 0: *pi = attr.maxThreadsPerBlock; break;       // MAX_THREADS_PER_BLOCK
-    case 1: *pi = (int)attr.sharedSizeBytes; break;     // SHARED_SIZE_BYTES
-    case 2: *pi = (int)attr.constSizeBytes; break;      // CONST_SIZE_BYTES
-    case 3: *pi = (int)attr.localSizeBytes; break;      // LOCAL_SIZE_BYTES
-    case 4: *pi = attr.numRegs; break;                  // NUM_REGS
-    case 5: *pi = attr.ptxVersion; break;               // PTX_VERSION
-    case 6: *pi = attr.binaryVersion; break;            // BINARY_VERSION
-    default: break;                                     // others: 0
+  if (hfunc == NULL) return CUDA_ERROR_INVALID_HANDLE;
+  gpgpu_context *ctx = GPGPU_Context();
+  CUctx_st *context = GPGPUSim_Context(ctx);
+  // yasai: a CUfunction is a host key: the function_info pointer of a module function
+  // (cuModuleGetFunction registers it as its own key) or the host stub of a runtime kernel
+  // (cudaGetFuncBySymbol); both resolve through the kernel lookup.
+  function_info *entry = context->get_kernel(reinterpret_cast<const char *>(hfunc));
+  if (entry == NULL) return CUDA_ERROR_INVALID_HANDLE;
+  gpgpu_sim *gpu = context->get_device()->get_gpgpu();
+  const struct gpgpu_ptx_sim_info *k = entry->get_kernel_info();
+  const struct cudaDeviceProp *prop = context->get_device()->get_prop();
+  switch (attrib) {
+    case CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK: {
+      struct cudaFuncAttributes fa;
+      memset(&fa, 0, sizeof(fa));
+      fa.numRegs = k->regs;
+      fa.sharedSizeBytes = k->smem;
+      *pi = k->maxthreads > 0 ? (int)k->maxthreads : (int)getMaxThreadsPerBlock(&fa, ctx);
+      break;
+    }
+    case CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES: *pi = (int)k->smem; break;
+    case CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES: *pi = (int)k->cmem; break;
+    case CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES: *pi = (int)k->lmem; break;
+    case CU_FUNC_ATTRIBUTE_NUM_REGS: *pi = (int)k->regs; break;
+    case CU_FUNC_ATTRIBUTE_PTX_VERSION: *pi = (int)k->ptx_version; break;
+    case CU_FUNC_ATTRIBUTE_BINARY_VERSION: *pi = (int)k->sm_target; break;
+    case CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: {
+      const unsigned set = gpu->has_kernel_max_dynamic_smem(entry->get_name())
+                               ? gpu->get_kernel_max_dynamic_smem(entry->get_name())
+                               : 0;
+      const unsigned optin = (unsigned)prop->sharedMemPerBlockOptin;
+      *pi = set != 0 ? (int)set : (int)(optin > k->smem ? optin - k->smem : 0);
+      break;
+    }
+    default: *pi = 0; break;
   }
   return CUDA_SUCCESS;
 }

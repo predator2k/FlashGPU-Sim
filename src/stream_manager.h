@@ -112,11 +112,24 @@ enum stream_operation_type {
   stream_memcpy_from_symbol,
   stream_kernel_launch,
   stream_event,
-  stream_wait_event
+  stream_wait_event,
+  stream_memset  // yasai: cudaMemsetAsync, performed in stream order
 };
 
 class stream_operation {
  public:
+  /// yasai: a memset of cnt bytes of device memory at dst to value, in stream order.
+  /// @param dst Device address.
+  /// @param value Byte value.
+  /// @param cnt Bytes.
+  /// @param stream Stream.
+  /// @return The operation.
+  static stream_operation memset_op(size_t dst, int value, size_t cnt, struct CUstream_st *stream) {
+    stream_operation op(size_t(0), dst, cnt, stream);
+    op.m_type = stream_memset;
+    op.m_memset_value = value;
+    return op;
+  }
   stream_operation() {
     m_kernel = NULL;
     m_type = stream_no_op;
@@ -234,6 +247,7 @@ class stream_operation {
   void *m_host_address_dst;
   const void *m_host_address_src;
   size_t m_cnt;
+  int m_memset_value = 0;  ///< yasai: byte value of a stream_memset operation
 
   const char *m_symbol;
   size_t m_offset;

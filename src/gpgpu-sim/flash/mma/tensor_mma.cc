@@ -439,6 +439,12 @@ void tensor_mma_impl(const ptx_instruction *pI, core_t *core,
 
   const operand_info &dst = pI->operand_lookup(0);
 
+  // yasai: the sparse form (mma.sp, lexed as this opcode) has its own model.
+  if (pI->get_source() && strstr(pI->get_source(), "mma.sp") != NULL) {
+    tensor_mma_sp_impl(pI, core, inst, M, N, K, tid);
+    return;
+  }
+
   // yasai: types without a type-specific file (FP8/FP6/FP4, block-scaled kinds,
   // u8, s4/u4, b1, f64) go to the generic model; s8 x s8 keeps
   // tensor_mma_s8_impl (which reads u8 as s8, so any u8 operand also goes to
