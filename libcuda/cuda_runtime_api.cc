@@ -5597,6 +5597,35 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
 }
 }
 
+// yasai: true when this process runs the simulator. A framework started with the simulator in
+// LD_PRELOAD passes it to every child: ninja and nvcc of a JIT build (FlashInfer under SGLang),
+// "nvcc --version" probes. The preloaded libraries with device code (NCCL, the cuBLAS
+// replacement) register their fat binaries from their constructors, which initialized the
+// simulator in each child: about 4 GB each, and an abort where the working directory has no
+// gpgpusim.config (ninja in FlashInfer's build directory). With YASAI_SIM_EXE_REGEX set, a process
+// whose executable path (/proc/self/exe) does not match skips the registrations, so the simulator
+// stays uninitialized; such a process makes no CUDA calls. Unset or empty: every process runs it.
+static bool yasai_sim_process_enabled() {
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char *r = getenv("YASAI_SIM_EXE_REGEX");
+    if (r == NULL || *r == '\0') {
+      enabled = 1;
+    } else {
+      char buf[4096];
+      const ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+      const std::string exe = n > 0 ? std::string(buf, (size_t)n) : std::string();
+      enabled = std::regex_search(exe, std::regex(r)) ? 1 : 0;
+      if (!enabled && getenv("YASAI_SIM_EXE_DEBUG"))
+        fprintf(stderr, "yasai: simulator disabled in %s (YASAI_SIM_EXE_REGEX)\n", exe.c_str());
+    }
+  }
+  return enabled == 1;
+}
+
+// yasai: the handle returned to the registrations of a process without the simulator.
+static void *yasai_disabled_fatbin_handle = NULL;
+
 extern "C" {
 
 void **CUDARTAPI __cudaRegisterFatBinarySST(const char *fn) {
@@ -5604,6 +5633,7 @@ void **CUDARTAPI __cudaRegisterFatBinarySST(const char *fn) {
 }
 
 void **CUDARTAPI __cudaRegisterFatBinary(void *fatCubin) {
+  if (!yasai_sim_process_enabled()) return &yasai_disabled_fatbin_handle;
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -5665,6 +5695,7 @@ void CUDARTAPI __cudaRegisterFunction(void **fatCubinHandle,
                                       const char *deviceName, int thread_limit,
                                       uint3 *tid, uint3 *bid, dim3 *bDim,
                                       dim3 *gDim) {
+  if (!yasai_sim_process_enabled()) return;
   cudaRegisterFunctionInternal(fatCubinHandle, hostFun, deviceFun, deviceName,
                                thread_limit, tid, bid, bDim, gDim);
 }
@@ -5700,6 +5731,7 @@ extern void __cudaRegisterVar(
     char *deviceAddress,     // name of variable
     const char *deviceName,  // name of variable (same as above)
     int ext, int size, int constant, int global) {
+  if (!yasai_sim_process_enabled()) return;
   cudaRegisterVarInternal(fatCubinHandle, hostVar, deviceAddress, deviceName,
                           ext, size, constant, global);
 }
@@ -5756,6 +5788,7 @@ void __cudaRegisterTexture(
     const void **deviceAddress, const char *deviceName, int dim, int norm,
     int ext)  // passes in a newly created textureReference
 {
+  if (!yasai_sim_process_enabled()) return;
   __cudaRegisterTextureInternal(fatCubinHandle, hostVar, deviceAddress,
                                 deviceName, dim, norm, ext);
 }
