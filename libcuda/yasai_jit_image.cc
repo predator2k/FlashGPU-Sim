@@ -49,8 +49,14 @@ const std::string &work_dir() {
     if (w != NULL && *w) {
       dir = w;
     } else {
+      // yasai: the host name is part of the name, since processes in two containers that share
+      // TMPDIR can have the same PID in their own PID namespaces.
       const char *t = getenv("TMPDIR");
-      dir = std::string(t != NULL && *t ? t : "/tmp") + "/yasai-jit-" + std::to_string(getpid());
+      char host[64] = "host";
+      gethostname(host, sizeof host - 1);
+      host[sizeof host - 1] = 0;
+      dir = std::string(t != NULL && *t ? t : "/tmp") + "/yasai-jit-" + host + "-" +
+            std::to_string(getpid());
     }
     yasai_system(("mkdir -p '" + dir + "'").c_str());
   }

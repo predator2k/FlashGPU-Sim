@@ -353,10 +353,21 @@ std::string scope_file(const std::string &path, const std::string &unit_in) {
   const std::string out_path = dir + "/" + hx + base;
   struct stat st;
   const bool cached = stat(out_path.c_str(), &st) == 0;
-  // Written under a per-process name and renamed, so processes that share the directory (the
-  // same file, the same content) never read a partial copy.
-  const std::string tmp = out_path + ".tmp" + std::to_string(getpid());
+  // Written under a unique name (mkstemp) and renamed, so processes that share the directory (the
+  // same file, the same content) never read a partial copy. A PID alone is not unique: ranks in
+  // two containers can have the same PID in their own PID namespaces.
+  std::string tmp;
   if (!cached) {
+    std::vector<char> tmpl(out_path.begin(), out_path.end());
+    const char suffix_x[] = ".tmpXXXXXX";
+    tmpl.insert(tmpl.end(), suffix_x, suffix_x + sizeof suffix_x);  // with the terminating zero
+    const int fd = mkstemp(tmpl.data());
+    if (fd < 0) {
+      fprintf(stderr, "yasai-scope: cannot create a temporary file for %s\n", out_path.c_str());
+      abort();
+    }
+    close(fd);
+    tmp = tmpl.data();
     std::ifstream in(path);
     std::ofstream out(tmp);
     std::string line;
@@ -372,9 +383,14 @@ std::string scope_file(const std::string &path, const std::string &unit_in) {
       abort();
     }
   }
+  // rename() replaces a copy that another process wrote meanwhile (same name, same content).
   if (!cached && rename(tmp.c_str(), out_path.c_str()) != 0) {
-    fprintf(stderr, "yasai-scope: cannot rename %s to %s\n", tmp.c_str(), out_path.c_str());
-    abort();
+    const bool present = stat(out_path.c_str(), &st) == 0;
+    unlink(tmp.c_str());
+    if (!present) {
+      fprintf(stderr, "yasai-scope: cannot rename %s to %s\n", tmp.c_str(), out_path.c_str());
+      abort();
+    }
   }
   for (const std::string &n : names) {
     if (dup_entries.count(n)) {
