@@ -956,7 +956,8 @@ void ptx_recognizer::end_vector_operand() {
     // components: FlashInfer's prefill kernels write "{%f670, 0., %f671, 0.}". Decimal literals
     // are lexed as doubles; the accumulator registers are f32, so they become f32 literals, which
     // get_vector_operand_values reads like registers.
-    const bool is_mma_source = g_opcode == MMA_OP && g_vector_operand_start >= 1;
+    const bool is_mma_source =
+        (g_opcode == MMA_OP || g_opcode == TENSOR_MMA_OP) && g_vector_operand_start >= 1;
     parse_assert(is_store_source || is_mov_pack || is_mma_source,
                  "literal vector operands are only valid as store sources, "
                  "mov.b32/mov.b64 pack sources or mma.sync sources.");
