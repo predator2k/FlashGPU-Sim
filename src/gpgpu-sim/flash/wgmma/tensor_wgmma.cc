@@ -488,8 +488,10 @@ void wgmma_m64n8_accumulator_coord(unsigned lane, int reg, int &row, int &col) {
 
 void tensor_wgmma_impl(const ptx_instruction *pI, core_t *core,
                        warp_inst_t &inst) {
+  // yasai: sparse A (wgmma.mma_async.sp) has its own model (wgmma_sparse.cc).
   if (pI->is_wgmma_sparse()) {
-    fail_unsupported_sparse_wgmma();
+    wgmma_sp_generic_impl(pI, core, inst);
+    return;
   }
 
   int accumulator_type = wgmma_scalar_type_at(pI, 0, F32_TYPE);
@@ -574,10 +576,7 @@ void wgmma_mma_async_impl(const ptx_instruction *pI, core_t *core,
 
 void wgmma_mma_async_sp_impl(const ptx_instruction *pI, core_t *core,
                              warp_inst_t &inst) {
-  (void)pI;
-  (void)core;
-  (void)inst;
-  fail_unsupported_sparse_wgmma();
+  wgmma_sp_generic_impl(pI, core, inst);
 }
 
 void wgmma_fence_impl(const ptx_instruction *pI, core_t *core,

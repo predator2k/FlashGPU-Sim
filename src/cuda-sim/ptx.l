@@ -129,6 +129,7 @@ callp   TC; BEGIN(NOT_OPCODE); yylval->int_value = CALLP_OP; return OPCODE;
 clz	TC; yylval->int_value = CLZ_OP; return OPCODE;
 cnot	TC; yylval->int_value = CNOT_OP; return OPCODE;
 cos	TC; yylval->int_value = COS_OP; return OPCODE;
+cvt\.pack	TC; yylval->int_value = CVT_PACK_OP; return OPCODE; /* yasai */
 cvt	TC; yylval->int_value = CVT_OP; return OPCODE;
 cvta	TC; yylval->int_value = CVTA_OP; return OPCODE;
 div	TC; yylval->int_value = DIV_OP; return OPCODE;

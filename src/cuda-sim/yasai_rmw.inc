@@ -468,3 +468,43 @@ void multimem_red_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   thread->m_last_effective_address = addr;
   thread->m_last_memory_space = global_space;
 }
+
+/// cvt.pack.sat.convertType.s32{.b32} d, a, b{, c}: a and b saturated to convertType (16, 8, 4
+/// or 2 bits) and packed into the low bits of d, a above b; with c, the remaining bits of d are
+/// the low bits of c (PTX ISA 9.7.10.25).
+void cvt_pack_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  const std::list<int> tl = pI->get_scalar_type();
+  const int ct = tl.empty() ? S16_TYPE : tl.front();
+  unsigned size = 16;
+  bool is_signed = true;
+  switch (ct) {
+    case U16_TYPE: size = 16; is_signed = false; break;
+    case S16_TYPE: size = 16; break;
+    case U8_TYPE: size = 8; is_signed = false; break;
+    case S8_TYPE: size = 8; break;
+    case U4_TYPE: size = 4; is_signed = false; break;
+    case S4_TYPE: size = 4; break;
+    default:
+      printf("cvt.pack: convert type %d is not supported\n", ct);
+      abort();
+  }
+  const int64_t lo = is_signed ? -(int64_t(1) << (size - 1)) : 0;
+  const int64_t hi = is_signed ? (int64_t(1) << (size - 1)) - 1 : (int64_t(1) << size) - 1;
+  auto sat = [&](int32_t v) -> uint32_t {
+    int64_t x = v;
+    if (x < lo) x = lo;
+    if (x > hi) x = hi;
+    return uint32_t(uint64_t(x) & ((uint64_t(1) << size) - 1));
+  };
+  const int32_t a = thread->get_operand_value(pI->src1(), pI->dst(), S32_TYPE, thread, 1).s32;
+  const int32_t b = thread->get_operand_value(pI->src2(), pI->dst(), S32_TYPE, thread, 1).s32;
+  uint32_t d = sat(b) | (sat(a) << size);
+  if (size < 16 && pI->get_num_operands() > 3) {
+    const uint32_t c = thread->get_operand_value(pI->src3(), pI->dst(), B32_TYPE, thread, 1).u32;
+    d |= c << (2 * size);
+  }
+  ptx_reg_t r;
+  r.u64 = 0;
+  r.u32 = d;
+  thread->set_operand_value(pI->dst(), r, B32_TYPE, thread, pI);
+}

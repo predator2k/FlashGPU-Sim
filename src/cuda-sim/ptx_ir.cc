@@ -1342,7 +1342,7 @@ static std::list<operand_info> check_operands(
     int opcode, const std::list<int> &scalar_type,
     const std::list<operand_info> &operands, gpgpu_context *ctx) {
   static int g_warn_literal_operands_two_type_inst;
-  if ((opcode == CVT_OP) || (opcode == SET_OP) || (opcode == SLCT_OP) ||
+  if ((opcode == CVT_OP) || (opcode == CVT_PACK_OP) || (opcode == SET_OP) || (opcode == SLCT_OP) ||
       (opcode == TEX_OP) || (opcode == MMA_OP) || (opcode == TENSOR_MMA_OP) ||
       (opcode == FMA_OP) ||
       (opcode == WGMMA_MMA_ASYNC_OP) ||

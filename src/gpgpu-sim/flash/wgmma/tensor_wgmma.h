@@ -48,6 +48,9 @@ void wgmma_m64n8k256_b1_impl(const ptx_instruction *pI, core_t *core,
 
 // Shared WGMMA fragment helpers used by data-type-specific implementations.
 unsigned wgmma_thread_count(core_t *core, const warp_inst_t &inst);
+// yasai: sparse wgmma.mma_async.sp (wgmma_sparse.cc).
+void wgmma_sp_generic_impl(const ptx_instruction *pI, core_t *core,
+                           warp_inst_t &inst);
 // yasai: generic dense wgmma (wgmma_generic.cc).
 void wgmma_generic_impl(const ptx_instruction *pI, core_t *core,
                         warp_inst_t &inst);
