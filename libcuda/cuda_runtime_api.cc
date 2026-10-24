@@ -774,15 +774,16 @@ static CUresult load_module_from_cuda_library_ptx(CUmodule *module,
 // yasai: cuModuleLoadData and cuModuleLoadDataEx load the image they are given (Triton,
 // DeepGEMM and CuTe DSL modules): a PTX image directly, a fat binary through its embedded PTX,
 // an ELF cubin through the PTX that the JIT caches keep (yasai_jit_image.h). The PTX sidecar of
-// GPGPUSIM_CUDA_LIBRARY_PTX / PTX_SIM_KERNELFILE, when set, still takes precedence; an image
+// GPGPUSIM_CUDA_LIBRARY_PTX / PTX_SIM_KERNELFILE, when its file exists, still takes precedence; an image
 // without PTX falls back to it as before.
 //   module  receives the module handle
 //   image   the image the caller passed
 //   caller  name of the API function (for the log)
 static CUresult yasai_load_module_image(CUmodule *module, const void *image, const char *caller) {
-  const char *sidecar = getenv("GPGPUSIM_CUDA_LIBRARY_PTX");
-  const char *kernelfile = getenv("PTX_SIM_KERNELFILE");
-  if ((sidecar != NULL && *sidecar) || (kernelfile != NULL && *kernelfile))
+  // setup_environment always exports PTX_SIM_KERNELFILE=_1.ptx, so the sidecar counts only
+  // when its file exists.
+  const std::string sidecar = get_cuda_library_ptx_path();
+  if (!sidecar.empty() && file_exists(sidecar))
     return load_module_from_cuda_library_ptx(module, caller);
   gpgpu_context *ctx = GPGPU_Context();
   if (!ctx) return CUDA_ERROR_INVALID_HANDLE;
