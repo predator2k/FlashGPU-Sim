@@ -18,7 +18,9 @@
 // keeps it; a file of another unit gets the kernel renamed with its module suffix. A unit is a
 // library (all PTX files with one library key: the architecture variants of one library share
 // their kernels, the first definition winning as before) or one module loaded by the driver API
-// (its PTX path). module_entry_name() maps a kernel name for a driver-API module
+// (its PTX path), or one translation unit of a library or program when the caller knows its fat
+// binary (yasai_fatbin_units.h): two translation units of one library may define the same
+// template kernel with different bodies. module_entry_name() maps a kernel name for a driver-API module
 // (cuModuleGetFunction), library_entry_name() for a fat binary's library (__cudaRegisterFunction),
 // and source_name() maps a renamed kernel back to its source name (records, cuKernelGetName).
 #ifndef YASAI_MODULE_SCOPE_H_INCLUDED
@@ -54,6 +56,15 @@ std::string module_entry_name(const std::string &path, const std::string &name);
 /// @param library File name of the fat binary that registers it ("" when unknown).
 /// @return The name to look up.
 std::string library_entry_name(const std::string &name, const std::string &library);
+
+/// The symbol of kernel name for the unit that registers it (a translation unit "<library
+/// key>#<fat binary number>" from yasai_fatbin_units.h, as passed to scope_file): the renamed
+/// symbol when that unit's file renamed the kernel, otherwise name (the unit that defined the
+/// name first keeps it).
+/// @param name Kernel name as the host registers it.
+/// @param unit Unit of the registering fat binary ("" when unknown).
+/// @return The name to look up.
+std::string unit_entry_name(const std::string &name, const std::string &unit);
 
 /// Unit of a library's PTX files for scope_file: the library key of the library's file name
 /// ("libfoo" for "/path/libfoo.so.1"). Files extracted from a library may be named after its

@@ -139,6 +139,20 @@ struct CUctx_st {
 
   void register_function(unsigned fat_cubin_handle, const char *hostFun,
                          const char *deviceFun) {
+    // yasai: a host stub registered again under another kernel symbol (a template kernel whose
+    // COMDAT host stub two translation units share, each registering its own module's kernel)
+    // keeps the last registration, as the CUDA runtime binds one (module, function) pair per
+    // stub; the replacement is logged.
+    {
+      auto prev = m_yasai_registered_name.find(hostFun);
+      if (prev != m_yasai_registered_name.end() && prev->second != deviceFun &&
+          ++m_yasai_reregistered <= 20)
+        printf("GPGPU-Sim PTX: host function %p registered again as %s (fat binary %u, before "
+               "%s): the last registration is kept%s\n",
+               (const void *)hostFun, deviceFun, fat_cubin_handle, prev->second.c_str(),
+               m_yasai_reregistered == 20 ? " (further ones are not printed)" : "");
+      m_yasai_registered_name[hostFun] = deviceFun;
+    }
     if (m_code.find(fat_cubin_handle) != m_code.end()) {
       symbol *s = m_code[fat_cubin_handle]->lookup(deviceFun);
       // yasai: fall back to every loaded module (see add_binary).
@@ -233,6 +247,10 @@ struct CUctx_st {
   std::vector<symbol_table *> m_all_code;  // yasai: every module table, in load order
   // yasai: host stub -> device kernel name of kernels whose PTX was not loaded at registration.
   std::map<const void *, std::string> m_yasai_pending_kernel;
+  // yasai: host stub -> kernel symbol of its latest registration (register_function).
+  std::map<const void *, std::string> m_yasai_registered_name;
+  // yasai: number of host stubs registered again under another kernel symbol.
+  unsigned m_yasai_reregistered = 0;
   // yasai: kernel names already reported as having no PTX (each is printed once).
   std::set<std::string> m_yasai_reported_missing;
   std::map<const void *, function_info *>
