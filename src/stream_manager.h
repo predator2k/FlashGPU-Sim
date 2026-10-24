@@ -59,9 +59,11 @@ struct CUevent_st {
     m_issued = 0;
     m_done = false;
   }
+  // yasai: the issue and update counts are read and written atomically: the application thread
+  // issues and waits, the simulation thread updates.
   void update(double cycle, time_t clk) {
     if (m_shared) __atomic_fetch_add(&m_shared[1], 1u, __ATOMIC_ACQ_REL);
-    else m_updates++;
+    else __atomic_fetch_add(&m_updates, 1u, __ATOMIC_ACQ_REL);
     m_wallclock = clk;
     m_gpu_tot_sim_cycle = cycle;
     m_done = true;
@@ -69,16 +71,16 @@ struct CUevent_st {
   // void set_done() { assert(!m_done); m_done=true; }
   int get_uid() const { return m_uid; }
   unsigned num_updates() const {
-    return m_shared ? __atomic_load_n(&m_shared[1], __ATOMIC_ACQUIRE) : m_updates;
+    return __atomic_load_n(m_shared ? &m_shared[1] : &m_updates, __ATOMIC_ACQUIRE);
   }
   bool done() const { return num_updates() == num_issued(); }
   time_t clock() const { return m_wallclock; }
   void issue() {
     if (m_shared) __atomic_fetch_add(&m_shared[0], 1u, __ATOMIC_ACQ_REL);
-    else m_issued++;
+    else __atomic_fetch_add(&m_issued, 1u, __ATOMIC_ACQ_REL);
   }
   unsigned int num_issued() const {
-    return m_shared ? __atomic_load_n(&m_shared[0], __ATOMIC_ACQUIRE) : m_issued;
+    return __atomic_load_n(m_shared ? &m_shared[0] : &m_issued, __ATOMIC_ACQUIRE);
   }
   /// yasai: makes the event interprocess: its issue and update counts live in shared memory
   /// (two 32-bit counters: [0] issued, [1] updates) that peer processes map through

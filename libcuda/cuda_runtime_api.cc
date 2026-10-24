@@ -4386,7 +4386,11 @@ __host__ cudaError_t CUDARTAPI cudaEventSynchronize(cudaEvent_t event) {
   printf("GPGPU-Sim API: cudaEventSynchronize ** waiting for event\n");
   fflush(stdout);
   CUevent_st *e = (CUevent_st *)event;
-  while (!e->done());
+  // yasai: polls with sleeps (20 us, doubling up to 1 ms). The former empty loop
+  // "while (!e->done());" over plain counters had no side effect, so the compiler could assume
+  // it ends and drop it: cudaEventSynchronize returned before the event's stream reached it,
+  // which a host-blocking launch used to hide.
+  for (unsigned us = 20; e != NULL && !e->done(); us = us < 1000 ? 2 * us : 1000) usleep(us);
   printf("GPGPU-Sim API: cudaEventSynchronize ** event detected\n");
   fflush(stdout);
   if (rec_on) {
