@@ -4925,9 +4925,19 @@ std::string yasai_piece_path(const std::string &src, int piece, const char *suff
 // True when per-kernel loading also defers function bodies to their first call
 // (YASAI_PTX_LAZY_FUNC unset or nonzero). Otherwise a kernel's piece holds every function it
 // reaches, through calls and through the function pointers of the file's initializers.
-bool yasai_lazy_func_enabled() {
+bool yasai_lazy_func_enabled(const std::string &file) {
   const char *e = getenv("YASAI_PTX_LAZY_FUNC");
-  return e == NULL || atoi(e) != 0;
+  if (e != NULL && atoi(e) == 0) return false;
+  // yasai: YASAI_PTX_LAZY_FUNC_REGEX limits lazy function bodies to the PTX files whose path
+  // matches (for example the NCCL merged module, whose function table reaches every body);
+  // the other files keep every reached function in the kernel's piece. Decided once per file.
+  const char *r = getenv("YASAI_PTX_LAZY_FUNC_REGEX");
+  if (r == NULL || *r == '\0') return true;
+  static std::map<std::string, bool> decided;
+  auto it = decided.find(file);
+  if (it != decided.end()) return it->second;
+  static const std::regex rx(r);
+  return decided[file] = std::regex_search(file, rx);
 }
 
 // Header of a .func definition item: its text up to the body's opening brace, as a
@@ -5065,7 +5075,7 @@ bool yasai_lazy_load_piece_lazyfunc(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int
 // resource usage is the kernel's. Returns true when something was parsed.
 //   ctx: simulator context; L: index of the fat binary; i: file index; name: kernel or variable
 bool yasai_lazy_load_piece(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i, const char *name) {
-  if (yasai_lazy_func_enabled()) return yasai_lazy_load_piece_lazyfunc(ctx, L, i, name);
+  if (yasai_lazy_func_enabled(L.files[i])) return yasai_lazy_load_piece_lazyfunc(ctx, L, i, name);
   std::string target = name;
   if (L.funcs_loaded[i].count(target)) return false;
   std::ifstream in(L.files[i]);
