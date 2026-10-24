@@ -1,7 +1,9 @@
 // yasai: per-module scope for PTX symbols without linkage (see yasai_module_scope.h).
 #include "yasai_module_scope.h"
 
+#include <dirent.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <cctype>
@@ -9,6 +11,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <algorithm>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -293,6 +297,55 @@ std::string rename_line(const std::string &line, const std::set<std::string> &na
   return out;
 }
 
+/// Keeps the shared cache directory within YASAI_MODULE_SCOPE_MAX_GB (default 4; 0 turns the cap
+/// off). A copy's modification time is its last use (scope_file touches a cached copy), and the
+/// least recently used copies are removed until the directory is within 90% of the cap. Copies
+/// used within the last 24 hours are never removed, since a running process may still parse
+/// them (PTX is parsed lazily). Runs once per process, at the first copy in a shared directory.
+/// @param dir Cache directory.
+void evict_lru_once(const std::string &dir) {
+  static bool done = false;
+  if (done) return;
+  done = true;
+  const char *cap_env = getenv("YASAI_MODULE_SCOPE_MAX_GB");
+  const double cap_gb = cap_env && *cap_env ? atof(cap_env) : 4.0;
+  if (cap_gb <= 0) return;
+  DIR *d = opendir(dir.c_str());
+  if (!d) return;
+  struct entry {
+    std::string path;
+    time_t used;
+    off_t size;
+  };
+  std::vector<entry> files;
+  off_t total = 0;
+  while (struct dirent *e = readdir(d)) {
+    if (e->d_name[0] == '.') continue;
+    const std::string f = dir + "/" + e->d_name;
+    struct stat st;
+    if (stat(f.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+    files.push_back({f, st.st_mtime, st.st_size});
+    total += st.st_size;
+  }
+  closedir(d);
+  const off_t cap = off_t(cap_gb * 1073741824.0);
+  if (total <= cap) return;
+  std::sort(files.begin(), files.end(),
+            [](const entry &a, const entry &b) { return a.used < b.used; });
+  const time_t keep_after = time(nullptr) - 24 * 3600;
+  const off_t target = cap / 10 * 9;
+  size_t removed = 0;
+  for (const entry &f : files) {
+    if (total <= target || f.used >= keep_after) break;
+    if (unlink(f.path.c_str()) == 0) {
+      total -= f.size;
+      removed++;
+    }
+  }
+  printf("GPGPU-Sim PTX: module-scope cache %s: %zu least recently used copies removed, %.2f GB "
+         "left (cap %.1f GB)\n", dir.c_str(), removed, double(total) / 1073741824.0, cap_gb);
+}
+
 }  // namespace
 
 std::string scope_file(const std::string &path, const std::string &unit_in) {
@@ -351,8 +404,11 @@ std::string scope_file(const std::string &path, const std::string &unit_in) {
   char hx[24];
   snprintf(hx, sizeof hx, "%016llx-", (unsigned long long)content_hash);
   const std::string out_path = dir + "/" + hx + base;
+  if (dir_env && *dir_env) evict_lru_once(dir);
   struct stat st;
   const bool cached = stat(out_path.c_str(), &st) == 0;
+  // A reused copy's modification time records its use, for the LRU eviction.
+  if (cached) utimes(out_path.c_str(), nullptr);
   // Written under a unique name (mkstemp) and renamed, so processes that share the directory (the
   // same file, the same content) never read a partial copy. A PID alone is not unique: ranks in
   // two containers can have the same PID in their own PID namespaces.
