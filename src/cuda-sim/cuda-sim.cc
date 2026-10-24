@@ -617,7 +617,10 @@ void function_info::ptx_assemble() {
   // get the instructions into instruction memory...
   unsigned num_inst = m_instructions.size();
   m_instr_mem_size = MAX_INST_SIZE * (num_inst + 1);
-  m_instr_mem = new ptx_instruction *[m_instr_mem_size];
+  // yasai: value-initialized, so the slots after the last instruction read NULL (labels take no
+  // slot); connect_basic_blocks tests the slot after a trap or a block's last instruction, which
+  // read uninitialized memory before.
+  m_instr_mem = new ptx_instruction *[m_instr_mem_size]();
 
   printf("GPGPU-Sim PTX: instruction assembly for function \'%s\'... ",
          m_name.c_str());
