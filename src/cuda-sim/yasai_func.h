@@ -44,6 +44,11 @@ struct Config {
   bool cta_sample = false;   // YASAI_CTA_SAMPLE
   std::string trace_dir;     // YASAI_TRACE_DIR: directory of the per-kernel warp traces; empty disables
   uint64_t trace_max_bytes = 0;  // YASAI_TRACE_MAX_MB in bytes; 0 means no limit
+  // YASAI_LAUNCH_ONLY_REGEX: kernels whose mangled name matches (std::regex, ECMAScript, searched
+  // anywhere in the name) are launched and recorded but none of their CTAs execute, so their
+  // outputs keep the previous memory contents. Meant for kernels whose values do not matter in a
+  // run, such as the random initialization of dummy weights; empty disables.
+  std::string launch_only_regex;
 };
 
 // Returns the process-wide configuration.
@@ -132,6 +137,9 @@ bool skip_fp_value(const ptx_instruction *pI, unsigned lane_id);
 // equals the lowest interior index (2). The second index in each dimension gives the per-
 // dimension address stride used by the synthesis. Without YASAI_CTA_SAMPLE every CTA runs.
 bool cta_is_representative(Dim3 grid, unsigned cta_linear_id);
+
+// True when the current kernel (kernel_begin) matches YASAI_LAUNCH_ONLY_REGEX: no CTA runs.
+bool launch_only();
 
 // Functional mbarrier model. FlashGPU-Sim keeps mbarrier state only in the timing model
 // (barrier_set_t), so in PTX_SIM_MODE_FUNC=1 an mbarrier.try_wait never succeeds and every kernel
