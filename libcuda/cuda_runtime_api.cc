@@ -749,6 +749,13 @@ static std::string get_cuda_library_ptx_path() {
   return std::string();
 }
 
+// yasai: PTX file of each module handle loaded from PTX (cuLibraryEnumerateKernels lists its
+// entries).
+static std::map<unsigned, std::string> &yasai_module_ptx() {
+  static std::map<unsigned, std::string> m;
+  return m;
+}
+
 static CUresult load_module_from_ptx_file(CUmodule *module,
                                           const std::string &ptx_path,
                                           const char *caller) {
@@ -775,6 +782,7 @@ static CUresult load_module_from_ptx_file(CUmodule *module,
   ctx->api->fatbinmap[module_handle] = ptx_path;
   ctx->api->fatbin_registered[module_handle] = true;
   ctx->api->name_symtab[ptx_path] = symtab;
+  yasai_module_ptx()[module_handle] = ptx_path;
 
   std::string arch = ptx_target_from_file(ptx_path);
   if (arch.empty()) {
@@ -5990,8 +5998,9 @@ cudaError_t CUDARTAPI cudaLibraryLoadData(
   }
   if (library == NULL) return g_last_cudaError = cudaErrorInvalidValue;
 
+  // yasai: the code image is resolved like a cuModuleLoadData image (yasai_load_module_image).
   CUmodule module = NULL;
-  CUresult result = load_module_from_cuda_library_ptx(&module, __my_func__);
+  CUresult result = yasai_load_module_image(&module, code, __my_func__);
   if (result != CUDA_SUCCESS) {
     return g_last_cudaError = cudaErrorInvalidValue;
   }
@@ -10531,3 +10540,128 @@ CUresult CUDAAPI cuGraphUpload(CUgraphExec hGraphExec, CUstream hStream) {
 }
 
 }  // extern "C"
+
+// ---- yasai: driver library API (DeepGEMM's JIT loads its kernels this way) ------------------
+// A CUlibrary is a module handle and a CUkernel is the CUfunction of cuModuleGetFunction (the
+// kernel's host key). Types are written as void pointers because the bundled cuda_api.h predates
+// the library API.
+
+// Entry names of a module loaded from PTX, in file order.
+//   module  module handle
+static std::vector<std::string> yasai_module_entries(CUmodule module) {
+  std::vector<std::string> names;
+  auto it = yasai_module_ptx().find((unsigned)(unsigned long long)module);
+  if (it == yasai_module_ptx().end()) return names;
+  std::ifstream in(it->second.c_str());
+  std::string line;
+  while (std::getline(in, line)) {
+    const size_t e = line.find(".entry");
+    if (e == std::string::npos) continue;
+    size_t b = e + 6;
+    while (b < line.size() && isspace((unsigned char)line[b])) ++b;
+    size_t f = b;
+    while (f < line.size() && (isalnum((unsigned char)line[f]) || line[f] == '_' || line[f] == '$')) ++f;
+    if (f > b) names.push_back(line.substr(b, f - b));
+  }
+  return names;
+}
+
+// cuLibraryLoadData: the image as for cuModuleLoadData.
+//   library, code, options  as in cuda.h (options not used)
+extern "C" CUresult CUDAAPI cuLibraryLoadData(void **library, const void *code, void *, void **,
+                                              unsigned, void *, void **, unsigned) {
+  if (library == NULL) return CUDA_ERROR_INVALID_VALUE;
+  CUmodule module = NULL;
+  const CUresult r = yasai_load_module_image(&module, code, __my_func__);
+  *library = (void *)module;
+  return r;
+}
+
+// cuLibraryLoadFromFile: a .cubin with its .ptx beside it loads that PTX; any other file is read
+// and resolved as a module image.
+//   library, fileName, options  as in cuda.h (options not used)
+extern "C" CUresult CUDAAPI cuLibraryLoadFromFile(void **library, const char *fileName, void *,
+                                                  void **, unsigned, void *, void **, unsigned) {
+  if (library == NULL || fileName == NULL) return CUDA_ERROR_INVALID_VALUE;
+  CUmodule module = NULL;
+  const std::string sidecar = sidecar_ptx_for_module(fileName);
+  CUresult r;
+  if (!sidecar.empty()) {
+    r = load_module_from_ptx_file(&module, sidecar, __my_func__);
+  } else {
+    std::ifstream in(fileName, std::ios::binary);
+    if (!in.good()) return CUDA_ERROR_FILE_NOT_FOUND;
+    std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    bytes.push_back('\0');
+    r = yasai_load_module_image(&module, bytes.data(), __my_func__);
+  }
+  *library = (void *)module;
+  return r;
+}
+
+// cuLibraryUnload: modules stay loaded.
+//   library  as in cuda.h
+extern "C" CUresult CUDAAPI cuLibraryUnload(void *library) {
+  (void)library;
+  return CUDA_SUCCESS;
+}
+
+// cuLibraryGetModule: the library is a module.
+//   pMod, library  as in cuda.h
+extern "C" CUresult CUDAAPI cuLibraryGetModule(CUmodule *pMod, void *library) {
+  if (pMod == NULL) return CUDA_ERROR_INVALID_VALUE;
+  *pMod = (CUmodule)library;
+  return CUDA_SUCCESS;
+}
+
+// cuLibraryGetKernel: the kernel of that name.
+//   pKernel, library, name  as in cuda.h
+extern "C" CUresult CUDAAPI cuLibraryGetKernel(void **pKernel, void *library, const char *name) {
+  if (pKernel == NULL) return CUDA_ERROR_INVALID_VALUE;
+  CUfunction f = NULL;
+  const CUresult r = cuModuleGetFunction(&f, (CUmodule)library, name);
+  *pKernel = (void *)f;
+  return r;
+}
+
+// cuLibraryGetKernelCount: number of entries of the library's PTX.
+//   count, library  as in cuda.h
+extern "C" CUresult CUDAAPI cuLibraryGetKernelCount(unsigned int *count, void *library) {
+  if (count == NULL) return CUDA_ERROR_INVALID_VALUE;
+  *count = (unsigned)yasai_module_entries((CUmodule)library).size();
+  return CUDA_SUCCESS;
+}
+
+// cuLibraryEnumerateKernels: up to numKernels kernels, in PTX file order.
+//   kernels, numKernels, library  as in cuda.h
+extern "C" CUresult CUDAAPI cuLibraryEnumerateKernels(void **kernels, unsigned int numKernels,
+                                                      void *library) {
+  if (kernels == NULL) return CUDA_ERROR_INVALID_VALUE;
+  const std::vector<std::string> names = yasai_module_entries((CUmodule)library);
+  for (unsigned i = 0; i < numKernels && i < names.size(); ++i) {
+    CUfunction f = NULL;
+    const CUresult r = cuModuleGetFunction(&f, (CUmodule)library, names[i].c_str());
+    if (r != CUDA_SUCCESS) return r;
+    kernels[i] = (void *)f;
+  }
+  return CUDA_SUCCESS;
+}
+
+// cuKernelGetFunction: a kernel is its function.
+//   pFunc, kernel  as in cuda.h
+extern "C" CUresult CUDAAPI cuKernelGetFunction(CUfunction *pFunc, void *kernel) {
+  if (pFunc == NULL) return CUDA_ERROR_INVALID_VALUE;
+  *pFunc = (CUfunction)kernel;
+  return CUDA_SUCCESS;
+}
+
+// cuKernelGetName: the entry name of the kernel.
+//   name, kernel  as in cuda.h
+extern "C" CUresult CUDAAPI cuKernelGetName(const char **name, void *kernel) {
+  if (name == NULL || kernel == NULL) return CUDA_ERROR_INVALID_VALUE;
+  static std::map<void *, std::string> names;
+  function_info *f = reinterpret_cast<function_info *>(kernel);
+  names[kernel] = f->get_name();
+  *name = names[kernel].c_str();
+  return CUDA_SUCCESS;
+}
