@@ -7151,10 +7151,11 @@ extern "C" CUresult CUDAAPI cuStreamGetCtx(CUstream hStream, CUcontext *pctx) {
   return CUDA_SUCCESS;
 }
 
-// yasai: cuStreamGetCtx with a green context output, which the simulator has none of.
+// yasai: cuStreamGetCtx with a green context output, which the simulator has none of
+// (CUgreenCtx is an opaque pointer type; the simulator's headers do not declare it).
 //   hStream: stream; pCtx: receives the context; pGreenCtx: receives NULL
 extern "C" CUresult CUDAAPI cuStreamGetCtx_v2(CUstream hStream, CUcontext *pCtx,
-                                             CUgreenCtx *pGreenCtx) {
+                                             void **pGreenCtx) {
   if (pGreenCtx) *pGreenCtx = NULL;
   return cuStreamGetCtx(hStream, pCtx);
 }
