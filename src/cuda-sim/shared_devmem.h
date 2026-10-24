@@ -67,6 +67,20 @@ size_t granularity();
 /// @return True on success; on failure nothing is mapped or recorded.
 bool alloc_device(uint64_t va, size_t size);
 
+/// Marks the calling thread as executing device work (the simulation thread for one turn of its
+/// loop, a memset or a copy into device memory) while the object lives. A conversion of an
+/// anonymous allocation into a segment (ipc_export, share_range) waits until no thread is inside
+/// such a scope and keeps new ones out until it has copied the allocation and replaced its
+/// mapping, so no store lands in the old pages after the copy. Scopes nest on one thread.
+struct exec_scope {
+  /// Enters the scope (waits while a conversion runs).
+  exec_scope();
+  /// Leaves the scope.
+  ~exec_scope();
+  exec_scope(const exec_scope &) = delete;
+  exec_scope &operator=(const exec_scope &) = delete;
+};
+
 /// Creates a physical allocation of `size` bytes (rounded up to the granularity).
 /// @param size Requested size in bytes.
 /// @return The allocation, or nullptr when the segment cannot be created.

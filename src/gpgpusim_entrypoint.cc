@@ -38,6 +38,7 @@
 #include "gpgpu-sim/icnt_wrapper.h"
 #include "option_parser.h"
 #include "stream_manager.h"
+#include "cuda-sim/shared_devmem.h"
 
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 
@@ -129,6 +130,9 @@ void *gpgpu_sim_thread_concurrent(void *ctx_ptr) {
       return v == NULL || atoi(v) != 0;
     }();
     do {
+      // yasai: one turn of this loop is device work; a conversion of anonymous device memory
+      // into a shared segment runs between turns (shared_devmem::exec_scope).
+      shared_devmem::exec_scope turn;
       // check if a kernel has completed
       // launch operation on device if one is pending and can be run
 
