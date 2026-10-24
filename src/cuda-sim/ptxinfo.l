@@ -55,7 +55,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 "ptxas"("-"[a-z]+)?" info    : Function properties for"[^\n]*\n[^\n]*
 "ptxas"("-"[a-z]+)?" info    : ("[A-Z][0-9]+")"[^\n]*
 "ptxas"("-"[a-z]+)?" info    : "[A-Z][0-9]+[^\n]*
-"warning"[^\n]* TC; return WARNING;
+"warning"[^\n]* TC; yylval->string_value = strdup(yytext); return WARNING; /* yasai: the "HEADER WARNING" rule prints it */
 "ptxas"("-"[a-z]+)?	TC; 	return HEADER;
 "info"	TC; 	return INFO;
 "Compiling entry function"	TC; return FUNC;
