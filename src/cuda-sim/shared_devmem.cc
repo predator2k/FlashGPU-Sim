@@ -17,7 +17,10 @@
 #include <ctime>
 #include <map>
 #include <mutex>
+#include <chrono>
+#include <memory>
 #include <set>
+#include <condition_variable>
 #include <vector>
 
 #include "host_window.h"
@@ -317,13 +320,69 @@ void hook_write(void *mc, uint64_t off, size_t bytes, const void *in) {
 
 /// Moves an anonymous cudaMalloc allocation into a new segment mapped at the same address: its
 /// non-zero chunks are copied (pages that were never written stay holes) and the segment then
-/// replaces the anonymous mapping. The caller holds st().mu and has synchronized the device, so no
-/// kernel writes the allocation meanwhile. A registration that pinned the anonymous pages before
+/// replaces the anonymous mapping. The caller holds a quiesce (no simulation turn, memset or copy
+/// runs) and st().mu, so no store reaches the old pages after the copy. A registration that pinned the anonymous pages before
 /// (ibv_reg_mr without the yasai_devmem_prepare_pin hook) would keep the old pages, so a conversion
 /// while the process holds pinned memory prints a warning.
 /// @param b First address.
 /// @param a The allocation.
 /// @return True on success.
+/// Gate between device work (exec_scope) and conversions (quiesce). A waiting conversion keeps
+/// new device work out, so the simulation thread, which enters a scope again right after it
+/// leaves one, cannot starve it.
+struct exec_gate {
+  std::mutex mu;                ///< guards the counters
+  std::condition_variable cv;   ///< signalled when a counter changes
+  int active = 0;               ///< threads inside an exec_scope
+  int waiting = 0;              ///< conversions waiting for active to reach 0
+  bool converting = false;      ///< a conversion runs
+};
+
+/// The gate of this process.
+exec_gate &gate() {
+  static auto *g = new exec_gate;  // never destroyed: used during exit
+  return *g;
+}
+
+/// Depth of exec_scope objects on this thread.
+thread_local int t_exec_depth = 0;
+
+/// Keeps device work out while it lives, so that no simulation turn, memset or copy runs during
+/// a conversion. The simulation thread stops between turns, so a kernel that spins on a flag
+/// pauses instead of having to finish. A thread inside an exec_scope does not wait (it would
+/// wait for itself); a wait longer than 60 s prints a warning and the conversion goes on without
+/// the gate.
+struct quiesce {
+  bool held = false;  ///< this conversion holds the gate
+  /// Waits until no device work runs, then holds the gate.
+  quiesce() {
+    if (t_exec_depth > 0) return;
+    exec_gate &g = gate();
+    std::unique_lock<std::mutex> lk(g.mu);
+    g.waiting++;
+    held = g.cv.wait_for(lk, std::chrono::seconds(60),
+                         [&] { return g.active == 0 && !g.converting; });
+    g.waiting--;
+    if (held) {
+      g.converting = true;
+    } else {
+      g.cv.notify_all();
+      fprintf(stderr, "shared_devmem: WARNING: a conversion waited 60 s for the simulation "
+              "thread to pause and goes on without it\n");
+    }
+  }
+  /// Releases the gate.
+  ~quiesce() {
+    if (!held) return;
+    exec_gate &g = gate();
+    {
+      std::lock_guard<std::mutex> lk(g.mu);
+      g.converting = false;
+    }
+    g.cv.notify_all();
+  }
+};
+
 bool convert_anon_locked(uint64_t b, allocation &a) {
   const size_t len = round_up(a.size, kPage);
   if (const long kb = pinned_kb())
@@ -397,6 +456,25 @@ void init_once() {
 }
 
 }  // namespace
+
+exec_scope::exec_scope() {
+  if (t_exec_depth++ > 0) return;
+  exec_gate &g = gate();
+  std::unique_lock<std::mutex> lk(g.mu);
+  g.cv.wait(lk, [&] { return !g.converting && g.waiting == 0; });
+  g.active++;
+}
+
+exec_scope::~exec_scope() {
+  if (--t_exec_depth > 0) return;
+  exec_gate &g = gate();
+  bool wake;
+  {
+    std::lock_guard<std::mutex> lk(g.mu);
+    wake = --g.active == 0 && g.waiting > 0;
+  }
+  if (wake) g.cv.notify_all();
+}
 
 bool devmem_host_enabled() {
   static const bool on = [] {
@@ -607,6 +685,10 @@ bool range_of(uint64_t addr, uint64_t *base, size_t *size) {
 bool ipc_export(uint64_t addr, const read_fn &read_old, std::string *ref, uint64_t *base,
                 size_t *size) {
   init_once();
+  // yasai: the exclusive exec lock comes before st().mu (lock order), and only when this call
+  // converts.
+  std::unique_ptr<quiesce> q;
+  if (range_needs_copy(addr, 1)) q.reset(new quiesce);
   std::lock_guard<std::mutex> lock(st().mu);
   state &s = st();
   auto it = s.allocs.upper_bound(addr);
@@ -666,6 +748,7 @@ bool range_needs_copy(uint64_t addr, size_t bytes) {
 
 bool share_range(uint64_t addr, size_t bytes) {
   init_once();
+  quiesce q;  // before st().mu (lock order)
   std::lock_guard<std::mutex> lock(st().mu);
   state &s = st();
   auto it = s.allocs.upper_bound(addr);
