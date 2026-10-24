@@ -40,6 +40,8 @@
 #include "opcodes.h"
 #include "ptx_ir.h"
 #include "ptx_sim.h"
+#include "host_window.h"
+#include "shared_devmem.h"
 typedef void *yyscan_t;
 class ptx_recognizer;
 #include <assert.h>
@@ -1408,6 +1410,11 @@ void bar_callback(const inst_t *inst, ptx_thread_info *thread) {
   thread->set_operand_value(dst, value, U32_TYPE, thread, pI);
 }
 
+// yasai: atomics on shared host_window words (yasai_rmw.inc).
+uint64_t yasai_atom_shared(const ptx_instruction *pI, ptx_thread_info *thread, addr_t addr,
+                           uint64_t b, uint64_t c);
+bool yasai_atom_is_shared(const ptx_instruction *pI, memory_space_t space, addr_t addr);
+
 void atom_callback(const inst_t *inst, ptx_thread_info *thread) {
   const ptx_instruction *pI = dynamic_cast<const ptx_instruction *>(inst);
 
@@ -1467,6 +1474,20 @@ void atom_callback(const inst_t *inst, ptx_thread_info *thread) {
     mem = thread->m_shared_mem;
   else
     abort();
+
+  // yasai: a word of memory shared with other processes is updated with a host
+  // compare-and-swap loop, so that the atomic holds across processes.
+  if (yasai_atom_is_shared(pI, space, effective_address)) {
+    uint64_t c = 0;
+    if (pI->get_atomic() == ATOMIC_CAS) {
+      const operand_info &src3 = pI->src3();
+      c = thread->get_operand_value(src3, dst.get_symbol()->type() ? dst : src1, to_type,
+                                    thread, 1).u64;
+    }
+    data.u64 = yasai_atom_shared(pI, thread, effective_address, src2_data.u64, c);
+    if (dst.get_symbol()->type()) thread->set_operand_value(dst, data, to_type, thread, pI);
+    return;
+  }
 
   // Copy value pointed to in operand 'a' into register 'd'
   // (i.e. copy src1_data to dst)
@@ -1794,6 +1815,14 @@ void atom_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   thread->m_last_dram_callback.function = atom_callback;
   thread->m_last_dram_callback.instruction = pI;
 }
+
+// yasai: implemented in yasai_rmw.inc (one line each so that the generated instructions.h
+// declares them).
+void red_impl(const ptx_instruction *pI, ptx_thread_info *thread);
+void multimem_ld_reduce_impl(const ptx_instruction *pI, ptx_thread_info *thread);
+void multimem_st_impl(const ptx_instruction *pI, ptx_thread_info *thread);
+void multimem_red_impl(const ptx_instruction *pI, ptx_thread_info *thread);
+#include "yasai_rmw.inc"
 
 void bar_impl(const ptx_instruction *pIin, ptx_thread_info *thread) {
   ptx_instruction *pI = const_cast<ptx_instruction *>(pIin);
@@ -2625,6 +2654,11 @@ void call_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     }
   }
   function_info *target_func = func_addr->get_pc();
+  // yasai: with lazy function bodies (per-kernel PTX loading) a function is only declared until
+  // its first call; parse its body now (the call target is known only here for indirect calls
+  // through function tables).
+  if (target_func->get_function_size() == 0 && yasai_func::g_lazy_load_name != nullptr)
+    yasai_func::g_lazy_load_name(target_func->get_name().c_str());
   if (target_func->is_pdom_set()) {
     printf("GPGPU-Sim PTX: PDOM analysis already done for %s \n",
            target_func->get_name().c_str());
@@ -5857,9 +5891,6 @@ void rcp_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   thread->set_operand_value(dst, data, i_type, thread, pI);
 }
 
-void red_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
-  inst_not_implemented(pI);
-}
 
 void rem_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   ptx_reg_t src1_data, src2_data, data;

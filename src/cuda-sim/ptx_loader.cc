@@ -641,11 +641,12 @@ char *get_app_binary_name() {
 }
 
 void gpgpu_context::gpgpu_ptx_info_load_from_filename(const char *filename,
-                                                      const char *arch_str) {
+                                                      const char *arch_str,
+                                                      bool compile_only) {
   std::string ptxas_filename(std::string(filename) + "as");
   char buff[4096], extra_flags[1024];
   extra_flags[0] = 0;
-  if (!device_runtime->g_cdp_enabled)
+  if (!device_runtime->g_cdp_enabled && !compile_only)
     snprintf(extra_flags, 1024, "--gpu-name=%s", arch_str);
   else
     snprintf(extra_flags, 1024, "--compile-only --gpu-name=%s", arch_str);

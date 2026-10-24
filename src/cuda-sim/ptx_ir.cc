@@ -597,8 +597,18 @@ void function_info::connect_basic_blocks()  // iterate across m_basic_blocks of
     ptx_instruction *pI = (*bb_itr)->ptx_end;
     if ((*bb_itr)->is_exit)  // reached last basic block, no successors to link
       continue;
+    // yasai: an unpredicated trap that ends the function links to the exit block like exit
+    // (Triton ends its assert path with "call __assertfail; trap;" as the function's last
+    // instructions, so no block follows it). A trap that other code follows keeps its
+    // fall-through edge: making it an exit edge moves the immediate post-dominator of the branch
+    // around it to the exit block, so the warp would not reconverge after an assert check
+    // (FlashMLA's decode kernels then compute wrong results).
+    const unsigned trap_next = pI->get_m_instr_mem_index() + pI->inst_size();
+    const bool trap_at_end =
+        pI->get_opcode() == TRAP_OP && !pI->has_pred() &&
+        !(trap_next < m_instr_mem_size && m_instr_mem[trap_next]);
     if (pI->get_opcode() == RETP_OP || pI->get_opcode() == RET_OP ||
-        pI->get_opcode() == EXIT_OP) {
+        pI->get_opcode() == EXIT_OP || trap_at_end) {
       (*bb_itr)->successor_ids.insert(exit_bb->bb_id);
       exit_bb->predecessor_ids.insert((*bb_itr)->bb_id);
       if (pI->has_pred()) {
@@ -627,7 +637,11 @@ void function_info::connect_basic_blocks()  // iterate across m_basic_blocks of
       // then next basic block is also successor
       // (this is better than testing for .uni)
       unsigned next_addr = pI->get_m_instr_mem_index() + pI->inst_size();
-      basic_block_t *next_bb = m_instr_mem[next_addr]->get_bb();
+      // yasai: a block at the end of the function (no instruction follows) falls to the exit
+      // block rather than dereferencing an empty instruction slot.
+      basic_block_t *next_bb = (next_addr < m_instr_mem_size && m_instr_mem[next_addr])
+                                   ? m_instr_mem[next_addr]->get_bb()
+                                   : exit_bb;
       (*bb_itr)->successor_ids.insert(next_bb->bb_id);
       next_bb->predecessor_ids.insert((*bb_itr)->bb_id);
     } else

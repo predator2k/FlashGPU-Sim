@@ -161,6 +161,7 @@ typedef enum CUoutput_mode_enum {
 #include "../src/abstract_hardware_model.h"
 #include "../src/cuda-sim/cuda-sim.h"
 #include "../src/cuda-sim/host_window.h"
+#include "yasai_vmm.h"
 #include "../src/cuda-sim/ptx_ir.h"
 #include "../src/cuda-sim/ptx_loader.h"
 #include "../src/cuda-sim/ptx_parser.h"
@@ -303,6 +304,18 @@ CUctx_st *GPGPUSim_Context(gpgpu_context *ctx) {
     the_context = ctx->the_gpgpusim->the_context;
   }
   return the_context;
+}
+
+gpgpu_context *GPGPU_Context();
+
+// yasai: defined further down; the driver cuIpc* functions forward to them.
+extern "C" __host__ cudaError_t CUDARTAPI cudaIpcGetEventHandle(cudaIpcEventHandle_t *handle, cudaEvent_t event);
+extern "C" __host__ cudaError_t CUDARTAPI cudaIpcOpenEventHandle(cudaEvent_t *event, cudaIpcEventHandle_t handle);
+extern "C" __host__ cudaError_t CUDARTAPI cudaIpcCloseMemHandle(void *devPtr);
+
+/// yasai: simulated GPU of the current context (used by yasai_vmm.cc).
+gpgpu_t *yasai_current_gpu() {
+  return GPGPUSim_Context(GPGPU_Context())->get_device()->get_gpgpu();
 }
 
 gpgpu_context *GPGPU_Context() {
@@ -1385,7 +1398,10 @@ cudaError_t cudaMallocInternal(void **devPtr, size_t size,
     announce_call(__my_func__);
   }
   CUctx_st *context = GPGPUSim_Context(ctx);
-  *devPtr = context->get_device()->get_gpgpu()->gpu_malloc(size);
+  // yasai: memfd-backed host memory at the device address (yasai_vmm::malloc_device), unless
+  // YASAI_DEVMEM_HOST=0.
+  *devPtr = reinterpret_cast<void *>(
+      yasai_vmm::malloc_device(context->get_device()->get_gpgpu(), size));
   if (g_debug_execution >= 3) {
     printf("GPGPU-Sim PTX: cudaMallocing %zu bytes starting at 0x%llx..\n",
            size, (unsigned long long)*devPtr);
@@ -2349,8 +2365,10 @@ cudaDeviceGetAttributeInternal(int *value, enum cudaDeviceAttr attr, int device,
       case 101:  // cudaDevAttrDirectManagedMemAccessFromHost
         *value = 1;
         break;
-      case 102:  // Unassigned
-      case 103:  // Unassigned
+      case 102:  // yasai: CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED (cuMem*)
+      case 103:  // yasai: CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED
+        *value = 1;
+        break;
       case 104:  // Unassigned
       case 105:  // Unassigned
         *value = 0;
@@ -2408,8 +2426,8 @@ cudaDeviceGetAttributeInternal(int *value, enum cudaDeviceAttr attr, int device,
       case 124:  // cudaDevAttrReserved124
         *value = 0;
         break;
-      case 125:  // cudaDevAttrIpcEventSupport
-        *value = 0;
+      case 125:  // cudaDevAttrIpcEventSupport (yasai: events in shared memory)
+        *value = 1;
         break;
       case 126:  // cudaDevAttrMemSyncDomainCount
         *value = 0;
@@ -2425,8 +2443,9 @@ cudaDeviceGetAttributeInternal(int *value, enum cudaDeviceAttr attr, int device,
       case 131:  // cudaDevAttrNumaId
         *value = 0;
         break;
-      case 132:  // cudaDevAttrReserved132
-        *value = 0;
+      case 132:  // yasai: CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED (shared_devmem multicast);
+                 // YASAI_MULTICAST=0 turns it off
+        *value = (getenv("YASAI_MULTICAST") && atoi(getenv("YASAI_MULTICAST")) == 0) ? 0 : 1;
         break;
       case 133:  // cudaDevAttrMpsEnabled
         *value = 0;
@@ -3029,7 +3048,8 @@ __host__ cudaError_t CUDARTAPI cudaFree(void *devPtr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  // TODO...  manage g_global_mem space?
+  // yasai: unmaps the allocation's segment (device addresses are not reused).
+  yasai_vmm::free_device(reinterpret_cast<uint64_t>(devPtr));
   return g_last_cudaError = cudaSuccess;
 }
 __host__ cudaError_t CUDARTAPI cudaFreeHost(void *ptr) {
@@ -3524,13 +3544,18 @@ __host__ cudaError_t CUDARTAPI cudaUserObjectRelease(cudaUserObject_t, unsigned 
   return g_last_cudaError = cudaSuccess;
 }
 
+// yasai: legacy IPC (yasai_vmm, shared_devmem): the handle carries the ref of the allocation's
+// memfd; the peer maps that segment at a fresh device address of its own.
 __host__ cudaError_t CUDARTAPI cudaIpcGetMemHandle(cudaIpcMemHandle_t *handle,
                                                    void *devPtr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  cuda_not_implemented(__my_func__, __LINE__);
-  return g_last_cudaError = cudaErrorUnknown;
+  if (!handle) return g_last_cudaError = cudaErrorInvalidValue;
+  if (!yasai_vmm::ipc_get_mem_handle(yasai_current_gpu(), handle,
+                                     reinterpret_cast<uint64_t>(devPtr)))
+    return g_last_cudaError = cudaErrorInvalidValue;
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t cudaIpcOpenMemHandle(void **devPtr,
@@ -3539,8 +3564,12 @@ __host__ cudaError_t cudaIpcOpenMemHandle(void **devPtr,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  cuda_not_implemented(__my_func__, __LINE__);
-  return g_last_cudaError = cudaErrorUnknown;
+  (void)flags;
+  uint64_t p = 0;
+  if (!devPtr || !yasai_vmm::ipc_open_mem_handle(yasai_current_gpu(), &handle, &p))
+    return g_last_cudaError = cudaErrorInvalidValue;
+  *devPtr = reinterpret_cast<void *>(p);
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI
@@ -4600,7 +4629,7 @@ bool yasai_lazy_enabled() {
   return e == NULL || atoi(e) != 0;
 }
 
-// Name declared by a file-scope PTX line (".entry", ".global" or ".const" definition), or "".
+// Name declared by a file-scope PTX line (".entry", ".func", ".global" or ".const"), or "".
 std::string yasai_ptx_decl_name(const std::string &line) {
   size_t p = 0;
   auto word = [&](const char *w) {
@@ -4615,6 +4644,19 @@ std::string yasai_ptx_decl_name(const std::string &line) {
   if (line.empty() || line[0] != '.') return "";
   if (word(".extern")) return "";
   word(".visible") || word(".weak");
+  // yasai: a .func (definition or forward declaration), so that a function body can be parsed
+  // lazily at its first call (per-kernel mode): the name follows the optional return list.
+  if (word(".func")) {
+    if (p < line.size() && line[p] == '(') {
+      const size_t c = line.find(')', p);
+      if (c == std::string::npos) return "";
+      p = c + 1;
+      while (p < line.size() && isspace((unsigned char)line[p])) ++p;
+    }
+    size_t e = p;
+    while (e < line.size() && (isalnum((unsigned char)line[e]) || line[e] == '_' || line[e] == '$')) ++e;
+    return line.substr(p, e - p);
+  }
   const bool entry = word(".entry");
   if (!entry && !(word(".global") || word(".const"))) return "";
   if (entry) {
@@ -4844,6 +4886,139 @@ void yasai_ptx_called(const std::string &t, size_t b, size_t e,
 // Total bytes of PTX parsed by the per-kernel loader (printed with each piece).
 size_t g_yasai_piece_bytes = 0;
 
+// True when per-kernel loading also defers function bodies to their first call
+// (YASAI_PTX_LAZY_FUNC unset or nonzero). Otherwise a kernel's piece holds every function it
+// reaches, through calls and through the function pointers of the file's initializers.
+bool yasai_lazy_func_enabled() {
+  const char *e = getenv("YASAI_PTX_LAZY_FUNC");
+  return e == NULL || atoi(e) != 0;
+}
+
+// Header of a .func definition item: its text up to the body's opening brace, as a
+// declaration ending in a semicolon.
+//   t: PTX text; it: a YASAI_PTX_FUNC_DEF item
+std::string yasai_ptx_func_proto(const std::string &t, const yasai_ptx_item_t &it) {
+  size_t p = it.begin;
+  while (p < it.end) {
+    if (t.compare(p, 2, "//") == 0 || t.compare(p, 2, "/*") == 0) {
+      const size_t q = yasai_ptx_skip_space(t, p);
+      p = q > p ? q : p + 1;
+    } else if (t[p] == '{') {
+      break;
+    } else {
+      ++p;
+    }
+  }
+  size_t e = p;
+  while (e > it.begin && isspace((unsigned char)t[e - 1])) --e;
+  return t.substr(it.begin, e - it.begin) + "\n;";
+}
+
+// The same declaration with external linkage (".extern .func ..."), for ptxas: a kernel's
+// self-contained copy then names every function of the file without defining it, which
+// ptxas accepts with --compile-only.
+//   proto: a .func declaration (with or without linkage words), ending in a semicolon
+std::string yasai_ptx_extern_proto(const std::string &proto) {
+  size_t f = proto.find(".func");
+  if (f == std::string::npos) return proto;
+  return ".extern " + proto.substr(f);
+}
+
+// Per-kernel loading with lazy function bodies (YASAI_PTX_LAZY_FUNC, default on). Function
+// bodies are parsed only when a call first reaches them (call_impl asks for the callee by name,
+// for direct calls and for indirect calls through function tables such as NCCL's
+// ncclDevFuncTable alike), so a kernel that can reach every function of a large module (NCCL's
+// ncclDevKernel_Generic) parses only the functions it runs. The pieces are:
+//   * the file's first piece: the header directives, every file-scope variable and directive,
+//     a declaration of every function of the file (its forward declaration, or the header of
+//     its definition), and the requested kernel's .entry when name is a kernel;
+//   * a later kernel: the header directives and its .entry;
+//   * a function: the header directives and its definition.
+// ptxas runs once per kernel on the header, the variables, the kernel and an external
+// declaration of every function (--compile-only), so it reports the kernel's own resource use.
+// Returns true when something was parsed.
+//   ctx: simulator context; L: index of the fat binary; i: file index; name: kernel, function or
+//   variable
+bool yasai_lazy_load_piece_lazyfunc(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i,
+                                    const char *name) {
+  const std::string target = name;
+  if (L.funcs_loaded[i].count(target)) return false;
+  std::ifstream in(L.files[i]);
+  std::stringstream ss;
+  ss << in.rdbuf();
+  const std::string t = ss.str();
+  const std::vector<yasai_ptx_item_t> items = yasai_ptx_split(t);
+  int entry_item = -1, func_item = -1;
+  for (int k = 0; k < (int)items.size(); ++k) {
+    if (items[k].kind == YASAI_PTX_ENTRY && items[k].name == target) entry_item = k;
+    if (items[k].kind == YASAI_PTX_FUNC_DEF && items[k].name == target) func_item = k;
+  }
+  if (entry_item < 0 && func_item < 0 && L.vars_loaded[i]) return false;  // variable, parsed
+  const bool first = !L.vars_loaded[i];
+  std::string parse_text, ptxas_text;
+  for (int k = 0; k < (int)items.size(); ++k) {
+    const yasai_ptx_item_t &it = items[k];
+    std::string part, ptxas_part;
+    switch (it.kind) {
+      case YASAI_PTX_HEADER:
+        part = ptxas_part = t.substr(it.begin, it.end - it.begin);
+        break;
+      case YASAI_PTX_DEBUG:
+        break;
+      case YASAI_PTX_OTHER:
+        ptxas_part = t.substr(it.begin, it.end - it.begin);
+        if (first) part = ptxas_part;
+        break;
+      case YASAI_PTX_FUNC_DECL: {
+        const std::string d = t.substr(it.begin, it.end - it.begin);
+        ptxas_part = yasai_ptx_extern_proto(d);
+        if (first) part = d;
+        break;
+      }
+      case YASAI_PTX_FUNC_DEF: {
+        const std::string d = yasai_ptx_func_proto(t, it);
+        ptxas_part = yasai_ptx_extern_proto(d);
+        if (k == func_item) part = t.substr(it.begin, it.end - it.begin);
+        else if (first) part = d;
+        break;
+      }
+      case YASAI_PTX_ENTRY:
+        if (k == entry_item) part = ptxas_part = t.substr(it.begin, it.end - it.begin);
+        break;
+    }
+    if (!part.empty()) parse_text.append(part).push_back('\n');
+    if (!ptxas_part.empty()) ptxas_text.append(ptxas_part).push_back('\n');
+  }
+  const int piece = L.pieces[i]++;
+  const std::string parse_file = L.files[i] + ".k" + std::to_string(piece) + ".ptx";
+  {
+    std::ofstream out(parse_file);
+    out << parse_text;
+  }
+  g_yasai_piece_bytes += parse_text.size();
+  printf("GPGPU-Sim PTX: parsing %s %s of %s (piece %d: %zu of %zu bytes; %zu bytes parsed in "
+         "pieces so far)\n",
+         entry_item >= 0 ? "kernel" : (func_item >= 0 ? "function" : "the variables of"),
+         entry_item >= 0 || func_item >= 0 ? target.c_str() : "", L.files[i].c_str(), piece,
+         parse_text.size(), t.size(), g_yasai_piece_bytes);
+  CUctx_st *context = GPGPUSim_Context(ctx);
+  symbol_table *symtab = ctx->gpgpu_ptx_sim_load_ptx_from_filename(parse_file.c_str());
+  context->add_binary(symtab, L.handle);
+  ctx->api->load_static_globals(symtab, STATIC_ALLOC_LIMIT, context->get_device()->get_gpgpu());
+  ctx->api->load_constants(symtab, STATIC_ALLOC_LIMIT, context->get_device()->get_gpgpu());
+  L.vars_loaded[i] = true;
+  if (entry_item >= 0 || func_item >= 0) L.funcs_loaded[i].insert(target);
+  if (entry_item >= 0) {
+    const std::string ptxas_file = L.files[i] + ".k" + std::to_string(piece) + ".full.ptx";
+    {
+      std::ofstream out(ptxas_file);
+      out << ptxas_text;
+    }
+    ctx->gpgpu_ptx_info_load_from_filename(ptxas_file.c_str(), L.archs[i].c_str(), true);
+  }
+  return true;
+}
+
 // Per-kernel loading: parses from file i of L only what name needs. For a kernel that is the
 // .entry, the .func definitions it reaches (directly, or through the function pointers in the
 // file's variable initializers), and, in the file's first piece, the file-scope variables and
@@ -4854,6 +5029,7 @@ size_t g_yasai_piece_bytes = 0;
 // resource usage is the kernel's. Returns true when something was parsed.
 //   ctx: simulator context; L: index of the fat binary; i: file index; name: kernel or variable
 bool yasai_lazy_load_piece(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i, const char *name) {
+  if (yasai_lazy_func_enabled()) return yasai_lazy_load_piece_lazyfunc(ctx, L, i, name);
   std::string target = name;
   if (L.funcs_loaded[i].count(target)) return false;
   std::ifstream in(L.files[i]);
@@ -5193,7 +5369,12 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
   }
 
   // yasai: lazy loading (see yasai_lazy_ptx_t): index the files and parse none of them now.
-  if (!use_selected_ptx_override && selected_files.size() > 1 && yasai_lazy_enabled()) {
+  // yasai: a single selected file is indexed too when it is a YASAI_PTX_LIB_OVERRIDE file (NCCL's
+  // merged rdc module), whose whole-file parse would take tens of GB.
+  const bool single_override =
+      selected_files.size() == 1 && yasai_override_arch().count(selected_files[0]) > 0;
+  if (!use_selected_ptx_override && (selected_files.size() > 1 || single_override) &&
+      yasai_lazy_enabled()) {
     yasai_lazy_ptx_t L;
     L.handle = handle;
     for (auto &f : selected_files) {
@@ -5552,12 +5733,12 @@ cudaPointerGetAttributes(cudaPointerAttributes *attributes, const void *ptr) {
   if (attributes == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   const uint64_t a = reinterpret_cast<uint64_t>(ptr);
   memset(attributes, 0, sizeof(*attributes));
-  if (host_window::contains(a, 1)) {
+  if (yasai_vmm::is_pinned_host(a)) {
     attributes->type = cudaMemoryTypeHost;
     attributes->device = 0;
     attributes->devicePointer = const_cast<void *>(ptr);
     attributes->hostPointer = const_cast<void *>(ptr);
-  } else if (a >= GLOBAL_HEAP_START && a < 0x500000000000ull) {
+  } else if ((a >= GLOBAL_HEAP_START && a < 0x500000000000ull) || host_window::contains(a, 1)) {
     attributes->type = cudaMemoryTypeDevice;
     attributes->device = 0;
     attributes->devicePointer = const_cast<void *>(ptr);
@@ -5584,8 +5765,10 @@ __host__ cudaError_t CUDARTAPI cudaDeviceEnablePeerAccess(int peerDevice,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  cuda_not_implemented(__my_func__, __LINE__);
-  return g_last_cudaError = cudaErrorUnknown;
+  // yasai: memory shared between rank processes needs no peer enablement.
+  (void)peerDevice;
+  (void)flags;
+  return g_last_cudaError = cudaSuccess;
 }
 
 cudaError_t CUDARTAPI cudaSetValidDevices(int *device_arr, int len) {
@@ -5616,7 +5799,17 @@ cudaError_t CUDARTAPI cudaFuncGetAttributes(struct cudaFuncAttributes *attr,
 }
 
 cudaError_t CUDARTAPI cudaEventCreateWithFlags(cudaEvent_t *event, int flags) {
-  CUevent_st *e = new CUevent_st(flags == cudaEventBlockingSync);
+  CUevent_st *e = new CUevent_st((flags & cudaEventBlockingSync) != 0);
+  // yasai: an interprocess event keeps its counters in shared memory (cudaIpcGetEventHandle).
+  if (flags & cudaEventInterprocess) {
+    unsigned int *counters = nullptr;
+    char ref[64];
+    if (!yasai_vmm::ipc_event_create(&counters, ref)) {
+      delete e;
+      return g_last_cudaError = cudaErrorMemoryAllocation;
+    }
+    e->set_shared(counters, ref);
+  }
   g_timer_events[e->get_uid()] = e;
 #if CUDART_VERSION >= 3000
   *event = e;
@@ -6810,7 +7003,10 @@ CUresult CUDAAPI cuMemAlloc(CUdeviceptr *dptr, size_t bytesize) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: the cudaMalloc allocator.
+  void *p = nullptr;
+  if (!dptr || cudaMalloc(&p, bytesize) != cudaSuccess) return CUDA_ERROR_OUT_OF_MEMORY;
+  *dptr = CUdeviceptr(reinterpret_cast<uint64_t>(p));
   return CUDA_SUCCESS;
 }
 
@@ -6828,7 +7024,7 @@ CUresult CUDAAPI cuMemFree(CUdeviceptr dptr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  cudaFree(reinterpret_cast<void *>(dptr));
   return CUDA_SUCCESS;
 }
 
@@ -6837,7 +7033,12 @@ CUresult CUDAAPI cuMemGetAddressRange(CUdeviceptr *pbase, size_t *psize,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: cudaMalloc allocations, cuMem mappings and host windows.
+  uint64_t base = 0;
+  size_t size = 0;
+  if (!yasai_vmm::address_range(uint64_t(dptr), &base, &size)) return CUDA_ERROR_NOT_FOUND;
+  if (pbase) *pbase = CUdeviceptr(base);
+  if (psize) *psize = size;
   return CUDA_SUCCESS;
 }
 
@@ -6921,8 +7122,11 @@ CUresult CUDAAPI cuIpcGetEventHandle(CUipcEventHandle *pHandle, CUevent event) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime IPC functions.
+  return cudaIpcGetEventHandle(reinterpret_cast<cudaIpcEventHandle_t *>(pHandle),
+                               reinterpret_cast<cudaEvent_t>(event)) == cudaSuccess
+             ? CUDA_SUCCESS
+             : CUDA_ERROR_INVALID_HANDLE;
 }
 
 CUresult CUDAAPI cuIpcOpenEventHandle(CUevent *phEvent,
@@ -6930,16 +7134,23 @@ CUresult CUDAAPI cuIpcOpenEventHandle(CUevent *phEvent,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime IPC functions.
+  cudaIpcEventHandle_t h;
+  memcpy(&h, &handle, sizeof(h));
+  return cudaIpcOpenEventHandle(reinterpret_cast<cudaEvent_t *>(phEvent), h) == cudaSuccess
+             ? CUDA_SUCCESS
+             : CUDA_ERROR_INVALID_VALUE;
 }
 
 CUresult CUDAAPI cuIpcGetMemHandle(CUipcMemHandle *pHandle, CUdeviceptr dptr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime IPC functions.
+  return cudaIpcGetMemHandle(reinterpret_cast<cudaIpcMemHandle_t *>(pHandle),
+                             reinterpret_cast<void *>(dptr)) == cudaSuccess
+             ? CUDA_SUCCESS
+             : CUDA_ERROR_INVALID_VALUE;
 }
 
 CUresult CUDAAPI cuIpcOpenMemHandle(CUdeviceptr *pdptr, CUipcMemHandle handle,
@@ -6947,7 +7158,12 @@ CUresult CUDAAPI cuIpcOpenMemHandle(CUdeviceptr *pdptr, CUipcMemHandle handle,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: forwards to the runtime IPC functions.
+  cudaIpcMemHandle_t h;
+  memcpy(&h, &handle, sizeof(h));
+  void *p = nullptr;
+  if (!pdptr || cudaIpcOpenMemHandle(&p, h, Flags) != cudaSuccess) return CUDA_ERROR_INVALID_VALUE;
+  *pdptr = CUdeviceptr(reinterpret_cast<uint64_t>(p));
   return CUDA_SUCCESS;
 }
 
@@ -6955,8 +7171,10 @@ CUresult CUDAAPI cuIpcCloseMemHandle(CUdeviceptr dptr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime IPC functions.
+  return cudaIpcCloseMemHandle(reinterpret_cast<void *>(dptr)) == cudaSuccess
+             ? CUDA_SUCCESS
+             : CUDA_ERROR_INVALID_VALUE;
 }
 
 #endif /* CUDART_VERSION >= 4010 */
@@ -7434,8 +7652,9 @@ CUresult CUDAAPI cuPointerGetAttribute(void *data,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: answered from the allocation, mapping and host window tables.
+  return CUresult(yasai_vmm::pointer_attribute(data, int(attribute), uint64_t(ptr),
+                                               GPGPUSim_Context(GPGPU_Context())));
 }
 #endif /* CUDART_VERSION >= 4000 */
 
@@ -7509,7 +7728,11 @@ CUresult CUDAAPI cuPointerGetAttributes(unsigned int numAttributes,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: attributes that do not apply leave their value untouched, as the driver does.
+  for (unsigned i = 0; i < numAttributes; i++)
+    if (data && data[i])
+      yasai_vmm::pointer_attribute(data[i], int(attributes[i]), uint64_t(ptr),
+                                   GPGPUSim_Context(GPGPU_Context()));
   return CUDA_SUCCESS;
 }
 #endif /* CUDART_VERSION >= 7000 */
@@ -9436,16 +9659,31 @@ __host__ cudaError_t CUDARTAPI cudaFreeAsync(void *devPtr, cudaStream_t hStream)
   return cudaFree(devPtr);
 }
 
+// yasai: an opened IPC event shares the exporter's counters, so cudaStreamWaitEvent and
+// cudaEventSynchronize in this process wait for records made in the other.
 __host__ cudaError_t CUDARTAPI cudaIpcOpenEventHandle(cudaEvent_t *event, cudaIpcEventHandle_t handle) {
-  cuda_error_not_impl;
+  unsigned int *counters = nullptr;
+  char ref[64];
+  if (!event || !yasai_vmm::ipc_event_open(&handle, &counters, ref))
+    return g_last_cudaError = cudaErrorInvalidValue;
+  CUevent_st *e = new CUevent_st(false);
+  e->set_shared(counters, ref);
+  g_timer_events[e->get_uid()] = e;
+  *event = e;
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI cudaIpcGetEventHandle(cudaIpcEventHandle_t *handle, cudaEvent_t event) {
-  cuda_error_not_impl;
+  CUevent_st *e = get_event(event);
+  if (!handle || !e || !e->shared_name()[0]) return g_last_cudaError = cudaErrorInvalidResourceHandle;
+  yasai_vmm::ipc_event_handle(handle, e->shared_name());
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI cudaIpcCloseMemHandle(void *devPtr) {
-  cuda_error_not_impl;
+  if (!yasai_vmm::ipc_close_mem_handle(reinterpret_cast<uint64_t>(devPtr)))
+    return g_last_cudaError = cudaErrorInvalidValue;
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ __cudart_builtin__ cudaError_t CUDARTAPI cudaGetDeviceProperties_v2(struct cudaDeviceProp *prop, int device) {

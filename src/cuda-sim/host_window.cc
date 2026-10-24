@@ -10,9 +10,17 @@
 namespace host_window {
 namespace {
 
-/// Registered ranges: first address to length.
-std::map<uint64_t, size_t> &ranges() {
-  static auto *m = new std::map<uint64_t, size_t>;  // never destroyed: used during exit
+/// What the map keeps per registered range.
+struct entry {
+  size_t bytes;        ///< length of the range
+  range_kind kind;     ///< what the range holds
+  void *mc;            ///< multicast object of a multicast range
+  uint64_t mc_offset;  ///< multicast object offset of the first byte
+};
+
+/// Registered ranges: first address to entry.
+std::map<uint64_t, entry> &ranges() {
+  static auto *m = new std::map<uint64_t, entry>;  // never destroyed: used during exit
   return *m;
 }
 
@@ -25,6 +33,11 @@ std::shared_mutex &ranges_mu() {
 /// Number of registered ranges; lets contains() skip the lock when nothing is registered.
 std::atomic<size_t> g_count{0};
 
+/// Multicast hooks installed by shared_devmem.
+mc_read_fn g_mc_read = nullptr;
+/// See g_mc_read.
+mc_write_fn g_mc_write = nullptr;
+
 /// Whether an access of this size at this address can be a single atomic operation.
 /// @param addr Address.
 /// @param bytes Size.
@@ -33,9 +46,22 @@ bool atomic_size(uint64_t addr, size_t bytes) {
   return (bytes == 1 || bytes == 2 || bytes == 4 || bytes == 8) && (addr % bytes) == 0;
 }
 
+/// Finds the range that holds [addr, addr + bytes); the caller holds ranges_mu().
+/// @param addr First address.
+/// @param bytes Length.
+/// @return Iterator to the range, or ranges().end().
+std::map<uint64_t, entry>::const_iterator find_locked(uint64_t addr, size_t bytes) {
+  const auto &m = ranges();
+  auto it = m.upper_bound(addr);
+  if (it == m.begin()) return m.end();
+  --it;
+  if (addr >= it->first && addr + bytes <= it->first + it->second.bytes) return it;
+  return m.end();
+}
+
 }  // namespace
 
-void add(uint64_t base, size_t bytes) {
+void add(uint64_t base, size_t bytes, range_kind kind, void *mc, uint64_t mc_offset) {
   if (bytes == 0) return;
   std::unique_lock<std::shared_mutex> lock(ranges_mu());
   auto &m = ranges();
@@ -43,10 +69,10 @@ void add(uint64_t base, size_t bytes) {
   auto it = m.lower_bound(base);
   if (it != m.begin()) {
     auto prev = std::prev(it);
-    if (prev->first + prev->second > base) it = prev;
+    if (prev->first + prev->second.bytes > base) it = prev;
   }
   while (it != m.end() && it->first < base + bytes) it = m.erase(it);
-  m[base] = bytes;
+  m[base] = entry{bytes, kind, mc, mc_offset};
   g_count.store(m.size(), std::memory_order_release);
 }
 
@@ -60,17 +86,28 @@ bool remove(uint64_t base) {
 bool contains(uint64_t addr, size_t bytes) {
   if (g_count.load(std::memory_order_acquire) == 0) return false;
   std::shared_lock<std::shared_mutex> lock(ranges_mu());
-  const auto &m = ranges();
-  auto it = m.upper_bound(addr);
-  if (it == m.begin()) return false;
-  --it;
-  return addr >= it->first && addr + bytes <= it->first + it->second;
+  return find_locked(addr, bytes) != ranges().end();
+}
+
+bool lookup(uint64_t addr, size_t bytes, range_info *out) {
+  if (g_count.load(std::memory_order_acquire) == 0) return false;
+  std::shared_lock<std::shared_mutex> lock(ranges_mu());
+  auto it = find_locked(addr, bytes);
+  if (it == ranges().end()) return false;
+  if (out) *out = range_info{it->first, it->second.bytes, it->second.kind, it->second.mc,
+                             it->second.mc_offset};
+  return true;
 }
 
 size_t size_at(uint64_t base) {
   std::shared_lock<std::shared_mutex> lock(ranges_mu());
   auto it = ranges().find(base);
-  return it == ranges().end() ? 0 : it->second;
+  return it == ranges().end() ? 0 : it->second.bytes;
+}
+
+void set_multicast_hooks(mc_read_fn rd, mc_write_fn wr) {
+  g_mc_read = rd;
+  g_mc_write = wr;
 }
 
 void read(uint64_t addr, size_t bytes, void *out) {
@@ -100,6 +137,56 @@ void write(uint64_t addr, size_t bytes, const void *in) {
   std::atomic_thread_fence(std::memory_order_release);
   memcpy(p, in, bytes);
   std::atomic_thread_fence(std::memory_order_release);
+}
+
+bool try_read(uint64_t addr, size_t bytes, void *out) {
+  range_info r;
+  if (!lookup(addr, bytes, &r)) return false;
+  if (r.kind == range_kind::multicast) {
+    if (g_mc_read) g_mc_read(r.mc, r.mc_offset + (addr - r.base), bytes, out);
+    else memset(out, 0, bytes);
+    return true;
+  }
+  read(addr, bytes, out);
+  return true;
+}
+
+bool try_write(uint64_t addr, size_t bytes, const void *in) {
+  range_info r;
+  if (!lookup(addr, bytes, &r)) return false;
+  if (r.kind == range_kind::multicast) {
+    if (g_mc_write) g_mc_write(r.mc, r.mc_offset + (addr - r.base), bytes, in);
+    return true;
+  }
+  write(addr, bytes, in);
+  return true;
+}
+
+bool compare_exchange(uint64_t addr, size_t bytes, uint64_t *expected, uint64_t desired) {
+  void *p = reinterpret_cast<void *>(addr);
+  switch (bytes) {
+    case 2: {
+      uint16_t e = uint16_t(*expected);
+      bool ok = __atomic_compare_exchange_n(static_cast<uint16_t *>(p), &e, uint16_t(desired),
+                                            false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+      *expected = e;
+      return ok;
+    }
+    case 4: {
+      uint32_t e = uint32_t(*expected);
+      bool ok = __atomic_compare_exchange_n(static_cast<uint32_t *>(p), &e, uint32_t(desired),
+                                            false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+      *expected = e;
+      return ok;
+    }
+    default: {
+      uint64_t e = *expected;
+      bool ok = __atomic_compare_exchange_n(static_cast<uint64_t *>(p), &e, desired, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+      *expected = e;
+      return ok;
+    }
+  }
 }
 
 }  // namespace host_window
