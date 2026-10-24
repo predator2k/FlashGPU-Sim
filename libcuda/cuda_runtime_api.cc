@@ -4634,10 +4634,25 @@ void yasai_lazy_load_file(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i) {
 }
 
 // True when a launch parses only the kernel it needs (YASAI_PTX_PER_KERNEL unset or nonzero)
-// rather than the whole PTX file that holds it.
-bool yasai_per_kernel_enabled() {
+// rather than the whole PTX file that holds it. PTX reordering (-gpgpu_ptx_reorder, a
+// timing-model feature) turns it off: the SASS-guided reorder runs ptxas and cuobjdump on the
+// text it parses and maps SASS to PTX line numbers of a whole module, and an external guide
+// (GPGPUSIM_SASS_PTXLINE_GUIDE) is keyed to the original file's lines, so a piece of a file
+// cannot be guided; those runs keep whole-file lazy parsing.
+//   ctx: simulator context (its reorder options come from gpgpusim.config)
+bool yasai_per_kernel_enabled(gpgpu_context *ctx) {
   const char *e = getenv("YASAI_PTX_PER_KERNEL");
-  return e == NULL || atoi(e) != 0;
+  if (e != NULL && atoi(e) == 0) return false;
+  if (ctx->ptx_reorder_enabled) {
+    static bool told = false;
+    if (!told) {
+      told = true;
+      printf("GPGPU-Sim PTX: PTX reordering is on, so PTX files are parsed whole rather than per "
+             "kernel\n");
+    }
+    return false;
+  }
+  return true;
 }
 
 // Kind of a top-level item of a PTX file (see yasai_ptx_split).
@@ -4918,7 +4933,7 @@ bool yasai_lazy_load_name(const char *name) {
   for (yasai_lazy_ptx_t &L : g_yasai_lazy) {
     auto it = L.owner.find(name);
     if (it == L.owner.end()) continue;
-    if (yasai_per_kernel_enabled()) {
+    if (yasai_per_kernel_enabled(GPGPU_Context())) {
       if (L.loaded[it->second]) return false;
       return yasai_lazy_load_piece(GPGPU_Context(), L, it->second, name);
     }
