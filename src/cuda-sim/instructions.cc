@@ -1822,6 +1822,7 @@ void red_impl(const ptx_instruction *pI, ptx_thread_info *thread);
 void multimem_ld_reduce_impl(const ptx_instruction *pI, ptx_thread_info *thread);
 void multimem_st_impl(const ptx_instruction *pI, ptx_thread_info *thread);
 void multimem_red_impl(const ptx_instruction *pI, ptx_thread_info *thread);
+void cvt_pack_impl(const ptx_instruction *pI, ptx_thread_info *thread);
 #include "yasai_rmw.inc"
 
 void bar_impl(const ptx_instruction *pIin, ptx_thread_info *thread) {
