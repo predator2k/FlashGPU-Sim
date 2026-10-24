@@ -1915,7 +1915,10 @@ ptx_instruction::ptx_instruction(
     const function_info *target_func = func_addr->get_pc();
     std::string fname = target_func->get_name();
 
-    if (fname == "vprintf") {
+    // yasai: __assertfail is an intrinsic like vprintf (call_impl prints and returns), so its call
+    // is no CALL_OPS: a CALL entry on the SIMT stack would never be popped, as no ret follows,
+    // and the warp's PC and its lanes' PCs would part (assertion pc == inst.pc).
+    if (fname == "vprintf" || fname == "__assertfail") {
       m_is_printf = true;
     }
     if (fname == "cudaStreamCreateWithFlags") m_is_cdp = 1;

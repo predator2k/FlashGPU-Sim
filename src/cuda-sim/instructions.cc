@@ -749,6 +749,23 @@ void ptx_thread_info::get_vector_operand_values(const operand_info &op,
   }
 }
 
+// yasai: sign-extends data (src_size bits) to the width of register symbol reg; used for the
+// elements of a vector load, whose registers are symbols rather than operands.
+//   data: value read from memory
+//   src_size: bits read
+//   reg: destination register
+static void yasai_sign_extend_reg(ptx_reg_t &data, unsigned src_size, const symbol *reg) {
+  if (reg == NULL || reg->type() == NULL) return;
+  size_t dst_size;
+  int t;
+  type_info_key::type_decode(reg->type()->get_key().scalar_type(), dst_size, t);
+  if (src_size == 0 || src_size >= dst_size || dst_size > 64) return;
+  if (((data.u64 >> (src_size - 1)) & 1) == 0) return;
+  const unsigned long long high =
+      (dst_size == 64 ? ~0ull : ((1ull << dst_size) - 1)) & ~((1ull << src_size) - 1);
+  data.u64 |= high;
+}
+
 void sign_extend(ptx_reg_t &data, unsigned src_size, const operand_info &dst) {
   if (!dst.is_reg()) return;
   unsigned dst_size = get_operand_nbits(dst);
@@ -4319,9 +4336,13 @@ void ld_exec(const ptx_instruction *pI, ptx_thread_info *thread) {
   int t;
   data.u64 = 0;
   type_info_key::type_decode(type, size, t);
+  // yasai: signed element types are sign-extended into wider destination registers.
+  const bool is_signed = type == S8_TYPE || type == S16_TYPE || type == S32_TYPE;
   if (!vector_spec) {
     mem->read(addr, size / 8, &data.s64);
-    if (type == S16_TYPE || type == S32_TYPE) sign_extend(data, size, dst);
+    // yasai: ld.s8 sign-extends as well (PyTorch's fetch_and_cast loads int8 with
+    // "ld.global.s8 %rd, [..]" into a 64-bit register; -1 became 255).
+    if (type == S8_TYPE || type == S16_TYPE || type == S32_TYPE) sign_extend(data, size, dst);
     thread->set_operand_value(dst, data, type, thread, pI);
 
     if (type == F32_TYPE) {
@@ -4340,6 +4361,7 @@ void ld_exec(const ptx_instruction *pI, ptx_thread_info *thread) {
       ptx_reg_t d;
       d.u64 = 0;
       mem->read(addr + e * size / 8, size / 8, &d.s64);
+      if (is_signed) yasai_sign_extend_reg(d, size, dst.vec_symbol(e));
       thread->set_reg(dst.vec_symbol(e), d);
     }
   } else if ((vector_spec == V2_TYPE || vector_spec == V4_TYPE) &&
@@ -4354,17 +4376,26 @@ void ld_exec(const ptx_instruction *pI, ptx_thread_info *thread) {
     for (unsigned e = 0; e < 4; e++) {
       d[e].u64 = 0;
       if (e < n) memcpy(&d[e].s64, buf + e * eb, eb);
+      if (e < n && is_signed && e < dst.get_vect_nelem())
+        yasai_sign_extend_reg(d[e], size, dst.vec_symbol(e));
     }
     if (n == 2) thread->set_vector_operand_values(dst, d[0], d[1], d[1], d[1]);
     else thread->set_vector_operand_values(dst, d[0], d[1], d[2], d[3]);
   } else {
     ptx_reg_t data1, data2, data3, data4;
+    data1.u64 = data2.u64 = data3.u64 = data4.u64 = 0;
     mem->read(addr, size / 8, &data1.s64);
     mem->read(addr + size / 8, size / 8, &data2.s64);
+    if (is_signed) {
+      yasai_sign_extend_reg(data1, size, dst.vec_symbol(0));
+      yasai_sign_extend_reg(data2, size, dst.vec_symbol(1));
+    }
     if (vector_spec != V2_TYPE) {  // either V3 or V4
       mem->read(addr + 2 * size / 8, size / 8, &data3.s64);
+      if (is_signed) yasai_sign_extend_reg(data3, size, dst.vec_symbol(2));
       if (vector_spec != V3_TYPE) {  // v4
         mem->read(addr + 3 * size / 8, size / 8, &data4.s64);
+        if (is_signed) yasai_sign_extend_reg(data4, size, dst.vec_symbol(3));
         thread->set_vector_operand_values(dst, data1, data2, data3, data4);
       } else  // v3
         thread->set_vector_operand_values(dst, data1, data2, data3, data3);
@@ -7707,8 +7738,18 @@ void tex_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 void txq_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   inst_not_implemented(pI);
 }
+// yasai: trap aborts the kernel. On a GPU the launch then fails (a device assert reports
+// cudaErrorAssert) and the CUDA context is unusable, so the simulation stops here with the
+// place of the first trap rather than with "not implemented".
 void trap_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
-  inst_not_implemented(pI);
+  const dim3 cta = thread->get_ctaid();
+  const dim3 tid = thread->get_tid();
+  printf("GPGPU-Sim PTX: trap (%s:%u) in kernel %s, block [%u,%u,%u], thread [%u,%u,%u]: the "
+         "kernel aborts (device assert or trap); simulation stops\n",
+         pI->source_file(), pI->source_line(), thread->get_kernel().name().c_str(), cta.x, cta.y,
+         cta.z, tid.x, tid.y, tid.z);
+  fflush(stdout);
+  abort();
 }
 void vabsdiff_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   inst_not_implemented(pI);
