@@ -115,6 +115,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <deque>
 #include <fstream>
 #include <atomic>
@@ -10758,6 +10759,236 @@ extern "C" CUresult CUDAAPI cuLaunchKernelEx(const yasai_CUlaunchConfig *config,
   return cuLaunchKernelInternal(f, config->gridDimX, config->gridDimY, config->gridDimZ,
                                 config->blockDimX, config->blockDimY, config->blockDimZ,
                                 config->sharedMemBytes, config->hStream, kernelParams, extra);
+}
+
+// yasai: driver entry points that UCX's cuda transport (NIXL for CUDA 13) imports, and the driver
+// form of the memory pools. CUDA 13's cuda.h maps cuDeviceGetUuid, cuDevicePrimaryCtxRelease,
+// cuIpcOpenMemHandle and cuMemcpyBatchAsync to their _v2 symbols; the driver pool types this
+// header lacks are passed as the runtime's equivalents (cudaMemPool_t for CUmemoryPool, the
+// enum values of CUmemPool_attribute and CUmemAllocationHandleType as integers), which have the
+// same representation.
+
+// yasai: the id of a context; the simulator has one context per process, whose id is 1.
+// @param ctx Context (NULL: the current one).
+// @param ctxId Receives the id.
+extern "C" CUresult CUDAAPI cuCtxGetId(CUcontext ctx, unsigned long long *ctxId) {
+  (void)ctx;
+  if (ctxId == NULL) return CUDA_ERROR_INVALID_VALUE;
+  *ctxId = 1;
+  return CUDA_SUCCESS;
+}
+
+extern "C" CUresult CUDAAPI cuDeviceGetUuid(CUuuid *uuid, CUdevice dev);
+
+// yasai: the _v2 symbol of cuDeviceGetUuid (same UUID).
+// @param uuid Receives the UUID.
+// @param dev Device ordinal.
+extern "C" CUresult CUDAAPI cuDeviceGetUuid_v2(CUuuid *uuid, CUdevice dev) {
+  return cuDeviceGetUuid(uuid, dev);
+}
+
+// yasai: the _v2 symbol of cuDevicePrimaryCtxRelease.
+// @param dev Device ordinal.
+extern "C" CUresult CUDAAPI cuDevicePrimaryCtxRelease_v2(CUdevice dev) {
+  return cuDevicePrimaryCtxRelease(dev);
+}
+
+// yasai: the _v2 symbol of cuIpcOpenMemHandle.
+// @param pdptr Receives the mapped address.
+// @param handle IPC handle.
+// @param Flags cudaIpcMemLazyEnablePeerAccess.
+extern "C" CUresult CUDAAPI cuIpcOpenMemHandle_v2(CUdeviceptr *pdptr, CUipcMemHandle handle,
+                                                  unsigned int Flags) {
+  return cuIpcOpenMemHandle(pdptr, handle, Flags);
+}
+
+// yasai: a batch of copies, one stream-ordered copy per entry (as cudaMemcpyBatchAsync).
+// @param dsts Destinations.
+// @param srcs Sources.
+// @param sizes Bytes per entry.
+// @param count Entries.
+// @param attrs Copy attributes (not used).
+// @param attrsIdxs Attribute indices (not used).
+// @param numAttrs Number of attributes (not used).
+// @param hStream Stream.
+extern "C" CUresult CUDAAPI cuMemcpyBatchAsync_v2(CUdeviceptr *dsts, CUdeviceptr *srcs, size_t *sizes,
+                                                  size_t count, void *attrs, size_t *attrsIdxs,
+                                                  size_t numAttrs, CUstream hStream) {
+  return cudaMemcpyBatchAsync(reinterpret_cast<void *const *>(dsts),
+                              reinterpret_cast<const void *const *>(srcs), sizes, count,
+                              reinterpret_cast<struct cudaMemcpyAttributes *>(attrs), attrsIdxs,
+                              numAttrs, reinterpret_cast<cudaStream_t>(hStream)) == cudaSuccess
+             ? CUDA_SUCCESS
+             : CUDA_ERROR_INVALID_VALUE;
+}
+
+// yasai: CUDA_SUCCESS for cudaSuccess, CUDA_ERROR_INVALID_VALUE otherwise.
+// @param e Runtime status.
+static CUresult yasai_drv_status(cudaError_t e) {
+  return e == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+// yasai: driver form of cudaMemPoolCreate (pools are tokens; see there).
+// @param pool Receives the pool.
+// @param poolProps Pool properties (not used).
+extern "C" CUresult CUDAAPI cuMemPoolCreate(cudaMemPool_t *pool, const void *poolProps) {
+  (void)poolProps;
+  return yasai_drv_status(cudaMemPoolCreate(pool, NULL));
+}
+
+// yasai: driver form of cudaMemPoolDestroy.
+// @param pool Pool.
+extern "C" CUresult CUDAAPI cuMemPoolDestroy(cudaMemPool_t pool) {
+  return yasai_drv_status(cudaMemPoolDestroy(pool));
+}
+
+// yasai: driver form of cudaDeviceGetDefaultMemPool.
+// @param pool_out Receives the pool.
+// @param dev Device ordinal.
+extern "C" CUresult CUDAAPI cuDeviceGetDefaultMemPool(cudaMemPool_t *pool_out, CUdevice dev) {
+  return yasai_drv_status(cudaDeviceGetDefaultMemPool(pool_out, int(dev)));
+}
+
+// yasai: the current pool of a device is its default pool (cuDeviceSetMemPool is not modelled).
+// @param pool Receives the pool.
+// @param dev Device ordinal.
+extern "C" CUresult CUDAAPI cuDeviceGetMemPool(cudaMemPool_t *pool, CUdevice dev) {
+  return yasai_drv_status(cudaDeviceGetDefaultMemPool(pool, int(dev)));
+}
+
+// yasai: driver form of cudaMemPoolGetAttribute (CUmemPool_attribute has the cudaMemPoolAttr values).
+// @param pool Pool.
+// @param attr Attribute.
+// @param value Receives the value.
+extern "C" CUresult CUDAAPI cuMemPoolGetAttribute(cudaMemPool_t pool, int attr, void *value) {
+  return yasai_drv_status(cudaMemPoolGetAttribute(pool, (enum cudaMemPoolAttr)attr, value));
+}
+
+// yasai: driver form of cudaMemPoolSetAttribute.
+// @param pool Pool.
+// @param attr Attribute.
+// @param value Value.
+extern "C" CUresult CUDAAPI cuMemPoolSetAttribute(cudaMemPool_t pool, int attr, void *value) {
+  return yasai_drv_status(cudaMemPoolSetAttribute(pool, (enum cudaMemPoolAttr)attr, value));
+}
+
+// yasai: driver form of cudaMemPoolSetAccess (CUmemAccessDesc has the cudaMemAccessDesc layout).
+// @param pool Pool.
+// @param map Access descriptors.
+// @param count Number of descriptors.
+extern "C" CUresult CUDAAPI cuMemPoolSetAccess(cudaMemPool_t pool, const void *map, size_t count) {
+  return yasai_drv_status(
+      cudaMemPoolSetAccess(pool, reinterpret_cast<const struct cudaMemAccessDesc *>(map), count));
+}
+
+// yasai: driver form of cudaMemPoolTrimTo.
+// @param pool Pool.
+// @param minBytesToKeep Bytes to keep.
+extern "C" CUresult CUDAAPI cuMemPoolTrimTo(cudaMemPool_t pool, size_t minBytesToKeep) {
+  return yasai_drv_status(cudaMemPoolTrimTo(pool, minBytesToKeep));
+}
+
+// yasai: driver form of cudaMallocFromPoolAsync: an ordinary allocation, released in stream
+// order by cuMemFreeAsync / cudaFreeAsync.
+// @param dptr Receives the address.
+// @param bytesize Bytes.
+// @param pool Pool.
+// @param hStream Stream.
+extern "C" CUresult CUDAAPI cuMemAllocFromPoolAsync(CUdeviceptr *dptr, size_t bytesize,
+                                                    cudaMemPool_t pool, CUstream hStream) {
+  void *p = NULL;
+  if (dptr == NULL) return CUDA_ERROR_INVALID_VALUE;
+  const CUresult r = yasai_drv_status(
+      cudaMallocFromPoolAsync(&p, bytesize, pool, reinterpret_cast<cudaStream_t>(hStream)));
+  *dptr = CUdeviceptr(reinterpret_cast<uint64_t>(p));
+  return r;
+}
+
+// yasai: driver form of cudaMallocAsync.
+// @param dptr Receives the address.
+// @param bytesize Bytes.
+// @param hStream Stream.
+extern "C" CUresult CUDAAPI cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize, CUstream hStream) {
+  void *p = NULL;
+  if (dptr == NULL) return CUDA_ERROR_INVALID_VALUE;
+  const CUresult r =
+      yasai_drv_status(cudaMallocAsync(&p, bytesize, reinterpret_cast<cudaStream_t>(hStream)));
+  *dptr = CUdeviceptr(reinterpret_cast<uint64_t>(p));
+  return r;
+}
+
+// yasai: driver form of cudaFreeAsync (released when the stream reaches the free).
+// @param dptr Allocation.
+// @param hStream Stream.
+extern "C" CUresult CUDAAPI cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream) {
+  return yasai_drv_status(cudaFreeAsync(reinterpret_cast<void *>(dptr),
+                                        reinterpret_cast<cudaStream_t>(hStream)));
+}
+
+// yasai: a pool exported as a shareable handle. Pools are tokens, so the handle only has to
+// import as a pool: for CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR (1) it is a descriptor of
+// /dev/null; other handle types are not supported.
+// @param handle_out Receives the handle (an int for a POSIX descriptor).
+// @param pool Pool.
+// @param handleType Handle type.
+// @param flags Must be 0.
+extern "C" CUresult CUDAAPI cuMemPoolExportToShareableHandle(void *handle_out, cudaMemPool_t pool,
+                                                             int handleType, unsigned long long flags) {
+  (void)pool;
+  (void)flags;
+  if (handle_out == NULL || handleType != 1) return CUDA_ERROR_NOT_SUPPORTED;
+  const int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return CUDA_ERROR_OUT_OF_MEMORY;
+  *static_cast<int *>(handle_out) = fd;
+  return CUDA_SUCCESS;
+}
+
+// yasai: imports a pool exported by cuMemPoolExportToShareableHandle as a new pool token of this
+// process.
+// @param pool_out Receives the pool.
+// @param handle Handle (the descriptor value cast to a pointer, as CUDA passes it).
+// @param handleType Handle type.
+// @param flags Must be 0.
+extern "C" CUresult CUDAAPI cuMemPoolImportFromShareableHandle(cudaMemPool_t *pool_out, void *handle,
+                                                               int handleType,
+                                                               unsigned long long flags) {
+  (void)handle;
+  (void)flags;
+  if (pool_out == NULL || handleType != 1) return CUDA_ERROR_NOT_SUPPORTED;
+  return yasai_drv_status(cudaMemPoolCreate(pool_out, NULL));
+}
+
+static_assert(sizeof(cudaIpcMemHandle_t) <= 64, "an IPC handle fits CUmemPoolPtrExportData");
+
+// yasai: exports a pool allocation: its IPC memory handle, in the 64 bytes of
+// CUmemPoolPtrExportData (pool allocations are ordinary allocations).
+// @param shareData_out Receives the export data.
+// @param ptr Allocation.
+extern "C" CUresult CUDAAPI cuMemPoolExportPointer(void *shareData_out, CUdeviceptr ptr) {
+  if (shareData_out == NULL) return CUDA_ERROR_INVALID_VALUE;
+  cudaIpcMemHandle_t h;
+  if (cudaIpcGetMemHandle(&h, reinterpret_cast<void *>(ptr)) != cudaSuccess)
+    return CUDA_ERROR_INVALID_VALUE;
+  memset(shareData_out, 0, 64);
+  memcpy(shareData_out, &h, sizeof(h));
+  return CUDA_SUCCESS;
+}
+
+// yasai: maps an allocation exported by cuMemPoolExportPointer (through its IPC handle).
+// @param ptr_out Receives the mapped address.
+// @param pool Importing pool (not used).
+// @param shareData Export data.
+extern "C" CUresult CUDAAPI cuMemPoolImportPointer(CUdeviceptr *ptr_out, cudaMemPool_t pool,
+                                                   void *shareData) {
+  (void)pool;
+  if (ptr_out == NULL || shareData == NULL) return CUDA_ERROR_INVALID_VALUE;
+  cudaIpcMemHandle_t h;
+  memcpy(&h, shareData, sizeof(h));
+  void *p = NULL;
+  if (cudaIpcOpenMemHandle(&p, h, cudaIpcMemLazyEnablePeerAccess) != cudaSuccess)
+    return CUDA_ERROR_INVALID_VALUE;
+  *ptr_out = CUdeviceptr(reinterpret_cast<uint64_t>(p));
+  return CUDA_SUCCESS;
 }
 
 // yasai: a fixed UUID per simulated device (NCCL reads it for topology and logging).
