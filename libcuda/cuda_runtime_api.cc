@@ -637,6 +637,14 @@ static int yasai_ordinal_count() {
   return n;
 }
 
+/// Devices a process sees: YASAI_NVML_DEVICES when it is set, otherwise 1 (one simulated GPU).
+/// Needs no initialized simulator, so cudaGetDeviceCount can answer before initialization.
+/// @return The device count.
+static int yasai_device_count() {
+  const int n = yasai_ordinal_count();
+  return n > 0 ? n : 1;
+}
+
 /// Whether device is a valid ordinal: below YASAI_NVML_DEVICES when it is set, otherwise the
 /// simulator's own test (device <= num_devices).
 /// @param device Ordinal asked for.
@@ -1219,19 +1227,15 @@ cudaError_t cudaConfigureCallInternal(dim3 gridDim, dim3 blockDim,
   return g_last_cudaError = cudaSuccess;
 }
 
+// yasai: the device count needs no initialized simulator (yasai_device_count).
 __host__ cudaError_t CUDARTAPI
 cudaGetDeviceCountInternal(int *count, gpgpu_context *gpgpu_ctx = NULL) {
-  gpgpu_context *ctx;
-  if (gpgpu_ctx) {
-    ctx = gpgpu_ctx;
-  } else {
-    ctx = GPGPU_Context();
-  }
+  (void)gpgpu_ctx;
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  _cuda_device_id *dev = ctx->GPGPUSim_Init();
-  *count = yasai_ordinal_count() > 0 ? yasai_ordinal_count() : dev->num_devices();
+  if (count == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  *count = yasai_device_count();
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -3493,22 +3497,34 @@ __host__ cudaError_t CUDARTAPI cudaMemset2D(void *mem, size_t pitch, int c,
  *                                                                              *
  *******************************************************************************/
 
+// yasai: the device address of a registered __device__ / __constant__ variable; symbol is the
+// host shadow variable (CUDA 5 and later), as for cudaMemcpyToSymbol. NVSHMEM finds its device
+// state (nvshmemi_device_state_d) this way.
 __host__ cudaError_t CUDARTAPI cudaGetSymbolAddress(void **devPtr,
                                                     const char *symbol) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  cuda_not_implemented(__my_func__, __LINE__);
-  return g_last_cudaError = cudaErrorUnknown;
+  gpgpu_context *ctx = GPGPU_Context();
+  ctx->GPGPUSim_Init();
+  unsigned long long addr = 0;
+  if (devPtr == NULL || !ctx->func_sim->yasai_symbol_address(symbol, &addr, NULL))
+    return g_last_cudaError = cudaErrorInvalidSymbol;
+  *devPtr = (void *)addr;
+  return g_last_cudaError = cudaSuccess;
 }
 
+// yasai: the size of a registered variable (see cudaGetSymbolAddress).
 __host__ cudaError_t CUDARTAPI cudaGetSymbolSize(size_t *size,
                                                  const char *symbol) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  cuda_not_implemented(__my_func__, __LINE__);
-  return g_last_cudaError = cudaErrorUnknown;
+  gpgpu_context *ctx = GPGPU_Context();
+  ctx->GPGPUSim_Init();
+  if (size == NULL || !ctx->func_sim->yasai_symbol_address(symbol, NULL, size))
+    return g_last_cudaError = cudaErrorInvalidSymbol;
+  return g_last_cudaError = cudaSuccess;
 }
 
 /*******************************************************************************
@@ -6953,11 +6969,24 @@ CUresult CUDAAPI cuCtxGetDevice(CUdevice *device) {
 }
 
 #if CUDART_VERSION >= 7000
+// yasai: flags of the current context. The simulator models one context whose flags nobody
+// changes except through cuCtxSetFlags (NVSHMEM adds CU_CTX_SYNC_MEMOPS); they are kept here.
+static unsigned &yasai_ctx_flags() {
+  static unsigned flags = 0;
+  return flags;
+}
+
+// yasai: see yasai_ctx_flags.
 CUresult CUDAAPI cuCtxGetFlags(unsigned int *flags) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  if (flags == NULL) return CUDA_ERROR_INVALID_VALUE;
+  *flags = yasai_ctx_flags();
+  return CUDA_SUCCESS;
+}
+
+// yasai: stores the flags (see yasai_ctx_flags); the functional model has no behaviour that
+// depends on them (CU_CTX_SYNC_MEMOPS: memory operations are synchronous already).
+extern "C" CUresult CUDAAPI cuCtxSetFlags(unsigned int flags) {
+  yasai_ctx_flags() = flags;
   return CUDA_SUCCESS;
 }
 #endif /* CUDART_VERSION >= 7000 */

@@ -269,6 +269,10 @@ class cuda_sim {
   void gpgpu_ptx_sim_memcpy_symbol(const char *hostVar, const void *src,
                                    size_t count, size_t offset, int to,
                                    gpgpu_t *gpu);
+  /// yasai: device address and size of the variable that the host registered as hostVar
+  /// (__cudaRegisterVar), for cudaGetSymbolAddress / cudaGetSymbolSize; loads its PTX file when
+  /// it is not parsed yet. False when hostVar names no registered variable.
+  bool yasai_symbol_address(const void *hostVar, unsigned long long *addr, size_t *size);
   void ptx_print_insn(address_type pc, FILE *fp);
   std::string ptx_get_insn_str(address_type pc);
   template <int activate_level>

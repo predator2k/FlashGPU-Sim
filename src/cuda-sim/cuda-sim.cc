@@ -3461,6 +3461,29 @@ void cuda_sim::gpgpu_ptx_sim_memcpy_symbol(const char *hostVar, const void *src,
   fflush(stdout);
 }
 
+bool cuda_sim::yasai_symbol_address(const void *hostVar, unsigned long long *addr, size_t *size) {
+  std::string sym_name;
+  auto c = g_const_name_lookup.find(hostVar);
+  auto g = g_global_name_lookup.find(hostVar);
+  if (c != g_const_name_lookup.end())
+    sym_name = c->second;
+  else if (g != g_global_name_lookup.end())
+    sym_name = g->second;
+  else
+    return false;
+  auto &tables = gpgpu_ctx->ptx_parser->g_sym_name_to_symbol_table;
+  auto st = tables.find(sym_name);
+  if (st == tables.end() && yasai_func::g_lazy_load_name != nullptr &&
+      yasai_func::g_lazy_load_name(sym_name.c_str()))
+    st = tables.find(sym_name);
+  if (st == tables.end()) return false;
+  const symbol *sym = st->second->lookup(sym_name.c_str());
+  if (sym == NULL) return false;
+  if (addr) *addr = sym->get_address();
+  if (size) *size = sym->get_size_in_bytes();
+  return true;
+}
+
 extern int ptx_debug;
 
 void cuda_sim::read_sim_environment_variables() {
