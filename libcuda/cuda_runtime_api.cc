@@ -5721,8 +5721,10 @@ static void yasai_register_library_ptx(gpgpu_context *ctx, unsigned handle, void
   for (const std::string &orig : files) {
     const int idx = int(L.files.size());
     // module-local symbols scoped to the module (yasai_module_scope.h); the index below reads
-    // the renamed copy, as every later parse does
-    const std::string f = yasai_scope::scope_file(orig);
+    // the renamed copy, as every later parse does. The files are named after the library's
+    // source files, so the library itself is their unit (kernels it shares by name with
+    // another library are renamed in it).
+    const std::string f = yasai_scope::scope_file(orig, yasai_scope::library_unit(path));
     L.files.push_back(f);
     L.archs.push_back(yasai_jit::arch_of_ptx_file(orig));
     L.loaded.push_back(false);

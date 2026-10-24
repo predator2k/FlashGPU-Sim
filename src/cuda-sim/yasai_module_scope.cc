@@ -380,6 +380,8 @@ std::string library_entry_name(const std::string &name, const std::string &libra
   return name;
 }
 
+std::string library_unit(const std::string &library) { return library_key(base_name(library)); }
+
 std::string source_name(const std::string &name) {
   Registry &r = registry();
   std::lock_guard<std::mutex> lock(r.mu);

@@ -53,6 +53,13 @@ std::string module_entry_name(const std::string &path, const std::string &name);
 /// @return The name to look up.
 std::string library_entry_name(const std::string &name, const std::string &library);
 
+/// Unit of a library's PTX files for scope_file: the library key of the library's file name
+/// ("libfoo" for "/path/libfoo.so.1"). Files extracted from a library may be named after its
+/// source files, so a caller that knows the library passes this unit.
+/// @param library Path or file name of the library.
+/// @return The unit.
+std::string library_unit(const std::string &library);
+
 /// Source name of a kernel symbol: the original name of a renamed kernel, otherwise name.
 /// @param name Kernel symbol.
 /// @return The name the program and the reference runs use.
