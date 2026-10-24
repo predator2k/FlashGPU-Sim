@@ -51,11 +51,12 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 %}
 
 %%
-"ptxas info    : Function properties for"[^\n]*\n[^\n]*
-"ptxas info    : ("[A-Z][0-9]+")"[^\n]*
-"ptxas info    : "[A-Z][0-9]+[^\n]*
+ /* yasai: a ptxas named with a suffix (Triton's ptxas-blackwell) prints its own name */
+"ptxas"("-"[a-z]+)?" info    : Function properties for"[^\n]*\n[^\n]*
+"ptxas"("-"[a-z]+)?" info    : ("[A-Z][0-9]+")"[^\n]*
+"ptxas"("-"[a-z]+)?" info    : "[A-Z][0-9]+[^\n]*
 "warning"[^\n]* TC; return WARNING;
-"ptxas"	TC; 	return HEADER;
+"ptxas"("-"[a-z]+)?	TC; 	return HEADER;
 "info"	TC; 	return INFO;
 "Compiling entry function"	TC; return FUNC;
 "Used"		TC; return USED;
