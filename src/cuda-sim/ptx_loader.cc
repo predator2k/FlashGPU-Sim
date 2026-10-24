@@ -660,6 +660,52 @@ void gpgpu_context::gpgpu_ptx_info_load_from_filename(const char *filename,
     ptxas_filename = std::string(slash ? slash + 1 : filename) + "." + host + "." +
                      std::to_string(getpid()) + "." + std::to_string(ptxas_seq++) + ".ptxas";
   }
+  // yasai: PTX newer than the toolkit's ptxas accepts (CuTe DSL ships its own NVVM and writes
+  // ".version 9.4"; CUDA 13.0's ptxas stops at 9.0, YASAI_PTXAS_MAX_PTX_VERSION) goes to the ptxas
+  // named by YASAI_PTXAS_NEWER (for example the CUDA 13.4 ptxas of the nvidia-cuda-nvcc wheel);
+  // ptxas only reports registers and shared memory here, so a newer one is safe. Without it, a
+  // copy whose .version line names the highest accepted version is assembled, with a warning:
+  // instructions that exist only in the newer ISA would be rejected or misread.
+  std::string capped_ptx, ptxas_bin = "${PTXAS_CUDA_INSTALL_PATH:-$CUDA_INSTALL_PATH}/bin/ptxas";
+  {
+    const char *mv = getenv("YASAI_PTXAS_MAX_PTX_VERSION");
+    const std::string max_version = mv != NULL && *mv ? mv : "9.0";
+    std::ifstream in(filename);
+    std::string line;
+    for (int n = 0; n < 64 && std::getline(in, line); ++n) {
+      unsigned major = 0, minor = 0, max_major = 0, max_minor = 0;
+      if (sscanf(line.c_str(), " .version %u.%u", &major, &minor) != 2) continue;
+      if (sscanf(max_version.c_str(), "%u.%u", &max_major, &max_minor) == 2 &&
+          major * 100 + minor > max_major * 100 + max_minor) {
+        const char *newer = getenv("YASAI_PTXAS_NEWER");
+        if (newer != NULL && *newer && access(newer, X_OK) == 0) {
+          ptxas_bin = newer;
+          printf("GPGPU-Sim PTX: %s is PTX %u.%u; ptxinfo from %s\n", filename, major, minor,
+                 newer);
+        } else {
+          capped_ptx = ptxas_filename + ".ptx";
+          std::ifstream src(filename);
+          std::ofstream dst(capped_ptx);
+          std::string l;
+          bool done = false;
+          while (std::getline(src, l)) {
+            unsigned a = 0, b = 0;
+            if (!done && sscanf(l.c_str(), " .version %u.%u", &a, &b) == 2) {
+              dst << ".version " << max_version << "\n";
+              done = true;
+            } else {
+              dst << l << "\n";
+            }
+          }
+          printf("GPGPU-Sim PTX: WARNING: %s is PTX %u.%u and YASAI_PTXAS_NEWER names no ptxas; "
+                 "ptxinfo from a copy marked %s (yasai-ptx-version-capped)\n",
+                 filename, major, minor, max_version.c_str());
+        }
+      }
+      break;
+    }
+  }
+  if (!capped_ptx.empty()) filename = capped_ptx.c_str();
   char buff[4096], extra_flags[1024];
   extra_flags[0] = 0;
   if (!device_runtime->g_cdp_enabled && !compile_only)
@@ -668,8 +714,8 @@ void gpgpu_context::gpgpu_ptx_info_load_from_filename(const char *filename,
     snprintf(extra_flags, 1024, "--compile-only --gpu-name=%s", arch_str);
   snprintf(
       buff, sizeof(buff),
-      "%s${PTXAS_CUDA_INSTALL_PATH:-$CUDA_INSTALL_PATH}/bin/ptxas %s -v %s --output-file  /dev/null 2> %s",
-      ptxas_clean_env_prefix(), extra_flags, filename, ptxas_filename.c_str());
+      "%s%s %s -v %s --output-file  /dev/null 2> %s",
+      ptxas_clean_env_prefix(), ptxas_bin.c_str(), extra_flags, filename, ptxas_filename.c_str());
   // yasai: YASAI_PTXINFO_CACHE=<dir> keeps the ptxas -v output per (PTX content, flags), so a
   // process that loads the same PTX again (every rank of a job) skips ptxas, which takes most of
   // the load time of a large module (FlashAttention-2: 42 s of 44 s). A new entry is written to a
