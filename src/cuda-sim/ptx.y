@@ -653,11 +653,18 @@ instruction_statement:  instruction SEMI_COLON
 	| IDENTIFIER COLON { recognizer->add_label($1); }
 	| pred_spec instruction SEMI_COLON;
 
-instruction: opcode_spec LEFT_PAREN operand RIGHT_PAREN { recognizer->set_return(); } COMMA operand COMMA LEFT_PAREN operand_list RIGHT_PAREN
+instruction: opcode_spec LEFT_PAREN operand RIGHT_PAREN { recognizer->set_return(); } COMMA operand COMMA call_arg_list
 	| opcode_spec operand COMMA LEFT_PAREN operand_list RIGHT_PAREN
 	| opcode_spec operand COMMA LEFT_PAREN RIGHT_PAREN
 	| opcode_spec operand_list 
 	| opcode_spec
+	;
+
+/* yasai: the arguments of a call with a return value; nvcc writes "call (retval0), f, ();" (the
+   parentheses on separate lines) for a function without parameters (NVSHMEM's
+   nvshmemi_transfer_submit_active_region_slow). */
+call_arg_list: LEFT_PAREN operand_list RIGHT_PAREN
+	| LEFT_PAREN RIGHT_PAREN
 	;
 
 opcode_spec: OPCODE { recognizer->add_opcode($1); } option_list
