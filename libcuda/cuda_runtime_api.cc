@@ -2059,14 +2059,19 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyAsyncInternal(
   // yasai: a host source that is not pinned (not a registered host window) is pageable
   // memory. CUDA copies pageable data before cudaMemcpyAsync returns, so the caller may reuse
   // the buffer at once (NCCL passes stack variables), while the stream operation here reads the
-  // source only when it executes. The data are therefore copied into a snapshot buffer now.
-  // Snapshots are kept until process exit (NCCL's are small; larger copies are rare here).
-  auto snapshot = [&](const void *p) -> const void * {
-    if (host_window::contains((unsigned long long)p, 1)) return p;
-    static std::vector<std::unique_ptr<unsigned char[]>> keep;
-    keep.emplace_back(new unsigned char[count ? count : 1]);
-    memcpy(keep.back().get(), p, count);
-    return keep.back().get();
+  // source only when it executes. The data are therefore copied into a snapshot buffer now. The
+  // stream operation owns the buffer and releases it after it has run, so model weights loaded
+  // through pageable copies are not kept twice; each call has its own buffer, so host threads
+  // that copy concurrently (parallel weight loading) do not share state here.
+  auto push_h2d = [&](const void *p) {
+    if (host_window::contains((unsigned long long)p, 1)) {
+      yasai_stream_manager(ctx)->push(stream_operation(p, (size_t)dst, count, s));
+      return;
+    }
+    std::shared_ptr<unsigned char[]> buf(new unsigned char[count ? count : 1]);
+    memcpy(buf.get(), p, count);
+    yasai_stream_manager(ctx)->push(stream_operation(
+        std::shared_ptr<const unsigned char[]>(std::move(buf)), (size_t)dst, count, s));
   };
   if (kind == cudaMemcpyDefault) {
     gpgpu_t *gpu = GPGPUSim_Context(ctx)->get_device()->get_gpgpu();
@@ -2079,8 +2084,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyAsyncInternal(
   }
   switch (kind) {
     case cudaMemcpyHostToDevice:
-      yasai_stream_manager(ctx)->push(
-          stream_operation(snapshot(src), (size_t)dst, count, s));
+      push_h2d(src);
       break;
     case cudaMemcpyDeviceToHost:
       yasai_stream_manager(ctx)->push(
@@ -2107,7 +2111,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyAsyncInternal(
       else if (sd)
         yasai_stream_manager(ctx)->push(stream_operation((size_t)src, dst, count, s));
       else if (dd)
-        yasai_stream_manager(ctx)->push(stream_operation(src, (size_t)dst, count, s));
+        push_h2d(src);
       else
         memcpy(dst, src, count);  // host to host
       break;

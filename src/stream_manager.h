@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <list>
+#include <memory>
 #include "abstract_hardware_model.h"
 
 // class stream_barrier {
@@ -195,6 +196,19 @@ class stream_operation {
     m_sim_mode = false;
     m_done = false;
   }
+  /// yasai: a host-to-device copy from a snapshot buffer that the operation owns. Copies of
+  /// the operation (the stream queues hold them by value) share the buffer, which is released
+  /// when the last copy is destroyed, after the operation has run.
+  /// @param snapshot Copy of the pageable host source, taken when the copy was issued.
+  /// @param device_address_dst Device destination address.
+  /// @param cnt Bytes.
+  /// @param stream Stream of the copy.
+  stream_operation(std::shared_ptr<const unsigned char[]> snapshot, size_t device_address_dst,
+                   size_t cnt, struct CUstream_st *stream)
+      : stream_operation(static_cast<const void *>(snapshot.get()), device_address_dst, cnt,
+                         stream) {
+    m_snapshot = std::move(snapshot);
+  }
   stream_operation(size_t device_address_src, void *host_address_dst,
                    size_t cnt, struct CUstream_st *stream) {
     m_kernel = NULL;
@@ -246,6 +260,8 @@ class stream_operation {
   size_t m_device_address_src;
   void *m_host_address_dst;
   const void *m_host_address_src;
+  /// yasai: owner of m_host_address_src for a copy from a pageable source (null otherwise)
+  std::shared_ptr<const unsigned char[]> m_snapshot;
   size_t m_cnt;
   int m_memset_value = 0;  ///< yasai: byte value of a stream_memset operation
 
