@@ -694,12 +694,26 @@ char *get_app_binary_name(std::string abs_path) {
 }
 
 // yasai: cluster shape of the next launch, set from cudaLaunchKernelExC / cuLaunchKernelEx
-// attributes and consumed (reset to 1,1,1) when the launch creates its kernel_info_t.
-static dim3 g_yasai_pending_cluster(1, 1, 1);
+// attributes and consumed (reset to 1,1,1) when the launch creates its kernel_info_t. Per thread:
+// the setting and the launch that consumes it run on the same thread, and a launch on another
+// thread must not take it.
+static thread_local dim3 g_yasai_pending_cluster(1, 1, 1);
 // yasai: the next launch is cooperative (cudaLaunchCooperativeKernel, cuLaunchCooperativeKernel,
 // or the cooperative attribute of cudaLaunchKernelExC / cuLaunchKernelEx); consumed by the
-// launch (cudaLaunchInternalImpl or the graph capture of the launch).
-static bool g_yasai_pending_cooperative = false;
+// launch (cudaLaunchInternalImpl or the graph capture of the launch). Per thread, as
+// g_yasai_pending_cluster.
+static thread_local bool g_yasai_pending_cooperative = false;
+
+/// yasai: serializes the part of a launch that writes the kernel's function_info (the argument
+/// values that add_param_data stores and finalize copies into the new grid's parameter memory,
+/// the dynamic shared memory size, and the one-time PDOM analysis). function_info is shared by
+/// every launch of a kernel, so two threads launching the same kernel at once could otherwise
+/// give one grid the other's arguments (stream_order direct_launch, two threads).
+/// @return The mutex.
+static std::recursive_mutex &yasai_launch_mu() {
+  static std::recursive_mutex *m = new std::recursive_mutex;
+  return *m;
+}
 
 // yasai: CTAs of launch grid that the device holds at once, from the device properties the
 // application sees (cudaDeviceProp: SM count, threads, registers, shared memory and blocks per
@@ -1710,6 +1724,8 @@ cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx
          (ctx->func_sim->g_ptx_sim_mode) ? "functional simulation"
                                          : "performance simulation",
          stream ? stream->get_uid() : 0);
+  // yasai: held from the argument copy to the PDOM analysis (see yasai_launch_mu).
+  std::unique_lock<std::recursive_mutex> yasai_launch_lock(yasai_launch_mu());
   kernel_info_t *grid = ctx->api->gpgpu_cuda_ptx_sim_init_grid(
       hostFun, config.get_args(), config.grid_dim(), config.block_dim(),
       context);
@@ -1772,6 +1788,7 @@ cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx
     kernel_func_info->do_pdom();
     kernel_func_info->set_pdom();
   }
+  yasai_launch_lock.unlock();
   dim3 gridDim = config.grid_dim();
   dim3 blockDim = config.block_dim();
 
