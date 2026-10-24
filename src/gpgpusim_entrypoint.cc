@@ -295,6 +295,9 @@ bool SST_Cycle() {
 }
 
 void gpgpu_context::synchronize() {
+  // yasai: with lazy initialization the GPU model (and its stream manager) may not exist yet
+  // (NVSHMEM's cuCtxSynchronize right after cudaSetDevice); then nothing is queued.
+  if (the_gpgpusim == NULL || the_gpgpusim->g_stream_manager == NULL) return;
   printf("GPGPU-Sim: synchronize waiting for inactive GPU simulation\n");
   the_gpgpusim->g_stream_manager->print(stdout);
   fflush(stdout);
@@ -314,6 +317,8 @@ void gpgpu_context::synchronize() {
 
 bool gpgpu_context::synchronize_check() {
   // printf("GPGPU-Sim: synchronize checking for inactive GPU simulation\n");
+  // yasai: no GPU model yet (lazy initialization): nothing is queued.
+  if (the_gpgpusim == NULL || the_gpgpusim->g_stream_manager == NULL) return true;
   requested_synchronize = true;
   the_gpgpusim->g_stream_manager->print(stdout);
   fflush(stdout);
