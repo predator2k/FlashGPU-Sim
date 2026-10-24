@@ -10783,25 +10783,6 @@ extern "C" CUresult CUDAAPI cuLaunchCooperativeKernel(CUfunction f, unsigned int
   return r;
 }
 
-// yasai: cuLaunchCooperativeKernel, the driver-API form of cudaLaunchCooperativeKernel, launched
-// as cuLaunchKernel with the same warning (grid-wide synchronization is not simulated).
-// Transformer Engine looks it up through cudaGetDriverEntryPoint.
-//   f, grid and block dimensions, sharedMemBytes, hStream, kernelParams  as in the driver API
-extern "C" CUresult CUDAAPI cuLaunchCooperativeKernel(CUfunction f, unsigned int gridDimX,
-                                                     unsigned int gridDimY, unsigned int gridDimZ,
-                                                     unsigned int blockDimX, unsigned int blockDimY,
-                                                     unsigned int blockDimZ, unsigned int sharedMemBytes,
-                                                     CUstream hStream, void **kernelParams) {
-  static bool warned = false;
-  if (!warned) {
-    warned = true;
-    printf("GPGPU-Sim PTX: warning: cuLaunchCooperativeKernel runs as a normal launch; grid-wide "
-           "synchronization is not simulated\n");
-  }
-  return cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ,
-                        sharedMemBytes, hStream, kernelParams, NULL);
-}
-
 // cudaMemset2DAsync: one cudaMemsetAsync per row.
 //   devPtr, pitch, value, width, height, stream  as in the CUDA runtime API
 extern "C" cudaError_t CUDARTAPI cudaMemset2DAsync(void *devPtr, size_t pitch, int value,
