@@ -558,6 +558,11 @@ void function_info::recognize_dynamic_shared_mem() {
 
           if (size_in_bytes == 0) {
             // This is a dynamic shared memory symbol.
+            // yasai: the base alignment is the largest .align of the kernel's extern arrays.
+            const int align =
+                symbol->type() ? symbol->type()->get_key().get_alignment_spec() : 0;
+            if (align > 0 && (unsigned)align > m_yasai_dyn_smem_align)
+              m_yasai_dyn_smem_align = (unsigned)align;
             // Check if it is not added to my scope.
             if (m_local_dyn_shared_mem_symbol == nullptr) {
               // I need to add it to the function's symbol table.
@@ -566,15 +571,23 @@ void function_info::recognize_dynamic_shared_mem() {
                      symbol->name().c_str());
               m_local_dyn_shared_mem_symbol = m_symtab->add_symbol(*symbol);
             }
-
-            assert(m_local_dyn_shared_mem_symbol->name() == symbol->name() &&
-                   "Multiple dynamic shared memory symbols found!");
+            // yasai: another extern .shared array of the same kernel aliases the same base
+            // (it used to abort on "Multiple dynamic shared memory symbols found!").
+            ::symbol *local = m_local_dyn_shared_mem_symbol;
+            if (local->name() != symbol->name()) {
+              local = nullptr;
+              for (::symbol *a : m_yasai_dyn_smem_aliases)
+                if (a->name() == symbol->name()) local = a;
+              if (!local) {
+                local = m_symtab->add_symbol(*symbol);
+                m_yasai_dyn_smem_aliases.push_back(local);
+              }
+            }
 
             // Update the operand to use the localized dynamic smem symbol.
             printf("GPGPU-Sim PTX: >>>>>> Updating operand to use localized "
                    "dyn shared mem symbol.\n");
-            const_cast<operand_info &>(op).set_symbolic(
-                m_local_dyn_shared_mem_symbol);
+            const_cast<operand_info &>(op).set_symbolic(local);
           }
         }
       }
@@ -596,6 +609,7 @@ void function_info::alloc_dyn_shared_mem(int shared_mem_size) {
     // (FlashMLA's SM100 decode, whose buffers then lost their 1024-byte swizzle alignment).
     if (m_yasai_dyn_smem_placed) {
       m_local_dyn_shared_mem_symbol->set_address(m_yasai_dyn_smem_addr);
+      for (symbol *a : m_yasai_dyn_smem_aliases) a->set_address(m_yasai_dyn_smem_addr);
       if ((unsigned)shared_mem_size > m_yasai_dyn_smem_reserved) {
         symtab->alloc_shared(shared_mem_size - m_yasai_dyn_smem_reserved);
         m_yasai_dyn_smem_reserved = shared_mem_size;
@@ -609,6 +623,9 @@ void function_info::alloc_dyn_shared_mem(int shared_mem_size) {
         (shared_mem_size & (shared_mem_size - 1)) == 0) {
       alignto = shared_mem_size;
     }
+    // yasai: and at least the declared .align of the extern arrays (CUTLASS, FA3, FlashMLA and
+    // ThunderKittens declare 128 or 1024, and the compiler folds address arithmetic on it).
+    if (m_yasai_dyn_smem_align > alignto) alignto = m_yasai_dyn_smem_align;
     addr_t addr_pad = alignto ? ((alignto - (addr % alignto)) % alignto) : 0;
     m_yasai_dyn_smem_placed = true;
     m_yasai_dyn_smem_addr = addr + addr_pad;
@@ -618,6 +635,7 @@ void function_info::alloc_dyn_shared_mem(int shared_mem_size) {
            m_local_dyn_shared_mem_symbol->name().c_str(), addr + addr_pad,
            addr + addr_pad + shared_mem_size, shared_mem_size);
     m_local_dyn_shared_mem_symbol->set_address(addr + addr_pad);
+    for (symbol *a : m_yasai_dyn_smem_aliases) a->set_address(addr + addr_pad);
     symtab->alloc_shared(shared_mem_size + addr_pad);
     // Print the dynamic allocation and the resulting total shared mem for this
     // kernel. `m_kernel_info.smem` is the declared (static) smem size parsed
