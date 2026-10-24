@@ -29,96 +29,16 @@
 #include "cuda_device_printf.h"
 #include "ptx_ir.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
+
 void decode_space(memory_space_t &space, ptx_thread_info *thread,
                   const operand_info &op, memory_space *&mem, addr_t &addr);
 
-void my_cuda_printf(const char *fmtstr, const char *arg_list) {
-  FILE *fp = stdout;
-  unsigned i = 0, j = 0;
-  unsigned arg_offset = 0;
-  char buf[64];
-  bool in_fmt = false;
-  while (fmtstr[i]) {
-    char c = fmtstr[i++];
-    if (!in_fmt) {
-      if (c != '%') {
-        fprintf(fp, "%c", c);
-      } else {
-        in_fmt = true;
-        buf[0] = c;
-        j = 1;
-      }
-    } else {
-      if (!(c == 'u' || c == 'f' || c == 'd')) {
-        printf(
-            "GPGPU-Sim PTX: ERROR ** printf parsing support is limited to %%u, "
-            "%%f, %%d at present");
-        abort();
-      }
-      buf[j] = c;
-      buf[j + 1] = 0;
-      void *ptr = (void *)&arg_list[arg_offset];
-      // unsigned long long value = ((unsigned long long*)arg_list)[arg_offset];
-      if (c == 'u' || c == 'd') {
-        fprintf(fp, buf, *((unsigned long long *)ptr));
-      } else if (c == 'f') {
-        double tmp = *((double *)ptr);
-        fprintf(fp, buf, tmp);
-      }
-      arg_offset++;
-      in_fmt = false;
-    }
-  }
-}
-
-void gpgpusim_cuda_vprintf(const ptx_instruction *pI, ptx_thread_info *thread,
-                           const function_info *target_func) {
-  char *fmtstr = NULL;
-  char *arg_list = NULL;
-  unsigned n_return = target_func->has_return();
-  unsigned n_args = target_func->num_args();
-  assert(n_args == 2);
-  for (unsigned arg = 0; arg < n_args; arg++) {
-    const operand_info &actual_param_op =
-        pI->operand_lookup(n_return + 1 + arg);
-    const symbol *formal_param = target_func->get_arg(arg);
-    unsigned size = formal_param->get_size_in_bytes();
-    assert(formal_param->is_param_local());
-    assert(actual_param_op.is_param_local());
-    addr_t from_addr = actual_param_op.get_symbol()->get_address();
-    unsigned long long buffer[1024];
-    assert(size < 1024 * sizeof(unsigned long long));
-    thread->m_local_mem->read(from_addr, size, buffer);
-    addr_t addr =
-        (addr_t)buffer[0];  // should be pointer to generic memory location
-    memory_space *mem = NULL;
-    memory_space_t space = generic_space;
-    decode_space(space, thread, actual_param_op, mem,
-                 addr);  // figure out which space
-    if (arg == 0) {
-      unsigned len = 0;
-      char b = 0;
-      do {  // figure out length
-        mem->read(addr + len, 1, &b);
-        len++;
-      } while (b);
-      fmtstr = (char *)malloc(len + 64);
-      for (int i = 0; i < len; i++) mem->read(addr + i, 1, fmtstr + i);
-      // mem->read(addr,len,fmtstr);
-    } else {
-      unsigned len = thread->get_finfo()->local_mem_framesize();
-      arg_list = (char *)malloc(len + 64);
-      for (int i = 0; i < len; i++) mem->read(addr + i, 1, arg_list + i);
-      // mem->read(addr,len,arg_list);
-    }
-  }
-  my_cuda_printf(fmtstr, arg_list);
-  free(fmtstr);
-  free(arg_list);
-}
-
-
-// yasai: reads the value of parameter arg of a call (as gpgpusim_cuda_vprintf does).
+// yasai: reads the value of parameter arg of a call (the parameter buffer of the call).
 //   pI: the call; thread: calling thread; target_func: callee; arg: parameter index
 static unsigned long long yasai_call_param(const ptx_instruction *pI, ptx_thread_info *thread,
                                            const function_info *target_func, unsigned arg) {
@@ -170,4 +90,179 @@ void yasai_cuda_assertfail(const ptx_instruction *pI, ptx_thread_info *thread,
          "Assertion `%s` failed.\n",
          file.c_str(), line, func.c_str(), cta.x, cta.y, cta.z, tid.x, tid.y, tid.z, msg.c_str());
   fflush(stdout);
+}
+
+// yasai: device printf. vprintf(format, args) receives a generic pointer to the format string and
+// a generic pointer to the argument buffer (0 when there are no arguments). The buffer follows the
+// CUDA ABI: every argument is aligned to its own size; char and short are promoted to 4-byte int,
+// float to 8-byte double, and long, long long, size_t and pointers take 8 bytes. %s reads a
+// NUL-terminated string at a generic address (global, shared or local). The full C conversion set
+// is formatted with the host's snprintf: flags, width and precision (also '*', taken from the
+// buffer as int), the length modifiers hh, h, l, ll, j, z, t and L, and the conversions d i u o x X
+// c s p f F e E g G a A and %%. %n writes nothing.
+
+// yasai: copies n bytes at a generic address of the calling thread into out; false for address 0.
+//   thread: calling thread; op: an operand of the call (for decode_space); addr: generic address;
+//   out: destination; n: bytes
+static bool yasai_read_generic(ptx_thread_info *thread, const operand_info &op, addr_t addr,
+                               void *out, unsigned n) {
+  if (addr == 0) return false;
+  memory_space *mem = NULL;
+  memory_space_t space = generic_space;
+  decode_space(space, thread, op, mem, addr);
+  mem->read(addr, n, out);
+  return true;
+}
+
+// yasai: the NUL-terminated string at a generic address (at most limit bytes), "(null)" for 0.
+//   thread: calling thread; op: an operand of the call; addr: generic address; limit: maximum
+static std::string yasai_read_generic_string(ptx_thread_info *thread, const operand_info &op,
+                                             addr_t addr, unsigned limit) {
+  if (addr == 0) return "(null)";
+  memory_space *mem = NULL;
+  memory_space_t space = generic_space;
+  decode_space(space, thread, op, mem, addr);
+  std::string s;
+  for (unsigned i = 0; i < limit; i++) {
+    char b = 0;
+    mem->read(addr + i, 1, &b);
+    if (b == 0) break;
+    s.push_back(b);
+  }
+  return s;
+}
+
+// yasai: formats a device printf call (see above) and returns the text.
+//   fmt: the format string; thread: calling thread; op: an operand of the call; args: generic
+//   address of the argument buffer (0: none)
+static std::string yasai_format_device_printf(const std::string &fmt, ptx_thread_info *thread,
+                                              const operand_info &op, addr_t args) {
+  std::string out;
+  size_t offset = 0;  // next byte of the argument buffer
+  // next argument of size bytes (4 or 8), aligned to its size
+  auto next_arg = [&](unsigned size) -> unsigned long long {
+    offset = (offset + size - 1) / size * size;
+    unsigned long long v = 0;
+    if (args != 0) yasai_read_generic(thread, op, args + offset, &v, size);
+    offset += size;
+    return v;
+  };
+  size_t i = 0;
+  while (i < fmt.size()) {
+    const char c = fmt[i];
+    if (c != '%') {
+      out.push_back(c);
+      ++i;
+      continue;
+    }
+    if (i + 1 < fmt.size() && fmt[i + 1] == '%') {
+      out.push_back('%');
+      i += 2;
+      continue;
+    }
+    // %[flags][width][.precision][length]conversion
+    std::string spec = "%";
+    size_t j = i + 1;
+    while (j < fmt.size() && strchr("-+ #0'", fmt[j])) spec.push_back(fmt[j++]);
+    if (j < fmt.size() && fmt[j] == '*') {
+      spec += std::to_string(int(next_arg(4)));
+      ++j;
+    } else {
+      while (j < fmt.size() && isdigit((unsigned char)fmt[j])) spec.push_back(fmt[j++]);
+    }
+    if (j < fmt.size() && fmt[j] == '.') {
+      spec.push_back(fmt[j++]);
+      if (j < fmt.size() && fmt[j] == '*') {
+        spec += std::to_string(int(next_arg(4)));
+        ++j;
+      } else {
+        while (j < fmt.size() && isdigit((unsigned char)fmt[j])) spec.push_back(fmt[j++]);
+      }
+    }
+    std::string len;
+    while (j < fmt.size() && strchr("hljztL", fmt[j])) len.push_back(fmt[j++]);
+    if (j >= fmt.size()) {  // incomplete specification: printed as it is
+      out.append(fmt, i, std::string::npos);
+      break;
+    }
+    const char conv = fmt[j++];
+    // 8-byte integers for l, ll, j, z and t; 4-byte int (promoted char/short) otherwise
+    const bool wide = len == "l" || len == "ll" || len == "j" || len == "z" || len == "t";
+    char buf[512];
+    int n = 0;
+    switch (conv) {
+      case 'd':
+      case 'i': {
+        long long v = wide ? (long long)next_arg(8) : (long long)(int)next_arg(4);
+        if (len == "hh") v = (signed char)v;
+        if (len == "h") v = (short)v;
+        n = snprintf(buf, sizeof buf, (spec + "ll" + conv).c_str(), v);
+        break;
+      }
+      case 'u':
+      case 'o':
+      case 'x':
+      case 'X': {
+        unsigned long long v = wide ? next_arg(8) : (unsigned long long)(unsigned)next_arg(4);
+        if (len == "hh") v &= 0xffull;
+        if (len == "h") v &= 0xffffull;
+        n = snprintf(buf, sizeof buf, (spec + "ll" + conv).c_str(), v);
+        break;
+      }
+      case 'c':
+        n = snprintf(buf, sizeof buf, (spec + conv).c_str(), (int)next_arg(4));
+        break;
+      case 's': {
+        const std::string s = yasai_read_generic_string(thread, op, (addr_t)next_arg(8), 65536);
+        out += [&] {  // a long string is formatted into a buffer of its own size
+          std::vector<char> big(s.size() + 512);
+          snprintf(big.data(), big.size(), (spec + "s").c_str(), s.c_str());
+          return std::string(big.data());
+        }();
+        i = j;
+        continue;
+      }
+      case 'p':
+        n = snprintf(buf, sizeof buf, (spec + "p").c_str(), (void *)(uintptr_t)next_arg(8));
+        break;
+      case 'f':
+      case 'F':
+      case 'e':
+      case 'E':
+      case 'g':
+      case 'G':
+      case 'a':
+      case 'A': {
+        const unsigned long long bits = next_arg(8);
+        double d;
+        memcpy(&d, &bits, sizeof d);
+        n = snprintf(buf, sizeof buf, (spec + conv).c_str(), d);
+        break;
+      }
+      case 'n':
+        next_arg(8);
+        break;
+      default:  // unknown conversion: printed as it is
+        out.append(fmt, i, j - i);
+        i = j;
+        continue;
+    }
+    if (n > 0) out.append(buf, std::min<size_t>(size_t(n), sizeof buf - 1));
+    i = j;
+  }
+  return out;
+}
+
+void gpgpusim_cuda_vprintf(const ptx_instruction *pI, ptx_thread_info *thread,
+                           const function_info *target_func) {
+  assert(target_func->num_args() == 2);
+  const operand_info &fmt_op = pI->operand_lookup(target_func->has_return() + 1);
+  const addr_t fmt_addr = (addr_t)yasai_call_param(pI, thread, target_func, 0);
+  const addr_t args = (addr_t)yasai_call_param(pI, thread, target_func, 1);
+  const std::string fmt = yasai_read_generic_string(thread, fmt_op, fmt_addr, 65536);
+  const std::string text = yasai_format_device_printf(fmt, thread, fmt_op, args);
+  fwrite(text.data(), 1, text.size(), stdout);
+  fflush(stdout);
+  // The int that vprintf returns (the number of arguments) is not written; callers of printf in
+  // device code do not use it.
 }
