@@ -8317,23 +8317,38 @@ CUresult CUDAAPI cuParamSetTexRef(CUfunction hfunc, int texunit,
 
 #if CUDART_VERSION >= 6050
 
-CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessor(
-    int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
-}
-
+// yasai: driver-API occupancy, as cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags but for
+// a CUfunction (a function_info): CTAs of blockSize threads with dynamicSMemSize bytes of dynamic
+// shared memory that fit on one SM. Both flags (default, disable caching override) give the same
+// count. Transformer Engine sizes the grids of its run-time compiled normalization kernels from
+// it; the stub left the count unset and those launches had empty grids.
+//   numBlocks: receives the count; func: function; blockSize: threads per CTA;
+//   dynamicSMemSize: dynamic shared memory per CTA; flags: CU_OCCUPANCY_*
 CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
     int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize,
     unsigned int flags) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  (void)flags;
+  if (numBlocks == NULL || func == NULL || blockSize <= 0) return CUDA_ERROR_INVALID_VALUE;
+  function_info *entry = reinterpret_cast<function_info *>(func);
+  CUctx_st *context = GPGPUSim_Context(GPGPU_Context());
+  gpgpu_sim *gpu = context->get_device()->get_gpgpu();
+  dim3 gridDim(gpu->max_cta_per_core() * gpu->get_config().num_shader());
+  dim3 blockDim(blockSize);
+  kernel_info_t probe(gridDim, blockDim, entry, -1);
+  probe.set_dynamic_smem(unsigned(dynamicSMemSize));
+  *numBlocks = gpu->get_max_cta(probe);
   return CUDA_SUCCESS;
+}
+
+// yasai: cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags with the default flag.
+//   numBlocks, func, blockSize, dynamicSMemSize: as there
+CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessor(
+    int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize) {
+  return cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(numBlocks, func, blockSize,
+                                                              dynamicSMemSize, 0);
 }
 
 CUresult CUDAAPI cuOccupancyMaxPotentialBlockSize(
