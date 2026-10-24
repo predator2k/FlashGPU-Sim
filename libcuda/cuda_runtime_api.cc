@@ -10833,3 +10833,49 @@ extern "C" CUresult CUDAAPI cuKernelGetName(const char **name, void *kernel) {
   *name = names[kernel].c_str();
   return CUDA_SUCCESS;
 }
+
+// yasai: runtime launch configuration (cudaLaunchConfig_t, CUDA 12 and later), used by the
+// occupancy query below; attrs points to an array laid out like yasai_CUlaunchAttribute.
+struct yasai_cudaLaunchConfig {
+  dim3 gridDim;             ///< grid size
+  dim3 blockDim;            ///< block size
+  size_t dynamicSmemBytes;  ///< dynamic shared memory per block
+  cudaStream_t stream;      ///< stream
+  void *attrs;              ///< launch attributes
+  unsigned int numAttrs;    ///< number of attributes
+};
+
+/// Clusters of the given shape that fit on the simulated GPU at once: the SM count divided by
+/// the cluster size (one CTA of the cluster per SM; the functional mode runs clusters one at a
+/// time, so the answer only sizes persistent grids).
+/// @param attrs Launch attributes (yasai_CUlaunchAttribute array).
+/// @param num Number of attributes.
+/// @return Clusters that fit.
+static int yasai_max_active_clusters(const void *attrs, unsigned num) {
+  unsigned csize = 1;
+  const yasai_CUlaunchAttribute *a = static_cast<const yasai_CUlaunchAttribute *>(attrs);
+  for (unsigned i = 0; a && i < num; i++)
+    if (a[i].id == 4) csize = a[i].value[0] * a[i].value[1] * a[i].value[2];
+  if (csize == 0) csize = 1;
+  const unsigned sms =
+      GPGPUSim_Context(GPGPU_Context())->get_device()->get_gpgpu()->get_config().num_shader();
+  return int(sms / csize > 0 ? sms / csize : 1);
+}
+
+/// cudaOccupancyMaxActiveClusters (CUTLASS sizes its persistent cluster grids with it).
+extern "C" __host__ cudaError_t CUDARTAPI cudaOccupancyMaxActiveClusters(
+    int *numClusters, const void *func, const yasai_cudaLaunchConfig *config) {
+  (void)func;
+  if (!numClusters || !config) return g_last_cudaError = cudaErrorInvalidValue;
+  *numClusters = yasai_max_active_clusters(config->attrs, config->numAttrs);
+  return g_last_cudaError = cudaSuccess;
+}
+
+/// cuOccupancyMaxActiveClusters: the driver form of the same query.
+extern "C" CUresult CUDAAPI cuOccupancyMaxActiveClusters(int *numClusters, CUfunction func,
+                                                         const yasai_CUlaunchConfig *config) {
+  (void)func;
+  if (!numClusters || !config) return CUDA_ERROR_INVALID_VALUE;
+  *numClusters = yasai_max_active_clusters(config->attrs, config->numAttrs);
+  return CUDA_SUCCESS;
+}
