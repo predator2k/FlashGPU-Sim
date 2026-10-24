@@ -6,7 +6,9 @@
 // memory at once: each tear piece (YASAI_FIO_WINDOW_TEAR bytes) waits in a per-process pending
 // buffer with a seeded random deadline on the window clock, and becomes visible when the clock
 // passes its deadline. Pieces become visible in deadline order, which keeps the reordering and
-// tearing hazards.
+// tearing hazards. By default the order of writes to one byte is kept (a piece's deadline is at
+// least that of every earlier pending piece covering its bytes), so a later write to a location is
+// never overwritten by an earlier one; YASAI_FIO_WINDOW_SAME_ADDR_ORDER=0 drops that guarantee.
 //
 // The window clock is global simulated time: a counter in a shared mapping
 // (YASAI_FIO_WINDOW_CLOCK, default /dev/shm/yasai-fio-window-clock) that every store into and load
