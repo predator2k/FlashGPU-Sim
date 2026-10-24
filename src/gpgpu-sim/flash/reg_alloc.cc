@@ -103,7 +103,11 @@ void collect_inst_liveness_regs(const ptx_instruction *inst,
   if (inst->has_pred())
     collect_operand_liveness_regs(inst->get_pred(), uses);
 
-  const bool has_dst = ptx_opcode_has_dst(inst->get_opcode());
+  // yasai: cp.async.bulk writes no register. A tensor store or reduction names its tensor map
+  // in the first operand as a plain register ([%rd, {coords}]); counting it as a definition
+  // ended the live range of a tensor-map pointer that a loop reuses, so another register was
+  // aliased onto it (Triton 3.8 grouped GEMM with device-side tensor descriptors).
+  const bool has_dst = ptx_opcode_has_dst(inst->get_opcode()) && inst->get_opcode() != TMA_OP;
   const bool dst_is_accumulator = inst->get_opcode() == MMA_OP ||
                                   inst->get_opcode() == TENSOR_MMA_OP ||
                                   inst->get_opcode() == WGMMA_MMA_ASYNC_OP ||
