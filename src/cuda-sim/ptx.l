@@ -446,6 +446,7 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.geu	TC; return GEU_OPTION;
 \.num	TC; return NUM_OPTION;
 \.nan	TC; return NAN_OPTION;
+\.NaN	TC; return NAN_OPTION; /* yasai: min/max .NaN (NaN propagation) */
 
 \.satfinite	TC; return SATFINITE_OPTION;
 \.sat	TC; return SAT_OPTION;

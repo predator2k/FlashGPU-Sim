@@ -1770,7 +1770,14 @@ cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlagsInternal(
       "Calculate Maxium Active Block with function ptr=%p, blockSize=%d, "
       "SMemSize=%lu\n",
       hostFunc, blockSize, dynamicSMemSize);
-  if (flags == cudaOccupancyDefault) {
+  // yasai: cudaOccupancyDisableCachingOverride only changes how caching is assumed, not the
+  // resource limits the simulator counts, so both flags give the same count (CUTLASS 2.x
+  // GemmUniversal asks with that flag); the dynamic shared memory of the query is counted.
+  if (flags == cudaOccupancyDefault || flags == cudaOccupancyDisableCachingOverride) {
+    if (entry == NULL) {
+      *numBlocks = 0;
+      return g_last_cudaError = cudaErrorInvalidDeviceFunction;
+    }
     // create kernel_info based on entry
     dim3 gridDim(context->get_device()->get_gpgpu()->max_cta_per_core() *
                  context->get_device()->get_gpgpu()->get_config().num_shader());
@@ -1778,6 +1785,7 @@ cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlagsInternal(
     // because this fuction is only checking for resource requirements, we do
     // not care which stream this kernel runs at, just picked -1
     kernel_info_t result(gridDim, blockDim, entry, -1);
+    result.set_dynamic_smem(unsigned(dynamicSMemSize));
     // if(entry == NULL){
     //	*numBlocks = 1;
     //	return g_last_cudaError = cudaErrorUnknown;

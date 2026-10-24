@@ -5050,7 +5050,10 @@ void max_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
         const ptx_reg_t c =
             thread->get_operand_value(pI->src3(), dst, i_type, thread, 1);
         d = minmax_f32_pair(minmax_f32_pair(a, b, true), c, true);
+        if (pI->get_cmpop() == NAN_OPTION && isNaN(c.f32)) d.u32 = 0x7fffffffu;
       }
+      // yasai: .NaN returns the canonical NaN when an input is NaN (default: the other input).
+      if (pI->get_cmpop() == NAN_OPTION && (isNaN(a.f32) || isNaN(b.f32))) d.u32 = 0x7fffffffu;
       break;
     case F64_TYPE:
     case FF64_TYPE:
@@ -5105,7 +5108,10 @@ void min_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
         const ptx_reg_t c =
             thread->get_operand_value(pI->src3(), dst, i_type, thread, 1);
         d = minmax_f32_pair(minmax_f32_pair(a, b, false), c, false);
+        if (pI->get_cmpop() == NAN_OPTION && isNaN(c.f32)) d.u32 = 0x7fffffffu;
       }
+      // yasai: .NaN returns the canonical NaN when an input is NaN (default: the other input).
+      if (pI->get_cmpop() == NAN_OPTION && (isNaN(a.f32) || isNaN(b.f32))) d.u32 = 0x7fffffffu;
       break;
     case F64_TYPE:
     case FF64_TYPE:
