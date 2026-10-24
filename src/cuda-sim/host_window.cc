@@ -8,6 +8,9 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#if defined(__x86_64__)
+#include <cpuid.h>
+#endif
 
 namespace host_window {
 namespace {
@@ -81,6 +84,77 @@ bool atomic16(uint64_t addr, size_t bytes) {
   return false;
 #endif
 }
+
+#if defined(__x86_64__)
+/// Whether an aligned 16-byte MOVDQA load is atomic on this processor. Intel SDM Vol. 3A
+/// section 9.1.1 guarantees it for processors that enumerate AVX (CPUID.01H:ECX.AVX[bit 28]),
+/// and the AMD APM Vol. 2 section 7.3.2 gives the same guarantee for AMD processors that report
+/// AVX; GCC's libatomic relies on both (PR104688). Other vendors keep lock cmpxchg16b.
+/// YASAI_HW_LOAD16_CAS=1 forces lock cmpxchg16b.
+/// @return True on Intel or AMD processors with AVX.
+bool load16_plain() {
+  static const bool on = [] {
+    if (const char *v = getenv("YASAI_HW_LOAD16_CAS"))
+      if (v[0] == '1') return false;
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    if (!__get_cpuid(0, &a, &b, &c, &d)) return false;
+    char vendor[13];
+    memcpy(vendor, &b, 4);
+    memcpy(vendor + 4, &d, 4);
+    memcpy(vendor + 8, &c, 4);
+    vendor[12] = 0;
+    const bool known = strcmp(vendor, "GenuineIntel") == 0 || strcmp(vendor, "AuthenticAMD") == 0;
+    if (!known || !__get_cpuid(1, &a, &b, &c, &d)) return false;
+    return (c & bit_AVX) != 0;
+  }();
+  return on;
+}
+
+/// Atomic aligned 16-byte load with MOVDQA (see load16_plain). Unlike lock cmpxchg16b it does
+/// not write, so a load from a never-written page maps the zero page instead of committing a
+/// private page.
+/// @param p 16-byte aligned address.
+/// @param out Destination of the 16 bytes.
+void load16(const void *p, void *out) {
+  typedef long long v2di __attribute__((vector_size(16)));
+  v2di v;
+  asm volatile("movdqa %1, %0" : "=x"(v) : "m"(*static_cast<const volatile v2di *>(p)) : "memory");
+  memcpy(out, &v, 16);
+}
+#endif
+
+/// Whether stores of zero over zero are skipped (YASAI_DEVMEM_ZERO_ELIDE, default 1; 0 stores
+/// every byte). A store of the value the memory already holds changes no byte, so skipping it
+/// is exact; it keeps a kernel or a copy that writes zeros into never-written memory (for example
+/// weight post-processing of zero dummy weights) from committing host pages.
+/// @return True unless YASAI_DEVMEM_ZERO_ELIDE=0.
+bool zero_elide() {
+  static const bool on = [] {
+    const char *v = getenv("YASAI_DEVMEM_ZERO_ELIDE");
+    return !(v && v[0] == '0');
+  }();
+  return on;
+}
+
+/// Whether every byte of a buffer is zero.
+/// @param p Buffer.
+/// @param bytes Length in bytes.
+/// @return True when all `bytes` bytes are zero.
+bool all_zero(const void *p, size_t bytes) {
+  const unsigned char *c = static_cast<const unsigned char *>(p);
+  size_t i = 0;
+  for (; i + 8 <= bytes; i += 8) {
+    uint64_t w;
+    memcpy(&w, c + i, 8);
+    if (w) return false;
+  }
+  for (; i < bytes; i++)
+    if (c[i]) return false;
+  return true;
+}
+
+/// Page size for the chunked zero-store elision of long writes.
+constexpr size_t kElideChunk = 4096;
 
 /// Finds the range that holds [addr, addr + bytes); the caller holds ranges_mu().
 /// @param addr First address.
@@ -168,6 +242,10 @@ void read(uint64_t addr, size_t bytes, void *out) {
   }
 #if defined(__x86_64__)
   if (atomic16(addr, bytes)) {
+    if (load16_plain()) {
+      load16(p, out);
+      return;
+    }
     uint64_t e[2] = {0, 0};
     cas16(p, e, 0, 0);  // stores 0 over 0 (no change) or returns the current value
     memcpy(out, e, 16);
@@ -180,6 +258,34 @@ void read(uint64_t addr, size_t bytes, void *out) {
 
 void write(uint64_t addr, size_t bytes, const void *in) {
   void *p = reinterpret_cast<void *>(addr);
+  if (zero_elide()) {
+    if (bytes <= 16) {
+      // A zero store over zero changes nothing: read the current value without writing.
+      unsigned char cur[16];
+      if (all_zero(in, bytes)) {
+        read(addr, bytes, cur);
+        if (all_zero(cur, bytes)) {
+          std::atomic_thread_fence(std::memory_order_release);
+          return;
+        }
+      }
+    } else {
+      // Long writes (copies, which are not single atomic operations): page by page, skip the
+      // pages where both source and destination are zero.
+      const unsigned char *src = static_cast<const unsigned char *>(in);
+      unsigned char *dst = static_cast<unsigned char *>(p);
+      std::atomic_thread_fence(std::memory_order_release);
+      size_t off = 0;
+      while (off < bytes) {
+        size_t n = kElideChunk - ((addr + off) % kElideChunk);
+        if (n > bytes - off) n = bytes - off;
+        if (!(all_zero(src + off, n) && all_zero(dst + off, n))) memcpy(dst + off, src + off, n);
+        off += n;
+      }
+      std::atomic_thread_fence(std::memory_order_release);
+      return;
+    }
+  }
   if (atomic_size(addr, bytes)) {
     switch (bytes) {
       case 1: { uint8_t v; memcpy(&v, in, 1); __atomic_store_n(static_cast<uint8_t *>(p), v, __ATOMIC_RELEASE); return; }

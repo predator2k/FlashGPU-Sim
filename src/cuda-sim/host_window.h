@@ -87,7 +87,9 @@ size_t size_at(uint64_t base);
 void set_multicast_hooks(mc_read_fn rd, mc_write_fn wr);
 
 /// Reads host memory for a kernel load; aligned 1, 2, 4 and 8 byte accesses are single atomic
-/// (acquire) loads so that spinning on a flag observes another thread's store.
+/// (acquire) loads so that spinning on a flag observes another thread's store. Aligned 16-byte
+/// accesses are single atomic loads too: MOVDQA on Intel and AMD processors with AVX, otherwise
+/// lock cmpxchg16b (which writes, so it commits a never-written page).
 /// @param addr Host address.
 /// @param bytes Length in bytes.
 /// @param out Destination buffer.
@@ -95,7 +97,9 @@ void read(uint64_t addr, size_t bytes, void *out);
 
 /// Writes host memory for a kernel store; aligned 1, 2, 4 and 8 byte accesses are single atomic
 /// (release) stores, and a release fence follows every store so earlier stores of the kernel are
-/// visible no later than this one.
+/// visible no later than this one. A store of zeros over memory that already holds zeros is
+/// skipped (page by page for writes longer than 16 bytes), so never-written pages stay
+/// uncommitted; YASAI_DEVMEM_ZERO_ELIDE=0 stores every byte.
 /// @param addr Host address.
 /// @param bytes Length in bytes.
 /// @param in Source buffer.
