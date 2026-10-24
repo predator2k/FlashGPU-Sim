@@ -7096,11 +7096,15 @@ CUresult CUDAAPI cuDeviceComputeCapability(int *major, int *minor,
 
 #if CUDART_VERSION >= 7000
 
+// yasai: the primary context is the one context of the simulated device (as cuCtxGetCurrent).
+//   pctx: receives the context; dev: device
 CUresult CUDAAPI cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  (void)dev;
+  if (!pctx) return CUDA_ERROR_INVALID_VALUE;
+  *pctx = (CUcontext)GPGPUSim_Context(GPGPU_Context());
   return CUDA_SUCCESS;
 }
 
@@ -7120,13 +7124,39 @@ CUresult CUDAAPI cuDevicePrimaryCtxSetFlags(CUdevice dev, unsigned int flags) {
   return CUDA_SUCCESS;
 }
 
+// yasai: the primary context of the simulated device exists from the first runtime call on, so
+// it reports active with no flags (callers such as PyTorch only test the active bit).
+//   dev: device; flags: receives the context flags; active: receives 1
 CUresult CUDAAPI cuDevicePrimaryCtxGetState(CUdevice dev, unsigned int *flags,
                                             int *active) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  (void)dev;
+  if (flags) *flags = 0;
+  if (active) *active = 1;
   return CUDA_SUCCESS;
+}
+
+// yasai: the context of a stream is the one context of the simulated device. Transformer Engine
+// looks it up through cudaGetDriverEntryPoint.
+//   hStream: stream; pctx: receives the context
+extern "C" CUresult CUDAAPI cuStreamGetCtx(CUstream hStream, CUcontext *pctx) {
+  if (g_debug_execution >= 3) {
+    announce_call(__my_func__);
+  }
+  (void)hStream;
+  if (!pctx) return CUDA_ERROR_INVALID_VALUE;
+  *pctx = (CUcontext)GPGPUSim_Context(GPGPU_Context());
+  return CUDA_SUCCESS;
+}
+
+// yasai: cuStreamGetCtx with a green context output, which the simulator has none of.
+//   hStream: stream; pCtx: receives the context; pGreenCtx: receives NULL
+extern "C" CUresult CUDAAPI cuStreamGetCtx_v2(CUstream hStream, CUcontext *pCtx,
+                                             CUgreenCtx *pGreenCtx) {
+  if (pGreenCtx) *pGreenCtx = NULL;
+  return cuStreamGetCtx(hStream, pCtx);
 }
 
 CUresult CUDAAPI cuDevicePrimaryCtxReset(CUdevice dev) {
@@ -10587,6 +10617,25 @@ extern "C" cudaError_t CUDARTAPI cudaLaunchCooperativeKernel(const void *func, d
   }
   return cudaLaunchKernel((const char *)func, gridDim, blockDim, (const void **)args, sharedMem,
                           stream);
+}
+
+// yasai: cuLaunchCooperativeKernel, the driver-API form of cudaLaunchCooperativeKernel, launched
+// as cuLaunchKernel with the same warning (grid-wide synchronization is not simulated).
+// Transformer Engine looks it up through cudaGetDriverEntryPoint.
+//   f, grid and block dimensions, sharedMemBytes, hStream, kernelParams  as in the driver API
+extern "C" CUresult CUDAAPI cuLaunchCooperativeKernel(CUfunction f, unsigned int gridDimX,
+                                                     unsigned int gridDimY, unsigned int gridDimZ,
+                                                     unsigned int blockDimX, unsigned int blockDimY,
+                                                     unsigned int blockDimZ, unsigned int sharedMemBytes,
+                                                     CUstream hStream, void **kernelParams) {
+  static bool warned = false;
+  if (!warned) {
+    warned = true;
+    printf("GPGPU-Sim PTX: warning: cuLaunchCooperativeKernel runs as a normal launch; grid-wide "
+           "synchronization is not simulated\n");
+  }
+  return cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ,
+                        sharedMemBytes, hStream, kernelParams, NULL);
 }
 
 // cudaMemset2DAsync: one cudaMemsetAsync per row.
