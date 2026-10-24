@@ -306,6 +306,7 @@ class ptx_recognizer;
 %token <int_value> CLUSTER_OPTION
 %token	INVAL_OPTION;
 %token	MBARRIER_INIT_OPTION;
+%token	SYNC_RESTRICT_OPTION;
 %token	M8N8_OPTION;
 %token	TRANS_OPTION;
 %token	X1_OPTION;
@@ -810,6 +811,7 @@ option: type_spec
 	| CLUSTER_OPTION { recognizer->add_option(CLUSTER_OPTION); if ($1) recognizer->shared_window_space(); }
 	| INVAL_OPTION { recognizer->add_option(INVAL_OPTION); }
 	| MBARRIER_INIT_OPTION { recognizer->add_option(MBARRIER_INIT_OPTION); }
+	| SYNC_RESTRICT_OPTION { recognizer->add_option(SYNC_RESTRICT_OPTION); } /* yasai: fence is a no-op here */
 	| M8N8_OPTION { recognizer->add_option(M8N8_OPTION); }
 	| TRANS_OPTION { recognizer->add_option(TRANS_OPTION); }
 	| X1_OPTION { recognizer->add_option(X1_OPTION); }
@@ -923,6 +925,8 @@ wmma_spec: WMMA_DIRECTIVE LAYOUT CONFIGURATION{recognizer->add_space_spec(global
 	;
 
 mma_spec: CONFIGURATION LAYOUT LAYOUT scalar_type scalar_type scalar_type scalar_type{recognizer->add_mma_option($1);recognizer->add_mma_option($2);recognizer->add_mma_option($3);}
+	/* yasai: .satfinite between the layouts and the types (integer mma.sync, ThunderKittens) */
+	| CONFIGURATION LAYOUT LAYOUT SATFINITE_OPTION scalar_type scalar_type scalar_type scalar_type{recognizer->add_mma_option($1);recognizer->add_mma_option($2);recognizer->add_mma_option($3);recognizer->add_option(SATFINITE_OPTION);}
 	;
 
 vp_spec: WMMA_DIRECTIVE LAYOUT CONFIGURATION{recognizer->add_space_spec(global_space,0);recognizer->add_ptr_spec(global_space);recognizer->add_wmma_option($1);recognizer->add_wmma_option($2);recognizer->add_wmma_option($3);}

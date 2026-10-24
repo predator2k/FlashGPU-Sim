@@ -1815,6 +1815,7 @@ ptx_instruction::ptx_instruction(
         break;
       case M8N8_OPTION:
       case MBARRIER_INIT_OPTION:
+      case SYNC_RESTRICT_OPTION:  // yasai: fence.*.sync_restrict (fence is a no-op)
       case TRANS_OPTION:
       case X1_OPTION:
       case X2_OPTION:
