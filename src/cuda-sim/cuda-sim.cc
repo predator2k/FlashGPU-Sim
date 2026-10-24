@@ -626,6 +626,11 @@ void function_info::alloc_dyn_shared_mem(int shared_mem_size) {
     // in the PTX while their cubins keep their own alignment. A 1024-byte base satisfies every
     // declaration. The base used to be 128-byte aligned (an extern __align__(1024) array after
     // static variables started at 0x80).
+    // Deviation: for arrays declared with a small .align the base is more aligned than on the
+    // hardware, so shared-memory addresses (traces, bank-conflict timing, address-dependent
+    // swizzles) differ from the hardware's by up to 1008 bytes. Capacity is unaffected: the
+    // launch and occupancy checks count the static and the requested dynamic bytes, not the
+    // padded base, and the padded end stays below the 256 KB that descriptor addresses reach.
     unsigned alignto = 1024;
     if (m_yasai_dyn_smem_align > alignto) alignto = m_yasai_dyn_smem_align;
     addr_t addr_pad = alignto ? ((alignto - (addr % alignto)) % alignto) : 0;
