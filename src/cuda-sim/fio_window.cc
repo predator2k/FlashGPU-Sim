@@ -92,6 +92,21 @@ std::mt19937_64 &rng() {
 /// Record file handle (opened once when a window asks to record).
 FILE *g_record = nullptr;
 
+/// Counts for YASAI_FIO_WINDOW_STATS (printed at exit): stores intercepted, tear pieces created,
+/// pieces made visible, and fences.
+uint64_t g_stat_stores = 0, g_stat_pieces = 0, g_stat_flushed = 0, g_stat_fences = 0;
+/// Registers the atexit stats dump once when stats are on.
+void stats_arm() {
+  static bool armed = []{
+    if (getenv("YASAI_FIO_WINDOW_STATS"))
+      atexit([]{ fprintf(stderr, "yasai fio_window stats: stores=%llu pieces=%llu flushed=%llu fences=%llu\n",
+                         (unsigned long long)g_stat_stores, (unsigned long long)g_stat_pieces,
+                         (unsigned long long)g_stat_flushed, (unsigned long long)g_stat_fences); });
+    return true;
+  }();
+  (void)armed;
+}
+
 /// @return The window holding [addr, addr + bytes), or nullptr (caller holds mu()).
 const std::pair<const uint64_t, Window> *find_locked(uint64_t addr, size_t bytes) {
   auto &m = windows();
@@ -123,8 +138,10 @@ void drain_locked(uint64_t now) {
     return a.visible_tick != b.visible_tick ? a.visible_tick < b.visible_tick : a.seq < b.seq;
   });
   size_t i = 0;
-  for (; i < p.size() && p[i].visible_tick <= now; ++i)
+  for (; i < p.size() && p[i].visible_tick <= now; ++i) {
     host_window::write(p[i].addr, p[i].data.size(), p[i].data.data());
+    g_stat_flushed++;
+  }
   p.erase(p.begin(), p.begin() + i);
 }
 
@@ -153,7 +170,10 @@ bool on_store(uint64_t addr, size_t bytes, const void *in) {
   Config &cfg = config();
   const unsigned char *src = static_cast<const unsigned char *>(in);
   g_tick++;
+  stats_arm();
+  g_stat_stores++;
   for (size_t off = 0; off < bytes; off += cfg.tear_unit) {
+    g_stat_pieces++;
     const size_t n = std::min<uint64_t>(cfg.tear_unit, bytes - off);
     Pending piece;
     piece.addr = addr + off;
@@ -196,6 +216,7 @@ void overlay(uint64_t addr, size_t bytes, void *out) {
 
 void fence(const char *reason) {
   std::lock_guard<std::mutex> lock(mu());
+  g_stat_fences++;
   if (pending().empty()) {
     if (!windows().empty()) record(reason, 0, 0);
     return;
