@@ -390,6 +390,55 @@ static stream_manager *yasai_stream_manager(gpgpu_context *ctx) {
   return ctx->the_gpgpusim->g_stream_manager;
 }
 
+// yasai: runtime functions defined further down that the driver forwards and their helpers
+// below call (C linkage, as the applications see them).
+extern "C" {
+__host__ cudaError_t CUDARTAPI cudaMemcpy(void *dst, const void *src, size_t count,
+                                          enum cudaMemcpyKind kind);
+__host__ cudaError_t CUDARTAPI cudaMemset(void *mem, int c, size_t count);
+__host__ cudaError_t CUDARTAPI cudaMemsetAsync(void *mem, int c, size_t count, cudaStream_t stream);
+__host__ cudaError_t CUDARTAPI cudaStreamSynchronize(cudaStream_t stream);
+__host__ cudaError_t CUDARTAPI cudaHostRegister(void *ptr, size_t size, unsigned int flags);
+__host__ cudaError_t CUDARTAPI cudaHostUnregister(void *ptr);
+__host__ cudaError_t CUDARTAPI cudaLaunchHostFunc(cudaStream_t stream, void (*fn)(void *),
+                                                  void *userData);
+}
+
+// yasai: CUDA_SUCCESS for cudaSuccess, CUDA_ERROR_NOT_READY for cudaErrorNotReady (an event or
+// stream query), CUDA_ERROR_INVALID_VALUE otherwise.
+// @param e Runtime status.
+static CUresult yasai_drv_status(cudaError_t e) {
+  if (e == cudaSuccess) return CUDA_SUCCESS;
+  if (e == cudaErrorNotReady) return CUDA_ERROR_NOT_READY;
+  return CUDA_ERROR_INVALID_VALUE;
+}
+
+// yasai: cuMemsetD16/D32 and their Async forms: n elements of esize bytes set to value. A value
+// whose bytes are all equal is a byte memset in stream order; any other value is written from a
+// host pattern by a synchronous copy, after the stream's earlier work (the Async form then
+// blocks the host).
+// @param dst Device address.
+// @param value Element value.
+// @param esize Element size (2 or 4).
+// @param n Elements.
+// @param stream Stream of an Async form.
+// @param async Whether the call is an Async form.
+static CUresult yasai_memset_elems(uint64_t dst, unsigned value, unsigned esize, size_t n,
+                                   cudaStream_t stream, bool async) {
+  const unsigned char b = (unsigned char)(value & 0xff);
+  bool uniform = true;
+  for (unsigned i = 1; i < esize; i++) uniform = uniform && ((value >> (8 * i)) & 0xff) == b;
+  if (uniform)
+    return yasai_drv_status(async ? cudaMemsetAsync(reinterpret_cast<void *>(dst), b, n * esize, stream)
+                                  : cudaMemset(reinterpret_cast<void *>(dst), b, n * esize));
+  std::vector<unsigned char> pattern(n * esize);
+  for (size_t i = 0; i < n; i++) memcpy(&pattern[i * esize], &value, esize);
+  if (async) cudaStreamSynchronize(stream);
+  return yasai_drv_status(cudaMemcpy(reinterpret_cast<void *>(dst), pattern.data(), pattern.size(),
+                                     cudaMemcpyHostToDevice));
+}
+
+
 CUctx_st *GPGPUSim_Context(gpgpu_context *ctx) {
   // static CUctx_st *the_context = NULL;
   if (g_yasai_ctx_ready.load(std::memory_order_acquire)) return ctx->the_gpgpusim->the_context;
@@ -7811,47 +7860,39 @@ CUresult CUDAAPI cuMemGetAddressRange(CUdeviceptr *pbase, size_t *psize,
 }
 
 CUresult CUDAAPI cuMemAllocHost(void **pp, size_t bytesize) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMallocHost(pp, bytesize));
 }
 #endif /* CUDART_VERSION >= 3020 */
 
 CUresult CUDAAPI cuMemFreeHost(void *p) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaFreeHost(p));
 }
 
 CUresult CUDAAPI cuMemHostAlloc(void **pp, size_t bytesize,
                                 unsigned int Flags) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaHostAlloc(pp, bytesize, Flags));
 }
 
 #if CUDART_VERSION >= 3020
 CUresult CUDAAPI cuMemHostGetDevicePointer(CUdeviceptr *pdptr, void *p,
                                            unsigned int Flags) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  void *d = NULL;
+  if (pdptr == NULL) return CUDA_ERROR_INVALID_VALUE;
+  const CUresult r = yasai_drv_status(cudaHostGetDevicePointer(&d, p, Flags));
+  *pdptr = CUdeviceptr(reinterpret_cast<uint64_t>(d));
+  return r;
 }
 #endif /* CUDART_VERSION >= 3020 */
 
 CUresult CUDAAPI cuMemHostGetFlags(unsigned int *pFlags, void *p) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: forwards to the runtime function.
+  if (pFlags == NULL) return CUDA_ERROR_INVALID_VALUE;
+  *pFlags = 0;  // host allocation flags are not kept
+  (void)p;
   return CUDA_SUCCESS;
 }
 
@@ -7948,11 +7989,8 @@ CUresult CUDAAPI cuIpcCloseMemHandle(CUdeviceptr dptr) {
 #if CUDART_VERSION >= 6050
 CUresult CUDAAPI cuMemHostRegister(void *p, size_t bytesize,
                                    unsigned int Flags) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaHostRegister(p, bytesize, Flags));
 }
 extern "C" __host__ cudaError_t CUDARTAPI cudaHostRegister(void *ptr, size_t size,
                                       unsigned int flags) {
@@ -7988,29 +8026,23 @@ extern "C" __host__ cudaError_t cudaProfilerStop() {
 #if CUDART_VERSION >= 4000
 
 CUresult CUDAAPI cuMemHostUnregister(void *p) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaHostUnregister(p));
 }
 
 CUresult CUDAAPI cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemcpy(reinterpret_cast<void *>(dst), reinterpret_cast<void *>(src), ByteCount, cudaMemcpyDefault));
 }
 
 CUresult CUDAAPI cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext,
                               CUdeviceptr srcDevice, CUcontext srcContext,
                               size_t ByteCount) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  (void)dstContext;
+  (void)srcContext;  // one simulated GPU per process
+  return yasai_drv_status(
+      cudaMemcpy(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDefault));
 }
 
 #endif /* CUDART_VERSION >= 4000 */
@@ -8018,29 +8050,21 @@ CUresult CUDAAPI cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext,
 #if CUDART_VERSION >= 3020
 CUresult CUDAAPI cuMemcpyHtoD(CUdeviceptr dstDevice, const void *srcHost,
                               size_t ByteCount) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemcpy(reinterpret_cast<void *>(dstDevice), srcHost, ByteCount, cudaMemcpyHostToDevice));
 }
 
 CUresult CUDAAPI cuMemcpyDtoH(void *dstHost, CUdeviceptr srcDevice,
                               size_t ByteCount) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemcpy(dstHost, reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToHost));
 }
 
 CUresult CUDAAPI cuMemcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
                               size_t ByteCount) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(
+      cudaMemcpy(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToDevice));
 }
 
 CUresult CUDAAPI cuMemcpyDtoA(CUarray dstArray, size_t dstOffset,
@@ -8125,50 +8149,42 @@ CUresult CUDAAPI cuMemcpy3DPeer(const CUDA_MEMCPY3D_PEER *pCopy) {
 
 CUresult CUDAAPI cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src,
                                size_t ByteCount, CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(
+      cudaMemcpyAsync(reinterpret_cast<void *>(dst), reinterpret_cast<void *>(src), ByteCount, cudaMemcpyDefault, reinterpret_cast<cudaStream_t>(hStream)));
 }
 
 CUresult CUDAAPI cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext,
                                    CUdeviceptr srcDevice, CUcontext srcContext,
                                    size_t ByteCount, CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  (void)dstContext;
+  (void)srcContext;  // one simulated GPU per process
+  return yasai_drv_status(
+      cudaMemcpyAsync(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDefault, reinterpret_cast<cudaStream_t>(hStream)));
 }
 #endif /* CUDART_VERSION >= 4000 */
 
 #if CUDART_VERSION >= 3020
 CUresult CUDAAPI cuMemcpyHtoDAsync(CUdeviceptr dstDevice, const void *srcHost,
                                    size_t ByteCount, CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(
+      cudaMemcpyAsync(reinterpret_cast<void *>(dstDevice), srcHost, ByteCount, cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(hStream)));
 }
 
 CUresult CUDAAPI cuMemcpyDtoHAsync(void *dstHost, CUdeviceptr srcDevice,
                                    size_t ByteCount, CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(
+      cudaMemcpyAsync(dstHost, reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToHost, reinterpret_cast<cudaStream_t>(hStream)));
 }
 
 CUresult CUDAAPI cuMemcpyDtoDAsync(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
                                    size_t ByteCount, CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemcpyAsync(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount,
+                                          cudaMemcpyDeviceToDevice, reinterpret_cast<cudaStream_t>(hStream)));
 }
 
 CUresult CUDAAPI cuMemcpyHtoAAsync(CUarray dstArray, size_t dstOffset,
@@ -8221,28 +8237,19 @@ CUresult CUDAAPI cuMemcpy3DPeerAsync(const CUDA_MEMCPY3D_PEER *pCopy,
 
 #if CUDART_VERSION >= 3020
 CUresult CUDAAPI cuMemsetD8(CUdeviceptr dstDevice, unsigned char uc, size_t N) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemset(reinterpret_cast<void *>(dstDevice), int(uc), size_t(N)));
 }
 
 CUresult CUDAAPI cuMemsetD16(CUdeviceptr dstDevice, unsigned short us,
                              size_t N) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_memset_elems(uint64_t(dstDevice), us, 2, size_t(N), NULL, false);
 }
 
 CUresult CUDAAPI cuMemsetD32(CUdeviceptr dstDevice, unsigned int ui, size_t N) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_memset_elems(uint64_t(dstDevice), ui, 4, size_t(N), NULL, false);
 }
 
 CUresult CUDAAPI cuMemsetD2D8(CUdeviceptr dstDevice, size_t dstPitch,
@@ -8274,29 +8281,20 @@ CUresult CUDAAPI cuMemsetD2D32(CUdeviceptr dstDevice, size_t dstPitch,
 
 CUresult CUDAAPI cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc,
                                  size_t N, CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemsetAsync(reinterpret_cast<void *>(dstDevice), int(uc), size_t(N), reinterpret_cast<cudaStream_t>(hStream)));
 }
 
 CUresult CUDAAPI cuMemsetD16Async(CUdeviceptr dstDevice, unsigned short us,
                                   size_t N, CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_memset_elems(uint64_t(dstDevice), us, 2, size_t(N), reinterpret_cast<cudaStream_t>(hStream), true);
 }
 
 CUresult CUDAAPI cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int ui,
                                   size_t N, CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_memset_elems(uint64_t(dstDevice), ui, 4, size_t(N), reinterpret_cast<cudaStream_t>(hStream), true);
 }
 
 CUresult CUDAAPI cuMemsetD2D8Async(CUdeviceptr dstDevice, size_t dstPitch,
@@ -8506,55 +8504,56 @@ CUresult CUDAAPI cuPointerGetAttributes(unsigned int numAttributes,
 /** @} */ /* END CUDA_UNIFIED */
 
 CUresult CUDAAPI cuStreamCreate(CUstream *phStream, unsigned int Flags) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaStreamCreateWithFlags(reinterpret_cast<cudaStream_t *>(phStream), Flags));
 }
 
 CUresult CUDAAPI cuStreamCreateWithPriority(CUstream *phStream,
                                             unsigned int flags, int priority) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(
+      cudaStreamCreateWithPriority(reinterpret_cast<cudaStream_t *>(phStream), flags, priority));
 }
 
 CUresult CUDAAPI cuStreamGetPriority(CUstream hStream, int *priority) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: forwards to the runtime function.
+  if (priority == NULL) return CUDA_ERROR_INVALID_VALUE;
+  *priority = 0;  // priorities are not modelled
   return CUDA_SUCCESS;
 }
 
 CUresult CUDAAPI cuStreamGetFlags(CUstream hStream, unsigned int *flags) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: forwards to the runtime function.
+  if (flags == NULL) return CUDA_ERROR_INVALID_VALUE;
+  CUstream_st *s = yasai_stream_manager(GPGPU_Context())->yasai_resolve(reinterpret_cast<CUstream_st *>(hStream));
+  *flags = (s != NULL && s->yasai_nonblocking()) ? 1u : 0u;  // CU_STREAM_NON_BLOCKING
   return CUDA_SUCCESS;
 }
 
 CUresult CUDAAPI cuStreamWaitEvent(CUstream hStream, CUevent hEvent,
                                    unsigned int Flags) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(
+      cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(hStream), reinterpret_cast<cudaEvent_t>(hEvent), Flags));
 }
 
 CUresult CUDAAPI cuStreamAddCallback(CUstream hStream,
                                      CUstreamCallback callback, void *userData,
                                      unsigned int flags) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  // The callback runs in stream order on the host-callback thread, with CUDA_SUCCESS.
+  (void)flags;
+  struct Call {
+    CUstreamCallback fn;
+    CUstream stream;
+    void *user;
+  };
+  Call *c = new Call{callback, hStream, userData};
+  return yasai_drv_status(cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(hStream), [](void *p) {
+    Call *call = static_cast<Call *>(p);
+    call->fn(call->stream, CUDA_SUCCESS, call->user);
+    delete call;
+  }, c));
 }
 
 #if CUDART_VERSION >= 6000
@@ -8571,82 +8570,56 @@ CUresult CUDAAPI cuStreamAttachMemAsync(CUstream hStream, CUdeviceptr dptr,
 #endif /* CUDART_VERSION >= 6000 */
 
 CUresult CUDAAPI cuStreamQuery(CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaStreamQuery(reinterpret_cast<cudaStream_t>(hStream)));
 }
 
 CUresult CUDAAPI cuStreamSynchronize(CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(hStream)));
 }
 
 #if CUDART_VERSION >= 4000
 CUresult CUDAAPI cuStreamDestroy(CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaStreamDestroy(reinterpret_cast<cudaStream_t>(hStream)));
 }
 #endif /* CUDART_VERSION >= 4000 */
 
 /** @} */ /* END CUDA_STREAM */
 
 CUresult CUDAAPI cuEventCreate(CUevent *phEvent, unsigned int Flags) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaEventCreateWithFlags(reinterpret_cast<cudaEvent_t *>(phEvent), Flags));
 }
 
 CUresult CUDAAPI cuEventRecord(CUevent hEvent, CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaEventRecord(reinterpret_cast<cudaEvent_t>(hEvent), reinterpret_cast<cudaStream_t>(hStream)));
 }
 
 CUresult CUDAAPI cuEventQuery(CUevent hEvent) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaEventQuery(reinterpret_cast<cudaEvent_t>(hEvent)));
 }
 
 CUresult CUDAAPI cuEventSynchronize(CUevent hEvent) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(hEvent)));
 }
 
 #if CUDART_VERSION >= 4000
 CUresult CUDAAPI cuEventDestroy(CUevent hEvent) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaEventDestroy(reinterpret_cast<cudaEvent_t>(hEvent)));
 }
 #endif /* CUDART_VERSION >= 4000 */
 
 CUresult CUDAAPI cuEventElapsedTime(float *pMilliseconds, CUevent hStart,
                                     CUevent hEnd) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaEventElapsedTime(pMilliseconds, reinterpret_cast<cudaEvent_t>(hStart),
+                                               reinterpret_cast<cudaEvent_t>(hEnd)));
 }
 
 #if CUDART_VERSION >= 8000
@@ -9461,11 +9434,8 @@ CUresult CUDAAPI cuGetExportTable(const void **ppExportTable,
     (CUDART_VERSION >= 4000 && CUDART_VERSION < 6050)
 CUresult CUDAAPI cuMemHostRegister(void *p, size_t bytesize,
                                    unsigned int Flags) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaHostRegister(p, bytesize, Flags));
 }
 #endif /* defined(CUDART_VERSION_INTERNAL) || (CUDART_VERSION >= 4000 && \
           CUDART_VERSION < 6050) */
@@ -9539,45 +9509,31 @@ CUresult CUDAAPI cuCtxPushCurrent(CUcontext ctx) {
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuStreamDestroy(CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaStreamDestroy(reinterpret_cast<cudaStream_t>(hStream)));
 }
 CUresult CUDAAPI cuEventDestroy(CUevent hEvent) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaEventDestroy(reinterpret_cast<cudaEvent_t>(hEvent)));
 }
 #endif /* CUDART_VERSION_INTERNAL || CUDART_VERSION < 4000 */
 
 #if defined(CUDART_VERSION_INTERNAL)
 CUresult CUDAAPI cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost,
                                  size_t ByteCount) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemcpy(reinterpret_cast<void *>(dstDevice), srcHost, ByteCount, cudaMemcpyHostToDevice));
 }
 CUresult CUDAAPI cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice,
                                  size_t ByteCount) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemcpy(dstHost, reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToHost));
 }
 CUresult CUDAAPI cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
                                  size_t ByteCount) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(
+      cudaMemcpy(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToDevice));
 }
 CUresult CUDAAPI cuMemcpyDtoA_v2(CUarray dstArray, size_t dstOffset,
                                  CUdeviceptr srcDevice, size_t ByteCount) {
@@ -9662,28 +9618,22 @@ CUresult CUDAAPI cuMemcpy3D_v2(const CUDA_MEMCPY3D *pCopy) {
 CUresult CUDAAPI cuMemcpyHtoDAsync_v2(CUdeviceptr dstDevice,
                                       const void *srcHost, size_t ByteCount,
                                       CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(
+      cudaMemcpyAsync(reinterpret_cast<void *>(dstDevice), srcHost, ByteCount, cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(hStream)));
 }
 CUresult CUDAAPI cuMemcpyDtoHAsync_v2(void *dstHost, CUdeviceptr srcDevice,
                                       size_t ByteCount, CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(
+      cudaMemcpyAsync(dstHost, reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToHost, reinterpret_cast<cudaStream_t>(hStream)));
 }
 CUresult CUDAAPI cuMemcpyDtoDAsync_v2(CUdeviceptr dstDevice,
                                       CUdeviceptr srcDevice, size_t ByteCount,
                                       CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemcpyAsync(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount,
+                                          cudaMemcpyDeviceToDevice, reinterpret_cast<cudaStream_t>(hStream)));
 }
 CUresult CUDAAPI cuMemcpy2DAsync_v2(const CUDA_MEMCPY2D *pCopy,
                                     CUstream hStream) {
@@ -9703,27 +9653,18 @@ CUresult CUDAAPI cuMemcpy3DAsync_v2(const CUDA_MEMCPY3D *pCopy,
 }
 CUresult CUDAAPI cuMemsetD8_v2(CUdeviceptr dstDevice, unsigned char uc,
                                size_t N) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemset(reinterpret_cast<void *>(dstDevice), int(uc), size_t(N)));
 }
 CUresult CUDAAPI cuMemsetD16_v2(CUdeviceptr dstDevice, unsigned short us,
                                 size_t N) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_memset_elems(uint64_t(dstDevice), us, 2, size_t(N), NULL, false);
 }
 CUresult CUDAAPI cuMemsetD32_v2(CUdeviceptr dstDevice, unsigned int ui,
                                 size_t N) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_memset_elems(uint64_t(dstDevice), ui, 4, size_t(N), NULL, false);
 }
 CUresult CUDAAPI cuMemsetD2D8_v2(CUdeviceptr dstDevice, size_t dstPitch,
                                  unsigned char uc, size_t Width,
@@ -9753,37 +9694,32 @@ CUresult CUDAAPI cuMemsetD2D32_v2(CUdeviceptr dstDevice, size_t dstPitch,
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemcpy(reinterpret_cast<void *>(dst), reinterpret_cast<void *>(src), ByteCount, cudaMemcpyDefault));
 }
 CUresult CUDAAPI cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src,
                                size_t ByteCount, CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(
+      cudaMemcpyAsync(reinterpret_cast<void *>(dst), reinterpret_cast<void *>(src), ByteCount, cudaMemcpyDefault, reinterpret_cast<cudaStream_t>(hStream)));
 }
 CUresult CUDAAPI cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext,
                               CUdeviceptr srcDevice, CUcontext srcContext,
                               size_t ByteCount) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  (void)dstContext;
+  (void)srcContext;  // one simulated GPU per process
+  return yasai_drv_status(
+      cudaMemcpy(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDefault));
 }
 CUresult CUDAAPI cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext,
                                    CUdeviceptr srcDevice, CUcontext srcContext,
                                    size_t ByteCount, CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  (void)dstContext;
+  (void)srcContext;  // one simulated GPU per process
+  return yasai_drv_status(
+      cudaMemcpyAsync(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDefault, reinterpret_cast<cudaStream_t>(hStream)));
 }
 CUresult CUDAAPI cuMemcpy3DPeer(const CUDA_MEMCPY3D_PEER *pCopy) {
   if (g_debug_execution >= 3) {
@@ -9803,27 +9739,18 @@ CUresult CUDAAPI cuMemcpy3DPeerAsync(const CUDA_MEMCPY3D_PEER *pCopy,
 
 CUresult CUDAAPI cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc,
                                  size_t N, CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemsetAsync(reinterpret_cast<void *>(dstDevice), int(uc), size_t(N), reinterpret_cast<cudaStream_t>(hStream)));
 }
 CUresult CUDAAPI cuMemsetD16Async(CUdeviceptr dstDevice, unsigned short us,
                                   size_t N, CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_memset_elems(uint64_t(dstDevice), us, 2, size_t(N), reinterpret_cast<cudaStream_t>(hStream), true);
 }
 CUresult CUDAAPI cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int ui,
                                   size_t N, CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_memset_elems(uint64_t(dstDevice), ui, 4, size_t(N), reinterpret_cast<cudaStream_t>(hStream), true);
 }
 CUresult CUDAAPI cuMemsetD2D8Async(CUdeviceptr dstDevice, size_t dstPitch,
                                    unsigned char uc, size_t Width,
@@ -9854,35 +9781,41 @@ CUresult CUDAAPI cuMemsetD2D32Async(CUdeviceptr dstDevice, size_t dstPitch,
 }
 
 CUresult CUDAAPI cuStreamGetPriority(CUstream hStream, int *priority) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: forwards to the runtime function.
+  if (priority == NULL) return CUDA_ERROR_INVALID_VALUE;
+  *priority = 0;  // priorities are not modelled
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuStreamGetFlags(CUstream hStream, unsigned int *flags) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: forwards to the runtime function.
+  if (flags == NULL) return CUDA_ERROR_INVALID_VALUE;
+  CUstream_st *s = yasai_stream_manager(GPGPU_Context())->yasai_resolve(reinterpret_cast<CUstream_st *>(hStream));
+  *flags = (s != NULL && s->yasai_nonblocking()) ? 1u : 0u;  // CU_STREAM_NON_BLOCKING
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuStreamWaitEvent(CUstream hStream, CUevent hEvent,
                                    unsigned int Flags) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(
+      cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(hStream), reinterpret_cast<cudaEvent_t>(hEvent), Flags));
 }
 CUresult CUDAAPI cuStreamAddCallback(CUstream hStream,
                                      CUstreamCallback callback, void *userData,
                                      unsigned int flags) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  // The callback runs in stream order on the host-callback thread, with CUDA_SUCCESS.
+  (void)flags;
+  struct Call {
+    CUstreamCallback fn;
+    CUstream stream;
+    void *user;
+  };
+  Call *c = new Call{callback, hStream, userData};
+  return yasai_drv_status(cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(hStream), [](void *p) {
+    Call *call = static_cast<Call *>(p);
+    call->fn(call->stream, CUDA_SUCCESS, call->user);
+    delete call;
+  }, c));
 }
 CUresult CUDAAPI cuStreamAttachMemAsync(CUstream hStream, CUdeviceptr dptr,
                                         size_t length, unsigned int flags) {
@@ -9893,25 +9826,16 @@ CUresult CUDAAPI cuStreamAttachMemAsync(CUstream hStream, CUdeviceptr dptr,
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuStreamQuery(CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaStreamQuery(reinterpret_cast<cudaStream_t>(hStream)));
 }
 CUresult CUDAAPI cuStreamSynchronize(CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(hStream)));
 }
 CUresult CUDAAPI cuEventRecord(CUevent hEvent, CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaEventRecord(reinterpret_cast<cudaEvent_t>(hEvent), reinterpret_cast<cudaStream_t>(hStream)));
 }
 CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX,
                                 unsigned int gridDimY, unsigned int gridDimZ,
@@ -10005,11 +9929,8 @@ CUresult cuProfilerStop(void) {
 
 extern "C" CUresult CUDAAPI cuMemcpy_ptds(CUdeviceptr dst, CUdeviceptr src,
                                           size_t ByteCount) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemcpy(reinterpret_cast<void *>(dst), reinterpret_cast<void *>(src), ByteCount, cudaMemcpyDefault));
 }
 
 extern "C" CUresult CUDAAPI cuMemcpyPeer_ptds(CUdeviceptr dstDevice,
@@ -10017,39 +9938,31 @@ extern "C" CUresult CUDAAPI cuMemcpyPeer_ptds(CUdeviceptr dstDevice,
                                               CUdeviceptr srcDevice,
                                               CUcontext srcContext,
                                               size_t ByteCount) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  (void)dstContext;
+  (void)srcContext;  // one simulated GPU per process
+  return yasai_drv_status(
+      cudaMemcpy(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDefault));
 }
 
 extern "C" CUresult CUDAAPI cuMemcpyHtoD_v2_ptds(CUdeviceptr dstDevice,
                                                  const void *srcHost,
                                                  size_t ByteCount) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemcpy(reinterpret_cast<void *>(dstDevice), srcHost, ByteCount, cudaMemcpyHostToDevice));
 }
 extern "C" CUresult CUDAAPI cuMemcpyDtoH_v2_ptds(void *dstHost,
                                                  CUdeviceptr srcDevice,
                                                  size_t ByteCount) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemcpy(dstHost, reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToHost));
 }
 extern "C" CUresult CUDAAPI cuMemcpyDtoD_v2_ptds(CUdeviceptr dstDevice,
                                                  CUdeviceptr srcDevice,
                                                  size_t ByteCount) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(
+      cudaMemcpy(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToDevice));
 }
 extern "C" CUresult CUDAAPI
 cuMemcpy2DUnaligned_v2_ptds(const CUDA_MEMCPY2D *pCopy) {
@@ -10077,29 +9990,20 @@ cuMemcpy3DPeer_ptds(const CUDA_MEMCPY3D_PEER *pCopy) {
 extern "C" CUresult CUDAAPI cuMemsetD8_v2_ptds(CUdeviceptr dstDevice,
                                                unsigned char uc,
                                                unsigned int N) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemset(reinterpret_cast<void *>(dstDevice), int(uc), size_t(N)));
 }
 extern "C" CUresult CUDAAPI cuMemsetD16_v2_ptds(CUdeviceptr dstDevice,
                                                 unsigned short us,
                                                 unsigned int N) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_memset_elems(uint64_t(dstDevice), us, 2, size_t(N), NULL, false);
 }
 extern "C" CUresult CUDAAPI cuMemsetD32_v2_ptds(CUdeviceptr dstDevice,
                                                 unsigned int ui,
                                                 unsigned int N) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_memset_elems(uint64_t(dstDevice), ui, 4, size_t(N), NULL, false);
 }
 extern "C" CUresult CUDAAPI cuMemsetD2D8_v2_ptds(CUdeviceptr dstDevice,
                                                  unsigned int dstPitch,
@@ -10148,21 +10052,19 @@ cuMemcpy3DPeer_ptsz(const CUDA_MEMCPY3D_PEER *pCopy) {
 extern "C" CUresult CUDAAPI cuMemcpyAsync_ptsz(CUdeviceptr dst, CUdeviceptr src,
                                                size_t ByteCount,
                                                CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(
+      cudaMemcpyAsync(reinterpret_cast<void *>(dst), reinterpret_cast<void *>(src), ByteCount, cudaMemcpyDefault, reinterpret_cast<cudaStream_t>(hStream)));
 }
 
 extern "C" CUresult CUDAAPI cuMemcpyPeerAsync_ptsz(
     CUdeviceptr dstDevice, CUcontext dstContext, CUdeviceptr srcDevice,
     CUcontext srcContext, size_t ByteCount, CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  (void)dstContext;
+  (void)srcContext;  // one simulated GPU per process
+  return yasai_drv_status(
+      cudaMemcpyAsync(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDefault, reinterpret_cast<cudaStream_t>(hStream)));
 }
 extern "C" CUresult CUDAAPI cuMemcpyHtoAAsync_v2_ptsz(CUarray dstArray,
                                                       size_t dstOffset,
@@ -10190,31 +10092,25 @@ extern "C" CUresult CUDAAPI cuMemcpyHtoDAsync_v2_ptsz(CUdeviceptr dstDevice,
                                                       const void *srcHost,
                                                       size_t ByteCount,
                                                       CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(
+      cudaMemcpyAsync(reinterpret_cast<void *>(dstDevice), srcHost, ByteCount, cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(hStream)));
 }
 extern "C" CUresult CUDAAPI cuMemcpyDtoHAsync_v2_ptsz(void *dstHost,
                                                       CUdeviceptr srcDevice,
                                                       size_t ByteCount,
                                                       CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(
+      cudaMemcpyAsync(dstHost, reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToHost, reinterpret_cast<cudaStream_t>(hStream)));
 }
 extern "C" CUresult CUDAAPI cuMemcpyDtoDAsync_v2_ptsz(CUdeviceptr dstDevice,
                                                       CUdeviceptr srcDevice,
                                                       size_t ByteCount,
                                                       CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemcpyAsync(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount,
+                                          cudaMemcpyDeviceToDevice, reinterpret_cast<cudaStream_t>(hStream)));
 }
 extern "C" CUresult CUDAAPI cuMemcpy2DAsync_v2_ptsz(const CUDA_MEMCPY2D *pCopy,
                                                     CUstream hStream) {
@@ -10244,11 +10140,8 @@ cuMemcpy3DPeerAsync_ptsz(const CUDA_MEMCPY3D_PEER *pCopy, CUstream hStream) {
 extern "C" CUresult CUDAAPI cuMemsetD8Async_ptsz(CUdeviceptr dstDevice,
                                                  unsigned char uc, size_t N,
                                                  CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaMemsetAsync(reinterpret_cast<void *>(dstDevice), int(uc), size_t(N), reinterpret_cast<cudaStream_t>(hStream)));
 }
 extern "C" CUresult CUDAAPI cuMemsetD2D8Async_ptsz(CUdeviceptr dstDevice,
                                                    size_t dstPitch,
@@ -10274,11 +10167,8 @@ extern "C" CUresult CUDAAPI cuLaunchKernel_ptsz(
 }
 extern "C" CUresult CUDAAPI cuEventRecord_ptsz(CUevent hEvent,
                                                CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaEventRecord(reinterpret_cast<cudaEvent_t>(hEvent), reinterpret_cast<cudaStream_t>(hStream)));
 }
 extern "C" CUresult CUDAAPI cuStreamWriteValue32_ptsz(CUstream stream,
                                                       CUdeviceptr addr,
@@ -10311,56 +10201,56 @@ extern "C" CUresult CUDAAPI cuStreamBatchMemOp_ptsz(
 }
 extern "C" CUresult CUDAAPI cuStreamGetPriority_ptsz(CUstream hStream,
                                                      int *priority) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: forwards to the runtime function.
+  if (priority == NULL) return CUDA_ERROR_INVALID_VALUE;
+  *priority = 0;  // priorities are not modelled
   return CUDA_SUCCESS;
 }
 extern "C" CUresult CUDAAPI cuStreamGetFlags_ptsz(CUstream hStream,
                                                   unsigned int *flags) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: forwards to the runtime function.
+  if (flags == NULL) return CUDA_ERROR_INVALID_VALUE;
+  CUstream_st *s = yasai_stream_manager(GPGPU_Context())->yasai_resolve(reinterpret_cast<CUstream_st *>(hStream));
+  *flags = (s != NULL && s->yasai_nonblocking()) ? 1u : 0u;  // CU_STREAM_NON_BLOCKING
   return CUDA_SUCCESS;
 }
 
 extern "C" CUresult CUDAAPI cuStreamWaitEvent_ptsz(CUstream hStream,
                                                    CUevent hEvent,
                                                    unsigned int Flags) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(
+      cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(hStream), reinterpret_cast<cudaEvent_t>(hEvent), Flags));
 }
 
 extern "C" CUresult CUDAAPI cuStreamAddCallback_ptsz(CUstream hStream,
                                                      CUstreamCallback callback,
                                                      void *userData,
                                                      unsigned int flags) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  // The callback runs in stream order on the host-callback thread, with CUDA_SUCCESS.
+  (void)flags;
+  struct Call {
+    CUstreamCallback fn;
+    CUstream stream;
+    void *user;
+  };
+  Call *c = new Call{callback, hStream, userData};
+  return yasai_drv_status(cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(hStream), [](void *p) {
+    Call *call = static_cast<Call *>(p);
+    call->fn(call->stream, CUDA_SUCCESS, call->user);
+    delete call;
+  }, c));
 }
 
 extern "C" CUresult CUDAAPI cuStreamSynchronize_ptsz(CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(hStream)));
 }
 
 extern "C" CUresult CUDAAPI cuStreamQuery_ptsz(CUstream hStream) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  // yasai: forwards to the runtime function.
+  return yasai_drv_status(cudaStreamQuery(reinterpret_cast<cudaStream_t>(hStream)));
 }
 extern "C" CUresult CUDAAPI cuStreamAttachMemAsync_ptsz(CUstream hStream,
                                                         CUdeviceptr dptr,
@@ -10534,7 +10424,20 @@ typedef void (CUDART_CB *cudaStreamCallback_t)(cudaStream_t stream, cudaError_t 
 
 __host__ cudaError_t CUDARTAPI cudaStreamAddCallback(cudaStream_t stream,
         cudaStreamCallback_t callback, void *userData, unsigned int flags) {
-  cuda_error_not_impl;
+  // yasai: the callback runs in stream order on the host-callback thread (cudaLaunchHostFunc),
+  // with status cudaSuccess; flags must be 0.
+  (void)flags;
+  struct Call {
+    cudaStreamCallback_t fn;
+    cudaStream_t stream;
+    void *user;
+  };
+  Call *c = new Call{callback, stream, userData};
+  return cudaLaunchHostFunc(stream, [](void *p) {
+    Call *call = static_cast<Call *>(p);
+    call->fn(call->stream, cudaSuccess, call->user);
+    delete call;
+  }, c);
 }
 
 
@@ -10820,12 +10723,6 @@ extern "C" CUresult CUDAAPI cuMemcpyBatchAsync_v2(CUdeviceptr *dsts, CUdeviceptr
                               numAttrs, reinterpret_cast<cudaStream_t>(hStream)) == cudaSuccess
              ? CUDA_SUCCESS
              : CUDA_ERROR_INVALID_VALUE;
-}
-
-// yasai: CUDA_SUCCESS for cudaSuccess, CUDA_ERROR_INVALID_VALUE otherwise.
-// @param e Runtime status.
-static CUresult yasai_drv_status(cudaError_t e) {
-  return e == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 
 // yasai: driver form of cudaMemPoolCreate (pools are tokens; see there).
