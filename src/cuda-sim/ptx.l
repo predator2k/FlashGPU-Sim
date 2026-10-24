@@ -297,6 +297,7 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.maxnctapersm TC; return MAXNCTAPERSM_DIRECTIVE;
 \.maxnreg TC; return MAXNNREG_DIRECTIVE;
 \.maxntid TC; return MAXNTID_DIRECTIVE;
+\.noreturn TC; /* yasai: a function attribute (Triton's __assertfail prototype) that changes no execution, so it is dropped */
 \.minnctapersm TC; return MINNCTAPERSM_DIRECTIVE;
 \.maxclusterrank TC; return MAXCLUSTERRANK_DIRECTIVE; /* yasai: cluster launch hints, ignored */
 \.reqnctapercluster TC; return REQNCTAPERCLUSTER_DIRECTIVE; /* yasai */
