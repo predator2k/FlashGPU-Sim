@@ -226,6 +226,17 @@ void register_ptx_function(const char *name, function_info *impl) {
 #endif
 #endif
 
+// yasai: simulated device memory size in bytes from YASAI_DEVICE_MEM_MB, or fallback when unset.
+// Device memory is host memory in this simulator; the size is only what queries report
+// (totalGlobalMem, cudaMemGetInfo, cuMemGetInfo, cuDeviceTotalMem), which frameworks use to size
+// their caches (vLLM's KV cache is gpu_memory_utilization times the total).
+//   fallback  the value reported when YASAI_DEVICE_MEM_MB is not set
+static size_t yasai_device_mem_bytes(size_t fallback) {
+  const char *v = getenv("YASAI_DEVICE_MEM_MB");
+  if (v == NULL || *v == '\0') return fallback;
+  return (size_t)strtoull(v, NULL, 0) << 20;
+}
+
 struct _cuda_device_id *gpgpu_context::GPGPUSim_Init() {
   _cuda_device_id *the_device = the_gpgpusim->the_cude_device;
   if (!the_device) {
@@ -236,7 +247,7 @@ struct _cuda_device_id *gpgpu_context::GPGPUSim_Init() {
              g_gpgpusim_version_string);
     prop->major = the_gpu->compute_capability_major();
     prop->minor = the_gpu->compute_capability_minor();
-    prop->totalGlobalMem = 0x80000000 /* 2 GB */;
+    prop->totalGlobalMem = yasai_device_mem_bytes(0x80000000 /* 2 GB */);
     prop->memPitch = 0;
     if (prop->major >= 2) {
       prop->maxThreadsPerBlock = 1024;
@@ -3198,8 +3209,9 @@ __host__ cudaError_t CUDARTAPI cudaMemGetInfo(size_t *free, size_t *total) {
     announce_call(__my_func__);
   }
   // placeholder; should interact with cudaMalloc and cudaFree?
-  *free = 10000000000;
-  *total = 10000000000;
+  // yasai: the size is YASAI_DEVICE_MEM_MB when set; free is reported equal to total.
+  *free = yasai_device_mem_bytes(10000000000);
+  *total = yasai_device_mem_bytes(10000000000);
 
   return g_last_cudaError = cudaSuccess;
 }
@@ -6498,7 +6510,7 @@ CUresult CUDAAPI cuDeviceTotalMem(size_t *bytes, CUdevice dev) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  *bytes = 20000000000;  // dummy value
+  *bytes = yasai_device_mem_bytes(20000000000);  // dummy value unless YASAI_DEVICE_MEM_MB
   return CUDA_SUCCESS;
 }
 #endif /* CUDART_VERSION >= 3020 */
@@ -6979,7 +6991,11 @@ CUresult CUDAAPI cuMemGetInfo(size_t *free, size_t *total) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: as cudaMemGetInfo (Triton and vLLM's driver-API paths query it).
+  size_t f = 0, t = 0;
+  cudaMemGetInfo(&f, &t);
+  if (free) *free = f;
+  if (total) *total = t;
   return CUDA_SUCCESS;
 }
 
@@ -9950,4 +9966,92 @@ extern "C" CUresult CUDAAPI cuDeviceGetUuid(CUuuid *uuid, CUdevice dev) {
   uuid->bytes[14] = (char)((base + dev) & 0xff);
   uuid->bytes[15] = (char)(dev & 0xff);
   return CUDA_SUCCESS;
+}
+
+// ---- yasai: entry points that framework extensions import at load time ----------------------
+// vLLM's _C, sglang-kernel's spatial_ops, DeepGEMM and DeepEP import these symbols; Python
+// loads extensions with RTLD_NOW, so a missing symbol fails the import even when the function is
+// never called (fakeenv coverage, 2026-10-24).
+
+// cuGetProcAddress_v2: the driver function of that name defined in this library (as
+// cudaGetDriverEntryPoint does), or NULL with CUDA_ERROR_NOT_FOUND.
+//   symbol        driver function name
+//   pfn           receives the address
+//   cudaVersion   requested CUDA version (not used)
+//   flags         CU_GET_PROC_ADDRESS_* flags (not used)
+//   symbolStatus  receives CU_GET_PROC_ADDRESS_SUCCESS (0) or _SYMBOL_NOT_FOUND (1); may be NULL
+extern "C" CUresult CUDAAPI cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
+                                                unsigned long long flags, int *symbolStatus) {
+  (void)cudaVersion;
+  (void)flags;
+  if (symbol == NULL || pfn == NULL) return CUDA_ERROR_INVALID_VALUE;
+  *pfn = yasai_find_own_symbol(symbol);
+  if (symbolStatus) *symbolStatus = *pfn ? 0 : 1;
+  return *pfn ? CUDA_SUCCESS : CUDA_ERROR_NOT_FOUND;
+}
+
+// cuGetProcAddress: cuGetProcAddress_v2 without the status output.
+//   symbol, pfn, cudaVersion, flags  as for cuGetProcAddress_v2
+extern "C" CUresult CUDAAPI cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion,
+                                             unsigned long long flags) {
+  return cuGetProcAddress_v2(symbol, pfn, cudaVersion, flags, NULL);
+}
+
+// Green contexts (SM partitions; sglang-kernel's spatial_ops imports them) are not simulated:
+// every call answers CUDA_ERROR_NOT_SUPPORTED, which callers treat as a GPU without the feature.
+//   (parameters as in cuda.h; not used)
+extern "C" CUresult CUDAAPI cuDeviceGetDevResource(CUdevice, void *, int) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+extern "C" CUresult CUDAAPI cuDevSmResourceSplitByCount(void *, unsigned *, const void *, void *,
+                                                        unsigned, unsigned) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+extern "C" CUresult CUDAAPI cuDevResourceGenerateDesc(void *, void *, unsigned) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+extern "C" CUresult CUDAAPI cuGreenCtxCreate(void *, void *, CUdevice, unsigned) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+extern "C" CUresult CUDAAPI cuGreenCtxDestroy(void *) { return CUDA_ERROR_NOT_SUPPORTED; }
+extern "C" CUresult CUDAAPI cuGreenCtxGetDevResource(void *, void *, int) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+extern "C" CUresult CUDAAPI cuCtxFromGreenCtx(void *, void *) { return CUDA_ERROR_NOT_SUPPORTED; }
+
+// cudaLaunchCooperativeKernel: launched as a normal kernel. The functional simulator runs the
+// CTAs of a grid one after another, so a kernel that synchronizes the whole grid (grid.sync)
+// would wait for CTAs that have not started; the call prints a warning once per process.
+//   func, gridDim, blockDim, args, sharedMem, stream  as for cudaLaunchKernel
+extern "C" cudaError_t CUDARTAPI cudaLaunchCooperativeKernel(const void *func, dim3 gridDim,
+                                                             dim3 blockDim, void **args,
+                                                             size_t sharedMem, cudaStream_t stream) {
+  static bool warned = false;
+  if (!warned) {
+    warned = true;
+    printf("GPGPU-Sim PTX: warning: cudaLaunchCooperativeKernel runs as a normal launch; grid-wide "
+           "synchronization is not simulated\n");
+  }
+  return cudaLaunchKernel((const char *)func, gridDim, blockDim, (const void **)args, sharedMem,
+                          stream);
+}
+
+// cudaMemset2DAsync: one cudaMemsetAsync per row.
+//   devPtr, pitch, value, width, height, stream  as in the CUDA runtime API
+extern "C" cudaError_t CUDARTAPI cudaMemset2DAsync(void *devPtr, size_t pitch, int value,
+                                                   size_t width, size_t height,
+                                                   cudaStream_t stream) {
+  for (size_t r = 0; r < height; ++r) {
+    const cudaError_t e = cudaMemsetAsync((char *)devPtr + r * pitch, value, width, stream);
+    if (e != cudaSuccess) return e;
+  }
+  return cudaSuccess;
+}
+
+// cudaOccupancyMaxActiveBlocksPerMultiprocessor: the WithFlags variant with flags 0.
+//   numBlocks, func, blockSize, dynamicSMemSize  as in the CUDA runtime API
+extern "C" cudaError_t CUDARTAPI cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    int *numBlocks, const void *func, int blockSize, size_t dynamicSMemSize) {
+  return cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(numBlocks, (const char *)func,
+                                                                blockSize, dynamicSMemSize, 0);
 }
