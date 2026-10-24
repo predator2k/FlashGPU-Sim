@@ -59,7 +59,10 @@ struct Config {
   uint64_t idle_step_us; ///< pause between idle clock steps (YASAI_FIO_WINDOW_IDLE_STEP_US, default 20)
   uint64_t max_pending_bytes;  ///< cap on pending memory (YASAI_FIO_WINDOW_MAX_PENDING_MB, default 256)
   bool cap_fatal;        ///< abort instead of delivering early at the cap (YASAI_FIO_WINDOW_CAP_FATAL=1)
-  bool same_addr_order;  ///< keep the write order per byte (YASAI_FIO_WINDOW_SAME_ADDR_ORDER, default 1)
+  /// Keep the write order per byte (YASAI_FIO_WINDOW_SAME_ADDR_ORDER=1). Default 0, the FIO base
+  /// specification: no ordering even between two posted writes from one source to one address
+  /// (fio-spec part V 3.4, default-unordered-ordering-model). 1 is a hypothetical profile.
+  bool same_addr_order;
   std::string clock_path;   ///< shared clock file (YASAI_FIO_WINDOW_CLOCK)
   std::string record_path;  ///< FIO transport record file (YASAI_FIO_WINDOW_RECORD), empty: none
 };
@@ -93,7 +96,7 @@ Config &config() {
     cfg->idle_step_us = env_u64("YASAI_FIO_WINDOW_IDLE_STEP_US", 20);
     cfg->max_pending_bytes = std::max<uint64_t>(1, env_u64("YASAI_FIO_WINDOW_MAX_PENDING_MB", 256)) << 20;
     cfg->cap_fatal = env_u64("YASAI_FIO_WINDOW_CAP_FATAL", 0) != 0;
-    cfg->same_addr_order = env_u64("YASAI_FIO_WINDOW_SAME_ADDR_ORDER", 1) != 0;
+    cfg->same_addr_order = env_u64("YASAI_FIO_WINDOW_SAME_ADDR_ORDER", 0) != 0;
     cfg->clock_path = env_str("YASAI_FIO_WINDOW_CLOCK", "/dev/shm/yasai-fio-window-clock");
     cfg->record_path = env_str("YASAI_FIO_WINDOW_RECORD", "");
     return cfg;
@@ -434,9 +437,10 @@ bool on_store(uint64_t addr, size_t bytes, const void *in) {
     Pending piece;
     piece.addr = addr + off;
     piece.deadline = now + draw_delay();
-    // Per-byte write order (default): a piece never becomes visible before an earlier pending piece
-    // that covers any of its bytes, so a later write to a location is never overwritten by an
-    // earlier one (no lost update of a flag). Writes to different locations still reorder freely.
+    // Per-byte write order (hypothetical profile, YASAI_FIO_WINDOW_SAME_ADDR_ORDER=1): a piece never
+    // becomes visible before an earlier pending piece that covers any of its bytes, so a later write
+    // to a location is never overwritten by an earlier one. The FIO base specification (default)
+    // gives no such order: an earlier write can land after a later one to the same address.
     if (cfg.same_addr_order && !p.by_addr.empty()) {
       const uint64_t a = addr + off;
       const uint64_t lo_key = a >= p.max_piece ? a - p.max_piece + 1 : 0;
