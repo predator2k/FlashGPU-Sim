@@ -1960,7 +1960,12 @@ cudaMemsetAsyncInternal(void *mem, int c, size_t count, cudaStream_t stream = 0,
     announce_call(__my_func__);
   }
   // yasai: the memset is a stream operation, so it runs after the work queued before it on the
-  // stream and before the work queued after it.
+  // stream and before the work queued after it. YASAI_MEMSET_AT_CALL=1 performs it at the call
+  // instead (the former behaviour; for comparison).
+  if (getenv("YASAI_MEMSET_AT_CALL")) {
+    GPGPUSim_Context(ctx)->get_device()->get_gpgpu()->gpu_memset((size_t)mem, c, count);
+    return g_last_cudaError = cudaSuccess;
+  }
   ctx->the_gpgpusim->g_stream_manager->push(stream_operation::memset_op(
       (size_t)mem, c, count, (struct CUstream_st *)stream));
   return g_last_cudaError = cudaSuccess;

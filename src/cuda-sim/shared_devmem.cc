@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <map>
 #include <mutex>
 #include <set>
@@ -35,6 +36,10 @@ constexpr size_t kGranularity = size_t(2) << 20;
 constexpr size_t kPage = 4096;
 /// Chunk size of copies between segments (all-zero chunks are skipped).
 constexpr size_t kCopyChunk = size_t(64) << 10;
+/// Poll interval of a multicast access that waits for devices to bind memory (microseconds).
+constexpr unsigned kMcWaitUs = 100;
+/// Polls after which such a wait is reported (about 10 s).
+constexpr unsigned kMcWaitWarnSpins = 100000;
 /// Bindings a multicast object can hold (several per device are allowed).
 constexpr int kMaxMcSlots = 4 * kMaxMcDevices;
 /// Length of a segment ref, including the terminating zero.
@@ -52,6 +57,8 @@ struct mc_slot {
   uint64_t mc_offset;    ///< first multicast offset of the binding
   uint64_t mem_offset;   ///< offset in the bound segment
   uint64_t size;         ///< length of the binding
+  uint64_t bind_id;      ///< unique id of the binding (keys the peer mapping cache, since a
+                         ///< ref names a descriptor number that its owner may reuse)
   char ref[kRefLen];     ///< ref of the bound segment
 };
 
@@ -219,10 +226,12 @@ bool place_locked(uint64_t va, size_t size, size_t offset, int fd, bool noreplac
 
 /// Opens another process's segment by ref and maps all of it; the caller holds st().mu.
 /// @param ref Segment ref.
+/// @param bind_id Id of the binding that names the segment (part of the cache key).
 /// @return The mapping, or nullptr.
-peer_map *peer_locked(const char *ref) {
+peer_map *peer_locked(const char *ref, uint64_t bind_id) {
   state &s = st();
-  auto it = s.peers.find(ref);
+  const std::string key = std::string(ref) + "#" + std::to_string(bind_id);
+  auto it = s.peers.find(key);
   if (it != s.peers.end()) return &it->second;
   int fd = open(ref, O_RDWR | O_CLOEXEC);
   if (fd < 0) {
@@ -238,7 +247,7 @@ peer_map *peer_locked(const char *ref) {
   close(fd);
   if (b == MAP_FAILED) return nullptr;
   peer_map pm{static_cast<char *>(b), size_t(sb.st_size)};
-  return &s.peers.emplace(ref, pm).first->second;
+  return &s.peers.emplace(key, pm).first->second;
 }
 
 /// Multicast read hook for host_window: reads the calling process's copy.
@@ -261,6 +270,16 @@ void hook_write(void *mc, uint64_t off, size_t bytes, const void *in) {
   uint64_t addrs[kMaxMcDevices];
   int n = mc_targets(mc, off, bytes, addrs, kMaxMcDevices);
   for (int i = 0; i < n; i++) host_window::write(addrs[i], bytes, in);
+  static const bool debug = getenv("YASAI_MC_DEBUG") != NULL;
+  if (debug && bytes == 8) {  // step counters (credits) stored to multicast addresses
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t v;
+    memcpy(&v, in, 8);
+    printf("yasai-mc: t %lld.%06ld plain store off 0x%llx value %llu to %d\n",
+           (long long)ts.tv_sec, ts.tv_nsec / 1000, (unsigned long long)off,
+           (unsigned long long)v, n);
+  }
 }
 
 /// In a forked child: moves every cudaMalloc segment inherited from the parent into a segment
@@ -617,6 +636,8 @@ bool mc_bind(phys *mc, size_t mc_offset, phys *mem, size_t mem_offset, size_t si
   sl.mc_offset = mc_offset;
   sl.mem_offset = mem_offset;
   sl.size = size;
+  static std::atomic<uint64_t> bind_seq{0};
+  sl.bind_id = st().token ^ (++bind_seq * 0x9e3779b97f4a7c15ull);
   snprintf(sl.ref, sizeof(sl.ref), "%s", ref_of(mem->fd).c_str());
   retain(mem);  // the binding keeps the descriptor (and so the ref) valid
   __atomic_store_n(&sl.state, 1u, __ATOMIC_RELEASE);
@@ -639,18 +660,34 @@ void mc_unbind(phys *mc, size_t mc_offset, size_t size) {
 int mc_targets(void *mcv, uint64_t off, size_t bytes, uint64_t *addrs, int max) {
   phys *mc = static_cast<phys *>(mcv);
   if (!mc || !mc->hdr) return 0;
-  std::lock_guard<std::mutex> lock(st().mu);
-  int n = 0;
-  uint32_t ns = __atomic_load_n(&mc->hdr->nslots, __ATOMIC_ACQUIRE);
-  for (uint32_t i = 0; i < ns && int(i) < kMaxMcSlots && n < max; i++) {
-    mc_slot &sl = mc->hdr->slots[i];
-    if (__atomic_load_n(&sl.state, __ATOMIC_ACQUIRE) != 1) continue;
-    if (off < sl.mc_offset || off + bytes > sl.mc_offset + sl.size) continue;
-    peer_map *pm = peer_locked(sl.ref);
-    if (!pm) continue;
-    addrs[n++] = reinterpret_cast<uint64_t>(pm->base) + sl.mem_offset + (off - sl.mc_offset);
+  // A multicast access reaches the memory of every device of the team. A device that has not
+  // bound memory at this offset yet (its rank process is still setting up) is waited for, as
+  // the team on real hardware is complete before multicast accesses reach it; otherwise a
+  // reduction or barrier would silently leave that device out.
+  const int want = std::min<int>(int(mc->hdr->num_devices), max);
+  bool warned = false;
+  for (unsigned spins = 0;; spins++) {
+    int n = 0;
+    {
+      std::lock_guard<std::mutex> lock(st().mu);
+      uint32_t ns = __atomic_load_n(&mc->hdr->nslots, __ATOMIC_ACQUIRE);
+      for (uint32_t i = 0; i < ns && int(i) < kMaxMcSlots && n < max; i++) {
+        mc_slot &sl = mc->hdr->slots[i];
+        if (__atomic_load_n(&sl.state, __ATOMIC_ACQUIRE) != 1) continue;
+        if (off < sl.mc_offset || off + bytes > sl.mc_offset + sl.size) continue;
+        peer_map *pm = peer_locked(sl.ref, sl.bind_id);
+        if (!pm) continue;
+        addrs[n++] = reinterpret_cast<uint64_t>(pm->base) + sl.mem_offset + (off - sl.mc_offset);
+      }
+    }
+    if (n >= want) return n;
+    if (!warned && spins == kMcWaitWarnSpins) {
+      fprintf(stderr, "shared_devmem: multicast access at offset 0x%llx waits for %d of %d "
+              "devices to bind memory\n", (unsigned long long)off, want - n, want);
+      warned = true;
+    }
+    usleep(kMcWaitUs);
   }
-  return n;
 }
 
 uint64_t mc_local_target(void *mcv, uint64_t off, size_t bytes) {
@@ -664,7 +701,7 @@ uint64_t mc_local_target(void *mcv, uint64_t off, size_t bytes) {
     mc_slot &sl = mc->hdr->slots[i];
     if (__atomic_load_n(&sl.state, __ATOMIC_ACQUIRE) != 1) continue;
     if (off < sl.mc_offset || off + bytes > sl.mc_offset + sl.size) continue;
-    peer_map *pm = peer_locked(sl.ref);
+    peer_map *pm = peer_locked(sl.ref, sl.bind_id);
     if (!pm) continue;
     uint64_t a = reinterpret_cast<uint64_t>(pm->base) + sl.mem_offset + (off - sl.mc_offset);
     if (sl.owner == me) return a;

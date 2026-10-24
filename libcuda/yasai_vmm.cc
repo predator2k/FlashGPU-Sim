@@ -226,6 +226,8 @@ int pointer_attribute(void *data, int attr, uint64_t ptr, void *ctx) {
   size_t size = 0;
   const bool known = address_range(ptr, &base, &size);
   const bool device = !host && (known || ptr >= GLOBAL_HEAP_START) && ptr < 0x500000000000ull;
+  // Whether ptr lies in a cuMem mapping (virtual memory management) rather than cudaMalloc.
+  const bool vmm = shared_devmem::mapping_at(ptr, nullptr, nullptr, nullptr, nullptr);
   if (!host && !device) return kInvalidValue;
   switch (attr) {
     case kContext: *static_cast<void **>(data) = ctx; return kSuccess;
@@ -239,7 +241,9 @@ int pointer_attribute(void *data, int attr, uint64_t ptr, void *ctx) {
     case kBufferId: *static_cast<unsigned long long *>(data) = known ? base : ptr; return kSuccess;
     case kIsManaged: *static_cast<int *>(data) = 0; return kSuccess;
     case kDeviceOrdinal: *static_cast<int *>(data) = 0; return kSuccess;
-    case kLegacyIpc: *static_cast<int *>(data) = (device && known) ? 1 : 0; return kSuccess;
+    case kLegacyIpc:  // cudaMalloc memory (not a cuMem mapping), as on a GPU
+      *static_cast<int *>(data) = (device && known && !vmm) ? 1 : 0;
+      return kSuccess;
     case kRangeStart:
       if (!known) return kInvalidValue;
       *static_cast<uint64_t *>(data) = base;
@@ -249,7 +253,10 @@ int pointer_attribute(void *data, int attr, uint64_t ptr, void *ctx) {
       *static_cast<size_t *>(data) = size;
       return kSuccess;
     case kMapped: *static_cast<int *>(data) = 1; return kSuccess;
-    case kAllowedHandles: *static_cast<unsigned long long *>(data) = kHandlePosixFd; return kSuccess;
+    case kAllowedHandles:  // only cuMem allocations are exportable, as on a GPU (cudaMalloc
+                           // memory answers 0, so NCCL does not try to multicast-bind it)
+      *static_cast<unsigned long long *>(data) = vmm ? kHandlePosixFd : 0;
+      return kSuccess;
     case kGdrCapable: *static_cast<int *>(data) = 0; return kSuccess;
     case kAccessFlags: *static_cast<int *>(data) = 3; return kSuccess;  // PROT_READWRITE
     case kMempool: *static_cast<void **>(data) = nullptr; return kSuccess;
