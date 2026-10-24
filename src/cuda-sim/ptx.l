@@ -235,6 +235,7 @@ vshl    TC; yylval->int_value = VSHL_OP; return OPCODE;
 vshr    TC; yylval->int_value = VSHR_OP; return OPCODE;
 vsub    TC; yylval->int_value = VSUB_OP; return OPCODE;
 vote	TC; yylval->int_value = VOTE_OP; return OPCODE;
+match	TC; yylval->int_value = MATCH_OP; return OPCODE; /* yasai: match.{any,all}.sync */
 activemask TC; yylval->int_value = ACTIVEMASK_OP; return OPCODE;
 xor     TC; yylval->int_value = XOR_OP; return OPCODE;
 nop     TC; yylval->int_value = NOP_OP; return OPCODE;

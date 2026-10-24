@@ -6724,6 +6724,65 @@ void shfl_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst) {
   }
 }
 
+// yasai: match.{any,all}.sync.{b32,b64} d{|p}, a, membermask (PTX ISA 9.7.13.11), a warp-level
+// instruction called once per active thread in lane order (like shfl_impl):
+//   match.any  d = the lanes of membermask whose a equals this lane's a
+//   match.all  d = membermask and p = true when every lane of membermask has the same a, else
+//              d = 0 and p = false
+// Lanes of membermask that are not active take no part (their a is unpredictable on hardware).
+//   pI: the instruction; core: the core; inst: the warp instruction
+void match_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst) {
+  const unsigned i_type = pI->get_type();
+  const bool wide = i_type == B64_TYPE || i_type == U64_TYPE || i_type == S64_TYPE;
+  const int tid = core->get_gpu()->is_functional_sim() ? inst.warp_id_func() * core->get_warp_size()
+                                                       : inst.warp_id() * core->get_warp_size();
+  ptx_warp_info *warp_info = core->get_thread_info()[tid]->m_warp_info;
+  // this call's lane: the k-th active lane, k = the threads of the warp done so far
+  unsigned k = warp_info->get_done_threads(), lane = 0;
+  for (unsigned l = 0, seen = 0; l < 32; ++l)
+    if (inst.active(l) && seen++ == k) {
+      lane = l;
+      break;
+    }
+  ptx_thread_info *thread = core->get_thread_info()[tid + lane];
+  const operand_info &dst = pI->dst(), &src1 = pI->src1(), &src2 = pI->src2();
+  const uint32_t member = thread->get_operand_value(src2, dst, B32_TYPE, thread, 1).u32;
+  auto value_of = [&](unsigned l) -> uint64_t {
+    ptx_thread_info *t = core->get_thread_info()[tid + l];
+    const ptx_reg_t v = t->get_operand_value(src1, dst, i_type, t, 1);
+    return wide ? v.u64 : uint64_t(v.u32);
+  };
+  const uint64_t mine = value_of(lane);
+  uint32_t equal = 0;
+  bool all = true;
+  for (unsigned l = 0; l < 32; ++l) {
+    if (!((member >> l) & 1u) || !inst.active(l)) continue;
+    if (value_of(l) == mine)
+      equal |= 1u << l;
+    else
+      all = false;
+  }
+  ptx_reg_t data;
+  data.u64 = 0;
+  bool p = true;
+  if (pI->vote_mode() == ptx_instruction::vote_all) {
+    data.u32 = all ? member : 0;
+    p = all;
+  } else {
+    data.u32 = equal;
+  }
+  if (dst.is_vector()) {
+    ptx_reg_t pred;
+    pred.pred = p ? 0 : 1;  // PTXPlus predicate convention: 0=true, 1=false.
+    thread->set_reg(dst.vec_symbol(0), data);
+    thread->set_reg(dst.vec_symbol(1), pred);
+  } else {
+    thread->set_operand_value(dst, data, B32_TYPE, thread, pI);
+  }
+  warp_info->inc_done_threads();
+  if (warp_info->get_done_threads() == inst.active_count()) warp_info->reset_done_threads();
+}
+
 void shf_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   ptx_reg_t a, b, c, d;
   const operand_info &dst = pI->dst();
