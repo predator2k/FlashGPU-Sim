@@ -32,6 +32,7 @@
 
 #include "cuda-sim.h"
 #include <shared_mutex>
+#include <mutex>
 
 // yasai: guards cuda_sim::g_pc_to_finfo. PTX pieces are assembled (map insertions) while
 // kernels run and look up reconvergence points (map lookups) on another thread.
@@ -3144,6 +3145,10 @@ unsigned ptx_sim_init_thread(kernel_info_t &kernel,
                              gpgpu_t *gpu, bool isInFunctionalSimulationMode) {
   std::list<ptx_thread_info *> &active_threads = kernel.active_threads();
 
+  // yasai: CTAs of concurrent kernels are created from different threads; the lookup maps below
+  // are shared.
+  static std::recursive_mutex init_thread_mu;
+  std::lock_guard<std::recursive_mutex> init_thread_lk(init_thread_mu);
   static std::map<unsigned, memory_space *> shared_memory_lookup;
   static std::map<unsigned, memory_space *> sstarr_memory_lookup;
   static std::map<unsigned, ptx_cta_info *> ptx_cta_lookup;
@@ -3954,8 +3959,34 @@ void functionalCoreSim::execute(int inst_count, unsigned ctaid_cp) {
 }
 
 
+// yasai: see cuda-sim.h.
+static std::mutex &yasai_cta_slot_mu() {
+  static std::mutex mu;
+  return mu;
+}
+// yasai: released slots, and the next never used slot.
+static std::set<unsigned> g_yasai_free_cta_slots;
+static unsigned g_yasai_next_cta_slot = 0;
+
+unsigned yasai_acquire_cta_slot() {
+  std::lock_guard<std::mutex> lk(yasai_cta_slot_mu());
+  if (!g_yasai_free_cta_slots.empty()) {
+    const unsigned s = *g_yasai_free_cta_slots.begin();
+    g_yasai_free_cta_slots.erase(g_yasai_free_cta_slots.begin());
+    return s;
+  }
+  return g_yasai_next_cta_slot++;
+}
+
+void yasai_release_cta_slot(unsigned slot) {
+  std::lock_guard<std::mutex> lk(yasai_cta_slot_mu());
+  g_yasai_free_cta_slots.insert(slot);
+}
+
+// yasai: hw_cta_id is the CTA's rank in its cluster; the hardware slot is the core's own
+// (yasai_acquire_cta_slot), which differs between the CTAs of a cluster as well.
 void functionalCoreSim::yasai_init(unsigned ctaid_cp, unsigned hw_cta_id) {
-  m_yasai_hw_cta = hw_cta_id;
+  (void)hw_cta_id;
   initializeCTA(ctaid_cp);
 }
 

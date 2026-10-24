@@ -64,18 +64,30 @@ const struct gpgpu_ptx_sim_info *ptx_sim_kernel_info(
  * This class functionally executes a kernel. It uses the basic data structures
  * and procedures in core_t
  */
+// yasai: hardware CTA slots of the live functional cores (cuda-sim.cc). A slot is the SM index
+// under which ptx_sim_init_thread keeps a CTA's shared memory, CTA and warp state, and the CTA
+// key of tcgen05 and TMA state. Slots used to be the CTA's rank in its cluster (0 outside
+// clusters), so two kernels running at the same time on different streams (NVSHMEM's internal
+// stream) shared slot 0 and hit the ptx_cta_info SM index assertion. Each live core now holds a
+// unique slot; released slots are reused lowest first.
+unsigned yasai_acquire_cta_slot();
+//   slot: a slot from yasai_acquire_cta_slot
+void yasai_release_cta_slot(unsigned slot);
+
 class functionalCoreSim : public core_t {
  public:
   functionalCoreSim(kernel_info_t *kernel, gpgpu_sim *g, unsigned warp_size)
       : core_t(g, kernel, warp_size, kernel->threads_per_cta()) {
     m_warpAtBarrier = new bool[m_warp_count];
     m_liveThreadCount = new unsigned[m_warp_count];
+    m_yasai_hw_cta = yasai_acquire_cta_slot();
   }
   virtual ~functionalCoreSim() {
     yasai_free_views();
     warp_exit(0);
     delete[] m_liveThreadCount;
     delete[] m_warpAtBarrier;
+    yasai_release_cta_slot(m_yasai_hw_cta);
   }
   //! executes all warps till completion
   void execute(int inst_count, unsigned ctaid_cp);
