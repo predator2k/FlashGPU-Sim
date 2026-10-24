@@ -534,6 +534,8 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.x128 TC; return X128_OPTION; /* yasai */
 \.cta_group::1 TC; return TCGEN05_CTA_GROUP_1_OPTION;
 \.block_scale TC; return TCGEN05_BLOCK_SCALE_OPTION; /* yasai: block-scaled tcgen05.mma / mma */
+\.sp::ordered_metadata TC; return MMA_SP_OPTION; /* yasai: sparse mma written after .kind (block-scaled sparse mma) */
+\.sp TC; return MMA_SP_OPTION; /* yasai: see .sp::ordered_metadata */
 \.scale_vec::1X TC; return TCGEN05_SCALE_VEC_1X_OPTION; /* yasai */
 \.scale_vec::2X TC; return TCGEN05_SCALE_VEC_2X_OPTION; /* yasai */
 \.scale_vec::4X TC; return TCGEN05_SCALE_VEC_4X_OPTION; /* yasai */

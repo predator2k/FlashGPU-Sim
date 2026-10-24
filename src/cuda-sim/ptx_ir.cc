@@ -1821,6 +1821,7 @@ ptx_instruction::ptx_instruction(
       case X64_OPTION:
       case X128_OPTION:
       case TCGEN05_BLOCK_SCALE_OPTION:  // yasai: read by the tcgen05/mma handlers
+      case MMA_SP_OPTION:  // yasai: sparse mma written after .kind (tensor_mma_sp_impl)
       case TCGEN05_SCALE_VEC_1X_OPTION:
       case TCGEN05_SCALE_VEC_2X_OPTION:
       case TCGEN05_SCALE_VEC_4X_OPTION:

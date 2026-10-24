@@ -1,8 +1,14 @@
 // yasai: functional model of the sparse warp-level MMA, mma.sp{::ordered_metadata}.sync.aligned
 // (PTX ISA 9.7.16.6), with structured-sparse A: f16/bf16 (m16n8k16, m16n8k32), tf32
 // (m16n8k8, m16n8k16), s8/u8 (m16n8k32, m16n8k64), FP8/FP6/FP4 of .kind::f8f6f4 (m16n8k64),
-// s4/u4 (m16n8k64, m16n8k128) and e2m1 of .kind::mxf4/.kind::mxf4nvf4 without scaling
-// (m16n8k128), with f32, f16 or s32 accumulators.
+// s4/u4 (m16n8k64, m16n8k128) and e2m1 of .kind::mxf4/.kind::mxf4nvf4 (m16n8k128), with f32,
+// f16 or s32 accumulators, and the block-scaled kinds (.block_scale with .scale_vec::NX).
+//
+// Block scaling (operands 6-9 after e and f: scale-a-data, {byte-id-a, thread-id-a},
+// scale-b-data, {byte-id-b, thread-id-b}) uses the scale-factor fragments of the dense
+// block-scaled mma (mma_generic.cc). .scale_vec::NX gives N factors per row over the logical K,
+// so one factor covers K / N logical elements, that is a block of K / (2N) stored elements, as for
+// tcgen05.mma.sp.
 //
 // Storage (PTX ISA 9.7.16.6.1): A is M x K with half of every row zero; its operand holds the
 // M x K/2 packed non-zero elements in the fragment layout of a dense A of shape M x K/2. The
@@ -93,6 +99,16 @@ void sp_read_regs(ptx_thread_info *t, const operand_info &op, ptx_reg_t *out, un
   else out[0] = t->get_reg(op.get_symbol());
 }
 
+/// Value of a block scale factor: ue8m0 (2^(v - 127)) or ue4m3 (unsigned e4m3).
+/// @param t Scale type (UE8M0_TYPE or UE4M3_TYPE).
+/// @param v Scale bits.
+/// @return Value.
+double yasai_scale_value(int t, unsigned v) {
+  using namespace yasai_func;
+  if (t == UE4M3_TYPE) return minifloat_decode(kE4M3, v & 0x7F);
+  return minifloat_decode(kUE8M0, v & 0xFF);
+}
+
 }  // namespace
 
 void tensor_mma_sp_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst, int M, int N,
@@ -105,9 +121,18 @@ void tensor_mma_sp_impl(const ptx_instruction *pI, core_t *core, warp_inst_t ins
     abort();
   }
   const int dtype = types[0], atype = types[1], btype = types[2];
-  bool packed4 = false;
-  for (int opt : pI->get_options())
+  bool packed4 = false, block_scale = false;
+  int scale_vec = 0;
+  for (int opt : pI->get_options()) {
     if (opt == TCGEN05_KIND_MXF4_OPTION || opt == TCGEN05_KIND_MXF4NVF4_OPTION) packed4 = true;
+    if (opt == TCGEN05_BLOCK_SCALE_OPTION) block_scale = true;
+    if (opt == TCGEN05_SCALE_VEC_1X_OPTION) scale_vec = 1;
+    if (opt == TCGEN05_SCALE_VEC_2X_OPTION) scale_vec = 2;
+    if (opt == TCGEN05_SCALE_VEC_4X_OPTION) scale_vec = 4;
+  }
+  if (block_scale && scale_vec == 0) scale_vec = packed4 ? 2 : 1;  // PTX defaults
+  const int sv = block_scale ? scale_vec : 1;
+  const int stype = types.size() > 4 ? types[4] : 0;
   const bool sat = pI->get_mma_saturate();
   // Container bits of an element in the A/B registers.
   auto container = [&](int t) -> unsigned {
@@ -211,6 +236,29 @@ void tensor_mma_sp_impl(const ptx_instruction *pI, core_t *core, warp_inst_t ins
       }
     }
   }
+  // Scale factors (block_scale): SA[m * sv + s] and SB[s * N + n].
+  std::vector<double> SA(M * sv, 1.0), SB(sv * N, 1.0);
+  if (block_scale) {
+    ptx_reg_t sel_a[2], sel_b[2];
+    sp_read_regs(t0, pI->operand_lookup(7), sel_a, 2);
+    sp_read_regs(t0, pI->operand_lookup(9), sel_b, 2);
+    const unsigned bida = sel_a[0].u16, tida = sel_a[1].u16, bidb = sel_b[0].u16,
+                   tidb = sel_b[1].u16;
+    for (int m = 0; m < M; m++) {
+      ptx_reg_t w;
+      sp_read_regs(core->get_thread_info()[tid + (m % 8) * 4 + tida * 2 + m / 8],
+                   pI->operand_lookup(6), &w, 1);
+      for (int s = 0; s < sv; s++)
+        SA[m * sv + s] = yasai_scale_value(stype, (w.u32 >> (8 * (bida + s))) & 0xFF);
+    }
+    for (int n = 0; n < N; n++) {
+      ptx_reg_t w;
+      sp_read_regs(core->get_thread_info()[tid + n * 4 + tidb], pI->operand_lookup(8), &w, 1);
+      for (int s = 0; s < sv; s++)
+        SB[s * N + n] = yasai_scale_value(stype, (w.u32 >> (8 * (bidb + s))) & 0xFF);
+    }
+  }
+  const int kblk = K / sv;
   const bool integer = (dtype == S32_TYPE);
   const operand_info &od = pI->operand_lookup(0);
   std::vector<ptx_reg_t> D(M * N);
@@ -229,7 +277,8 @@ void tensor_mma_sp_impl(const ptx_instruction *pI, core_t *core, warp_inst_t ins
         continue;
       }
       double acc = C[m * N + n];
-      for (int k = 0; k < K; k++) acc += A[m * K + k] * B[k * N + n];
+      for (int k = 0; k < K; k++)
+        acc += A[m * K + k] * B[k * N + n] * SA[m * sv + k / kblk] * SB[(k / kblk) * N + n];
       if (c_f16) d.u32 = yasai_func::minifloat_encode_f16(float(acc));
       else d.f32 = float(acc);
     }
