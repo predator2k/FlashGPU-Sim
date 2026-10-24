@@ -1243,8 +1243,12 @@ static bool yasai_packed_binop(const ptx_instruction *pI, ptx_thread_info *threa
   return true;
 }
 
+// yasai: mixed-precision add/sub (.f32.f16 and .f32.bf16), defined before sub_impl.
+static bool yasai_mixed_f32_binop(const ptx_instruction *pI, ptx_thread_info *thread, char op);
+
 void add_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   if (yasai_packed_binop(pI, thread, '+')) return;
+  if (yasai_mixed_f32_binop(pI, thread, '+')) return;  // yasai
   ptx_reg_t src1_data, src2_data, data;
   int overflow = 0;
   int carry = 0;
@@ -5049,6 +5053,11 @@ void mad_def(const ptx_instruction *pI, ptx_thread_info *thread,
       }
       if (mul_type == F16_TYPE) {
         d.f32 = static_cast<float>(a.f16) * static_cast<float>(b.f16) + c.f32;
+      } else if (mul_type == BF16_TYPE) {
+        // yasai: fma.rn.f32.bf16 d, a, b, c; a and b are bf16 bit patterns (the product of two
+        // bf16 values is exact in f32, so a * b + c rounds once)
+        d.f32 = f32_from_bf16_bits(uint16_t(a.u32)) * f32_from_bf16_bits(uint16_t(b.u32)) +
+                c.f32;
       } else {
         d.f32 = a.f32 * b.f32 + c.f32;
       }
@@ -7270,8 +7279,43 @@ void st_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   thread->m_last_memory_space = space;
 }
 
+// yasai: mixed-precision add and sub (PTX ISA 8.6, sm_100 and later):
+// add{.rnd}{.sat}.f32.atype d, a, c and sub{.rnd}{.sat}.f32.atype d, a, c with .atype .f16 or
+// .bf16. Operand a holds an .atype value and is converted to f32 exactly; c and d are f32. The
+// result is rounded once with the instruction's rounding mode (.rn when none is given) and .sat
+// clamps it to [0, 1]. Triton emits these for bf16 element-wise kernels on sm_120.
+// @param pI Instruction.
+// @param thread Executing thread.
+// @param op '+' for add, '-' for sub.
+// @return True when the instruction is the mixed form and has been executed.
+static bool yasai_mixed_f32_binop(const ptx_instruction *pI, ptx_thread_info *thread, char op) {
+  const std::list<int> types = pI->get_scalar_type();
+  if (types.size() != 2 || types.front() != F32_TYPE) return false;
+  const int a_type = types.back();
+  if (a_type != F16_TYPE && a_type != BF16_TYPE) return false;
+  const operand_info &dst = pI->dst();
+  const uint16_t a_bits =
+      uint16_t(thread->get_operand_value(pI->src1(), dst, B16_TYPE, thread, 1).u32);
+  const float a = packed_half_to_f32(a_bits, a_type == BF16_TYPE);
+  const float c = thread->get_operand_value(pI->src2(), dst, F32_TYPE, thread, 1).f32;
+  const int orig_rm = fegetround();
+  set_fenv_rounding_mode(pI->rounding_mode());
+  // volatile operands: the compiler may not move the arithmetic across the rounding change
+  volatile float va = a, vc = c;
+  volatile float v = op == '+' ? va + vc : va - vc;
+  fesetround(orig_rm);
+  float r = v;
+  if (pI->saturation_mode()) r = r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
+  ptx_reg_t d;
+  d.u64 = 0;
+  d.f32 = r;
+  thread->set_operand_value(dst, d, F32_TYPE, thread, pI);
+  return true;
+}
+
 void sub_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   if (yasai_packed_binop(pI, thread, '-')) return;  // yasai
+  if (yasai_mixed_f32_binop(pI, thread, '-')) return;  // yasai
   ptx_reg_t data;
   int overflow = 0;
   int carry = 0;

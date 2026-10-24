@@ -11,6 +11,16 @@
 // and run), in a copy of the file; .visible, .extern and .weak names keep resolving across
 // modules by name. local_name() maps a name that the host registers for a module
 // (__cudaRegisterVar of a static device variable) to the module's renamed symbol.
+//
+// Kernels (.entry) have linkage, but separate modules may still define the same kernel name
+// with different bodies (two Inductor graphs both compile a "triton_poi_fused_..._0"; two
+// libraries instantiate the same template kernel). The first unit that defines a kernel name
+// keeps it; a file of another unit gets the kernel renamed with its module suffix. A unit is a
+// library (all PTX files with one library key: the architecture variants of one library share
+// their kernels, the first definition winning as before) or one module loaded by the driver API
+// (its PTX path). module_entry_name() maps a kernel name for a driver-API module
+// (cuModuleGetFunction), library_entry_name() for a fat binary's library (__cudaRegisterFunction),
+// and source_name() maps a renamed kernel back to its source name (records, cuKernelGetName).
 #ifndef YASAI_MODULE_SCOPE_H_INCLUDED
 #define YASAI_MODULE_SCOPE_H_INCLUDED
 
@@ -25,8 +35,37 @@ namespace yasai_scope {
 /// keeps its lines, so line-keyed information (SASS guides, debug output) still applies. A path
 /// is scanned once per process; later calls return the same copy.
 /// @param path PTX file.
+/// @param unit Unit that owns the file's kernels: "" for a file of a library or program (the
+///        file name without its index and architecture parts), library_unit() of the library
+///        when the caller knows it, the PTX path for a module loaded through the driver API.
 /// @return The file to parse.
-std::string scope_file(const std::string &path);
+std::string scope_file(const std::string &path, const std::string &unit = "");
+
+/// The symbol of kernel name in the module loaded from path (scope_file's path): the renamed
+/// symbol when the module's kernel was renamed, otherwise name.
+/// @param path PTX file of the module, as passed to scope_file.
+/// @param name Kernel name as the program asks for it.
+/// @return The name to look up.
+std::string module_entry_name(const std::string &path, const std::string &name);
+
+/// The symbol of kernel name for a fat binary of library: the renamed symbol when that
+/// library's file renamed the kernel, otherwise name.
+/// @param name Kernel name as the host registers it.
+/// @param library File name of the fat binary that registers it ("" when unknown).
+/// @return The name to look up.
+std::string library_entry_name(const std::string &name, const std::string &library);
+
+/// Unit of a library's PTX files for scope_file: the library key of the library's file name
+/// ("libfoo" for "/path/libfoo.so.1"). Files extracted from a library may be named after its
+/// source files, so a caller that knows the library passes this unit.
+/// @param library Path or file name of the library.
+/// @return The unit.
+std::string library_unit(const std::string &library);
+
+/// Source name of a kernel symbol: the original name of a renamed kernel, otherwise name.
+/// @param name Kernel symbol.
+/// @return The name the program and the reference runs use.
+std::string source_name(const std::string &name);
 
 /// The renamed symbol for a module-local name registered by the host, or name itself when no
 /// module renamed it. The candidate whose file has the library key of library (the fat

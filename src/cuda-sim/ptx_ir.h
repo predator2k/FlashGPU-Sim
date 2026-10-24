@@ -1615,7 +1615,12 @@ class function_info {
     assert(arg != NULL);
     m_args.push_back(arg);
   }
-  void remove_args() { m_args.clear(); }
+  // yasai: a redeclaration (the same module image loaded again) declares the parameters anew,
+  // so the parameter table is cleared with the argument list.
+  void remove_args() {
+    m_args.clear();
+    m_ptx_kernel_param_info.clear();
+  }
   unsigned num_args() const { return m_args.size(); }
   unsigned get_args_aligned_size();
 
