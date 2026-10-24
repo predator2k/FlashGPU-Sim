@@ -126,6 +126,7 @@
 #include <sys/stat.h>
 #include <vector>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #ifdef OPENGL_SUPPORT
 #define GL_GLEXT_PROTOTYPES
@@ -3033,9 +3034,22 @@ __host__ cudaError_t CUDARTAPI cudaMallocArray(
   return cudaMallocArrayInternal(array, desc, width, height);
 }
 
+// yasai: managed allocations (cudaMallocManaged), which cudaFree releases as host memory.
+static std::set<void *> g_yasai_managed;
+// yasai: guards g_yasai_managed.
+static std::mutex g_yasai_managed_mutex;
+
 __host__ cudaError_t CUDARTAPI cudaFree(void *devPtr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_yasai_managed_mutex);
+    if (g_yasai_managed.erase(devPtr)) {
+      host_window::remove(reinterpret_cast<uint64_t>(devPtr));
+      free(devPtr);
+      return g_last_cudaError = cudaSuccess;
+    }
   }
   // yasai: unmaps the allocation's segment (device addresses are not reused).
   yasai_vmm::free_device(reinterpret_cast<uint64_t>(devPtr));
@@ -5588,6 +5602,42 @@ cudaError_t CUDARTAPI cudaHostAlloc(void **pHost, size_t bytes,
 cudaError_t CUDARTAPI cudaHostGetDevicePointer(void **pDevice, void *pHost,
                                                unsigned int flags) {
   return cudaHostGetDevicePointerInternal(pDevice, pHost, flags);
+}
+
+// yasai: managed memory is mapped host memory, which kernels access in place (device address ==
+// host address), so the host and the device see one copy as with unified memory. cudaFree
+// releases it. bitsandbytes (paged optimizers) uses it.
+//   devPtr: receives the allocation; size: bytes; flags: cudaMemAttachGlobal or
+//   cudaMemAttachHost (both give the same mapping here)
+__host__ cudaError_t CUDARTAPI cudaMallocManaged(void **devPtr, size_t size, unsigned int flags) {
+  if (g_debug_execution >= 3) {
+    announce_call(__my_func__);
+  }
+  (void)flags;
+  if (devPtr == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  const cudaError_t e = cudaHostAllocInternal(devPtr, size, cudaHostAllocMapped);
+  if (e != cudaSuccess) return e;
+  std::lock_guard<std::mutex> lock(g_yasai_managed_mutex);
+  g_yasai_managed.insert(*devPtr);
+  return g_last_cudaError = cudaSuccess;
+}
+
+// yasai: prefetching moves managed pages between host and device on a real GPU. Here managed
+// memory is one host copy that kernels access in place, so there is nothing to move; the call
+// only checks its arguments.
+//   devPtr: start of the range; count: bytes; location: destination; flags: must be 0;
+//   stream: stream the prefetch would be ordered on
+__host__ cudaError_t CUDARTAPI cudaMemPrefetchAsync(const void *devPtr, size_t count,
+                                                    struct cudaMemLocation location,
+                                                    unsigned int flags, cudaStream_t stream) {
+  if (g_debug_execution >= 3) {
+    announce_call(__my_func__);
+  }
+  (void)count;
+  (void)location;
+  (void)stream;
+  if (devPtr == NULL || flags != 0) return g_last_cudaError = cudaErrorInvalidValue;
+  return g_last_cudaError = cudaSuccess;
 }
 
 __host__ cudaError_t CUDARTAPI
