@@ -7017,10 +7017,13 @@ extern "C" CUresult CUDAAPI cuTensorMapEncodeTiled(
     announce_call(__my_func__);
   }
 
-  // Null pointer checks
-  if (!tensorMap || !globalAddress || !globalDim || !globalStrides ||
-      !boxDim || !elementStrides)
+  // Null pointer checks. yasai: a NULL global address is a placeholder: CUTLASS's SM100 grouped
+  // GEMMs encode a template descriptor with no address and dummy strides, then set the address,
+  // dimensions and strides of each group on the device (tensormap.replace), so the stride checks
+  // below are skipped for it.
+  if (!tensorMap || !globalDim || !globalStrides || !boxDim || !elementStrides)
     return CUDA_ERROR_INVALID_VALUE;
+  const bool yasai_placeholder = globalAddress == NULL;
 
   // tensorRank: must be 1-5
   if (tensorRank < 1 || tensorRank > 5)
@@ -7044,7 +7047,7 @@ extern "C" CUresult CUDAAPI cuTensorMapEncodeTiled(
   }
 
   // globalStrides: must be a multiple of 16 and < 2^40
-  for (cuuint32_t i = 0; i < tensorRank - 1; i++) {
+  for (cuuint32_t i = 0; i < tensorRank - 1 && !yasai_placeholder; i++) {
     if (globalStrides[i] % 16 != 0)
       return CUDA_ERROR_INVALID_VALUE;
     if (globalStrides[i] >= (1ULL << 40))
