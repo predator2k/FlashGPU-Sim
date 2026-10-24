@@ -914,7 +914,9 @@ class exec_gpgpu_sim : public gpgpu_sim {
  public:
   exec_gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
       : gpgpu_sim(config, ctx) {
-    createSIMTCluster();
+    // yasai experiment: YASAI_FUNC_SKIP_CORES=1 builds no SIMT core clusters (memory test).
+    if (getenv("YASAI_FUNC_SKIP_CORES") == NULL) createSIMTCluster();
+    else m_cluster = NULL;
   }
 
   virtual void createSIMTCluster();
