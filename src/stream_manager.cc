@@ -665,6 +665,23 @@ void stream_manager::yasai_wait_stream(CUstream_st *handle, uint64_t seq) {
   }
 }
 
+void stream_manager::yasai_wait_device() {
+  pthread_mutex_lock(&m_lock);
+  const uint64_t seq = m_yasai_next_seq - 1;
+  pthread_mutex_unlock(&m_lock);
+  unsigned us = 20;
+  for (;;) {
+    uint64_t f = 0;
+    pthread_mutex_lock(&m_lock);
+    bool busy = m_stream_zero.yasai_front_seq(&f) && f <= seq;
+    for (CUstream_st *b : m_streams)
+      if (!busy && b->yasai_front_seq(&f) && f <= seq) busy = true;
+    pthread_mutex_unlock(&m_lock);
+    if (!busy) return;
+    yasai_backoff(&us);
+  }
+}
+
 uint64_t stream_manager::push(stream_operation op) {
   struct CUstream_st *stream = yasai_resolve(op.get_stream());
   op.set_stream(stream);
