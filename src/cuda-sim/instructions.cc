@@ -3195,9 +3195,20 @@ ptx_reg_t d2x(ptx_reg_t x, unsigned from_width, unsigned to_width, int to_sign,
     }
   } else {
     switch (to_width) {
-      case 16:
-        assert(0);
+      case 16: {
+        // yasai: cvt.{rn,rz,rm,rp}.f16.f64 (ThunderKittens' half vectors), rounded once from
+        // f64 in the instruction's rounding mode.
+        const int old_mode = fegetround();
+        fesetround(rounding_mode == RZ_OPTION   ? FE_TOWARDZERO
+                   : rounding_mode == RM_OPTION ? FE_DOWNWARD
+                   : rounding_mode == RP_OPTION ? FE_UPWARD
+                                                : FE_TONEAREST);
+        const _Float16 h = static_cast<_Float16>(x.f64);
+        fesetround(old_mode);
+        y.u64 = 0;
+        memcpy(&y.u16, &h, sizeof h);
         break;
+      }
       case 32:
         y.f32 = x.f64;
         break;
