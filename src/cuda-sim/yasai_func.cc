@@ -112,6 +112,8 @@ const Config &config() {
     c.cta_sample = env_flag("YASAI_CTA_SAMPLE");
     if (const char *d = std::getenv("YASAI_TRACE_DIR")) c.trace_dir = d;
     if (const char *r = std::getenv("YASAI_LAUNCH_ONLY_REGEX")) c.launch_only_regex = r;
+    if (const char *r = std::getenv("YASAI_CTA_SAMPLE_REGEX")) c.cta_sample_regex = r;
+    if (const char *r = std::getenv("YASAI_CTA_SAMPLE_EXCLUDE_REGEX")) c.cta_sample_exclude_regex = r;
     if (const char *m = std::getenv("YASAI_TRACE_MAX_MB"))
       c.trace_max_bytes = std::strtoull(m, nullptr, 10) << 20;
     return c;
@@ -121,6 +123,8 @@ const Config &config() {
 
 // True while the current kernel matches YASAI_LAUNCH_ONLY_REGEX (set by kernel_begin).
 static bool g_launch_only = false;
+// True while the current kernel is CTA-sampled by YASAI_CTA_SAMPLE_REGEX (set by kernel_begin).
+static bool g_sample_kernel = false;
 
 void kernel_begin(const std::string &name, Dim3 grid, Dim3 block) {
   g_counters = KernelCounters();
@@ -129,6 +133,14 @@ void kernel_begin(const std::string &name, Dim3 grid, Dim3 block) {
     static const std::regex rx(config().launch_only_regex);
     g_launch_only = std::regex_search(name, rx);
     if (g_launch_only) std::printf("yasai-func launch-only kernel=%s\n", name.c_str());
+  }
+  g_sample_kernel = false;
+  if (!config().cta_sample_regex.empty()) {
+    static const std::regex allow(config().cta_sample_regex);
+    static const std::regex deny(config().cta_sample_exclude_regex.empty()
+                                     ? std::string("$^") : config().cta_sample_exclude_regex);
+    g_sample_kernel = std::regex_search(name, allow) && !std::regex_search(name, deny);
+    if (g_sample_kernel) std::printf("yasai-func cta-sampled kernel=%s\n", name.c_str());
   }
   g_grid = grid;
   g_block = block;
@@ -396,7 +408,7 @@ bool launch_only() { return g_launch_only; }
 
 bool cta_is_representative(Dim3 g, unsigned cta_linear_id) {
   if (g_launch_only) return false;
-  if (!config().cta_sample) return true;
+  if (!config().cta_sample && !g_sample_kernel) return true;
   const unsigned x = cta_linear_id % g.x;
   const unsigned y = (cta_linear_id / g.x) % g.y;
   const unsigned z = cta_linear_id / (g.x * g.y);

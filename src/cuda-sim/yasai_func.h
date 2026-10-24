@@ -50,6 +50,13 @@ struct Config {
   // outputs keep the previous memory contents. Meant for kernels whose values do not matter in a
   // run, such as the random initialization of dummy weights; empty disables.
   std::string launch_only_regex;
+  // YASAI_CTA_SAMPLE_REGEX: CTA sampling (as YASAI_CTA_SAMPLE) only for kernels whose mangled
+  // name matches, and YASAI_CTA_SAMPLE_EXCLUDE_REGEX names kernels that always run every CTA
+  // even when they match (persistent, stream-K, split-K kernels: their CTAs are not independent).
+  // Meant for an allowlist of GEMM and attention kernels whose CTAs are independent and whose
+  // work is an affine function of the CTA coordinates; empty disables.
+  std::string cta_sample_regex;
+  std::string cta_sample_exclude_regex;
 };
 
 // Returns the process-wide configuration.
