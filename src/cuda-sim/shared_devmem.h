@@ -6,11 +6,14 @@
 // descriptors, cuMemImportFromShareableHandle, cuMemMap) and through multicast objects
 // (cuMulticastCreate, cuMulticastBindMem, multimem.* instructions). RDMA NICs (rxe) register
 // device buffers with ibv_reg_mr. This module backs all of them with memfd segments:
-//   * Device memory (cudaMalloc, and cuMemCreate allocations once mapped) is a memfd mapped
-//     MAP_SHARED at its device address, which comes from the simulator's device heap. The device
+//   * Device memory (cuMemCreate allocations once mapped, and cudaMalloc memory once exported by
+//     legacy IPC) is a memfd mapped MAP_SHARED at its device address, which comes from the simulator's device heap. The device
 //     address therefore equals the host virtual address (identity mapping, as for mapped host
 //     memory), and the range is registered in host_window as device memory, so kernels, copies,
 //     host threads and other processes see the same bytes with acquire/release visibility.
+//     cudaMalloc memory starts as private anonymous memory at its device address, so reading a
+//     page that was never written maps the zero page and costs no memory (a read fault on a
+//     memfd hole allocates the page); YASAI_DEVMEM_EAGER_MEMFD=1 maps a memfd at once.
 //     YASAI_DEVMEM_HOST=0 restores the simulator's own storage for cudaMalloc (legacy IPC then
 //     moves an allocation into a memfd when it is first exported).
 //   * A segment is reached from another process through its owner's descriptor, by the path
@@ -52,8 +55,9 @@ bool devmem_host_enabled();
 /// Granularity of physical allocations, mappings and multicast objects (2 MiB, as on GPUs).
 size_t granularity();
 
-/// cudaMalloc in host memory mode: maps a new segment of `size` bytes (rounded up to a page) at
-/// device address `va` and records the allocation.
+/// cudaMalloc in host memory mode: maps `size` bytes (rounded up to a page) of private anonymous
+/// memory at device address `va` and records the allocation; its first legacy IPC export moves it
+/// into a segment. With YASAI_DEVMEM_EAGER_MEMFD=1 a segment is mapped at once.
 /// @param va Page-aligned device heap address that owns the rounded length.
 /// @param size Length in bytes.
 /// @return True on success; on failure nothing is mapped or recorded.
@@ -162,6 +166,13 @@ bool range_of(uint64_t addr, uint64_t *base, size_t *size);
 /// @return True on success.
 bool ipc_export(uint64_t addr, const read_fn &read_old, std::string *ref, uint64_t *base,
                 size_t *size);
+
+/// Whether a legacy IPC export of the allocation that holds `addr` copies it into a new segment
+/// first (the allocation has none yet); the caller then synchronizes the device, so that no
+/// kernel writes the allocation during the copy.
+/// @param addr Address inside a cudaMalloc allocation.
+/// @return True when the export will copy.
+bool export_needs_copy(uint64_t addr);
 
 /// Legacy IPC open: maps the segment `ref` of `size` bytes at device address `va` (taken by the
 /// caller from the device heap).

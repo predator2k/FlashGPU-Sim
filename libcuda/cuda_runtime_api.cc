@@ -166,6 +166,7 @@ typedef enum CUoutput_mode_enum {
 #include "../src/abstract_hardware_model.h"
 #include "../src/cuda-sim/cuda-sim.h"
 #include "../src/cuda-sim/host_window.h"
+#include "../src/cuda-sim/shared_devmem.h"
 #include "../src/cuda-sim/yasai_module_scope.h"
 #include "yasai_vmm.h"
 #include "../src/cuda-sim/ptx_ir.h"
@@ -4087,6 +4088,10 @@ __host__ cudaError_t CUDARTAPI cudaIpcGetMemHandle(cudaIpcMemHandle_t *handle,
     announce_call(__my_func__);
   }
   if (!handle) return g_last_cudaError = cudaErrorInvalidValue;
+  // yasai: the first export of a cudaMalloc allocation copies it into a shared segment; no
+  // kernel may write it during the copy.
+  if (shared_devmem::export_needs_copy(reinterpret_cast<uint64_t>(devPtr)))
+    cudaDeviceSynchronizeInternal();
   if (!yasai_vmm::ipc_get_mem_handle(yasai_current_gpu(), handle,
                                      reinterpret_cast<uint64_t>(devPtr)))
     return g_last_cudaError = cudaErrorInvalidValue;

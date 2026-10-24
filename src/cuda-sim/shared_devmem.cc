@@ -95,7 +95,10 @@ struct mapping {
 /// One cudaMalloc allocation.
 struct allocation {
   size_t size;   ///< length
-  phys *seg;     ///< its segment (host memory mode or after a legacy IPC export), or nullptr
+  phys *seg;     ///< its segment (after a legacy IPC export, or from the start with
+                 ///< YASAI_DEVMEM_EAGER_MEMFD=1), or nullptr
+  bool anon;     ///< whether the allocation is private anonymous memory at its device address
+                 ///< (host memory mode before any export)
 };
 
 /// Peer segment mapped by this process to reach another device's copy of multicast memory.
@@ -203,6 +206,20 @@ void release_locked(phys *p) {
   delete p;
 }
 
+/// Whether cudaMalloc places a memfd segment at once (YASAI_DEVMEM_EAGER_MEMFD=1) instead of
+/// private anonymous memory that becomes a segment on its first legacy IPC export. Reading a
+/// never-written page of a memfd mapping allocates the page (tmpfs fills a hole on a fault),
+/// while anonymous memory maps the shared zero page, so the default keeps untouched device memory
+/// free for readers (dummy model weights are read by kernels but never written).
+/// @return True with YASAI_DEVMEM_EAGER_MEMFD=1.
+bool eager_memfd() {
+  static const bool on = [] {
+    const char *v = getenv("YASAI_DEVMEM_EAGER_MEMFD");
+    return v && atoi(v) != 0;
+  }();
+  return on;
+}
+
 /// Places object bytes at a fixed address and registers the range; the caller holds st().mu.
 /// @param va Address.
 /// @param size Length.
@@ -284,7 +301,8 @@ void hook_write(void *mc, uint64_t off, size_t bytes, const void *in) {
 
 /// In a forked child: moves every cudaMalloc segment inherited from the parent into a segment
 /// of the child's own (the parent keeps using the old ones), and draws a new token. Refs held by
-/// peers name the parent's descriptors and stay valid for the parent.
+/// peers name the parent's descriptors and stay valid for the parent. Anonymous allocations are
+/// private copy-on-write memory already.
 void after_fork_child() {
   state &s = st();
   new (&s.mu) std::mutex();  // the parent may have held it
@@ -343,6 +361,20 @@ size_t granularity() { return kGranularity; }
 bool alloc_device(uint64_t va, size_t size) {
   init_once();
   const size_t len = round_up(size ? size : 1, kPage);
+  if (!eager_memfd()) {
+    void *r = mmap(reinterpret_cast<void *>(va), len, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+    if (r == MAP_FAILED || reinterpret_cast<uint64_t>(r) != va) {
+      fprintf(stderr, "shared_devmem: anonymous mmap at 0x%llx (%zu bytes) failed: %s\n",
+              (unsigned long long)va, len, r == MAP_FAILED ? strerror(errno) : "moved");
+      if (r != MAP_FAILED) munmap(r, len);
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(st().mu);
+    host_window::add(va, len, host_window::range_kind::device);
+    st().allocs[va] = allocation{size ? size : 1, nullptr, true};
+    return true;
+  }
   int fd = new_memfd(len);
   if (fd < 0) return false;
   std::lock_guard<std::mutex> lock(st().mu);
@@ -350,7 +382,7 @@ bool alloc_device(uint64_t va, size_t size) {
     close(fd);
     return false;
   }
-  st().allocs[va] = allocation{size ? size : 1, wrap_locked(fd, len)};
+  st().allocs[va] = allocation{size ? size : 1, wrap_locked(fd, len), false};
   return true;
 }
 
@@ -477,7 +509,7 @@ bool mapping_at(uint64_t va, phys **p, uint64_t *base, size_t *size, size_t *off
 
 void note_alloc(uint64_t base, size_t size) {
   std::lock_guard<std::mutex> lock(st().mu);
-  st().allocs[base] = allocation{size, nullptr};
+  st().allocs[base] = allocation{size, nullptr, false};
 }
 
 bool forget_alloc(uint64_t base) {
@@ -490,6 +522,9 @@ bool forget_alloc(uint64_t base) {
     host_window::remove(base);
     munmap(reinterpret_cast<void *>(base), len);
     release_locked(p);
+  } else if (it->second.anon) {
+    host_window::remove(base);
+    munmap(reinterpret_cast<void *>(base), round_up(it->second.size, kPage));
   }
   s.allocs.erase(it);
   return true;
@@ -530,7 +565,27 @@ bool ipc_export(uint64_t addr, const read_fn &read_old, std::string *ref, uint64
   if (addr >= it->first + it->second.size) return false;
   allocation &a = it->second;
   const uint64_t b = it->first;
-  if (!a.seg) {
+  if (!a.seg && a.anon) {
+    // Anonymous allocation: its non-zero chunks move into a new segment that then replaces the
+    // anonymous mapping at the same address (pages that were never written stay holes). The
+    // caller has synchronized the device (export_needs_copy), so no kernel writes meanwhile.
+    const size_t len = round_up(a.size, kPage);
+    int fd = new_memfd(len);
+    if (fd < 0) return false;
+    void *tmp = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (tmp == MAP_FAILED) {
+      close(fd);
+      return false;
+    }
+    copy_nonzero(static_cast<char *>(tmp), reinterpret_cast<const char *>(b), len);
+    munmap(tmp, len);
+    if (!place_locked(b, len, 0, fd, false)) {
+      close(fd);
+      return false;
+    }
+    a.seg = wrap_locked(fd, len);
+    a.anon = false;
+  } else if (!a.seg) {
     // Storage allocation (YASAI_DEVMEM_HOST=0): move its contents into a segment mapped at the
     // same address, so the owner's pointers stay valid.
     if (b % kPage) {
@@ -563,6 +618,15 @@ bool ipc_export(uint64_t addr, const read_fn &read_old, std::string *ref, uint64
   *base = b;
   *size = a.size;
   return true;
+}
+
+bool export_needs_copy(uint64_t addr) {
+  std::lock_guard<std::mutex> lock(st().mu);
+  state &s = st();
+  auto it = s.allocs.upper_bound(addr);
+  if (it == s.allocs.begin()) return false;
+  --it;
+  return addr < it->first + it->second.size && !it->second.seg;
 }
 
 bool ipc_open(const char *ref, size_t size, uint64_t va) {
