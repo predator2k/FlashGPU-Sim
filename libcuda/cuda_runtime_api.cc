@@ -1955,6 +1955,10 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyToArrayInternal(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
+  // yasai: a synchronous copy performed at the call; it first waits for the work queued on the
+  // legacy default stream (and the blocking streams), which no longer blocks the host.
+  if (!yasai_stream_manager(ctx)->yasai_host_sync())
+    yasai_stream_manager(ctx)->yasai_wait_stream(NULL, UINT64_MAX);
   CUctx_st *context = GPGPUSim_Context(ctx);
   gpgpu_t *gpu = context->get_device()->get_gpgpu();
   size_t size = count;
@@ -1987,6 +1991,10 @@ __host__ cudaError_t CUDARTAPI cudaMemcpy2DInternal(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
+  // yasai: a synchronous copy performed at the call; it first waits for the work queued on the
+  // legacy default stream (and the blocking streams), which no longer blocks the host.
+  if (!yasai_stream_manager(ctx)->yasai_host_sync())
+    yasai_stream_manager(ctx)->yasai_wait_stream(NULL, UINT64_MAX);
   CUctx_st *context = GPGPUSim_Context(ctx);
   gpgpu_t *gpu = context->get_device()->get_gpgpu();
   size_t size = spitch * height;
@@ -2019,6 +2027,10 @@ __host__ cudaError_t CUDARTAPI cudaMemcpy2DToArrayInternal(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
+  // yasai: a synchronous copy performed at the call; it first waits for the work queued on the
+  // legacy default stream (and the blocking streams), which no longer blocks the host.
+  if (!yasai_stream_manager(ctx)->yasai_host_sync())
+    yasai_stream_manager(ctx)->yasai_wait_stream(NULL, UINT64_MAX);
   CUctx_st *context = GPGPUSim_Context(ctx);
   gpgpu_t *gpu = context->get_device()->get_gpgpu();
   size_t size = spitch * height;
@@ -3410,25 +3422,48 @@ static std::set<void *> g_yasai_managed;
 // yasai: guards g_yasai_managed.
 static std::mutex g_yasai_managed_mutex;
 
-__host__ cudaError_t CUDARTAPI cudaFree(void *devPtr) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
+// yasai: releases an allocation now: a managed allocation as host memory, any other by unmapping
+// its segment (device addresses are not reused).
+// @param devPtr Allocation.
+static void yasai_free_now(void *devPtr) {
   {
     std::lock_guard<std::mutex> lock(g_yasai_managed_mutex);
     if (g_yasai_managed.erase(devPtr)) {
       host_window::remove(reinterpret_cast<uint64_t>(devPtr));
       free(devPtr);
-      return g_last_cudaError = cudaSuccess;
+      return;
     }
   }
-  // yasai: unmaps the allocation's segment (device addresses are not reused).
   yasai_vmm::free_device(reinterpret_cast<uint64_t>(devPtr));
+}
+
+// yasai: host-function form of yasai_free_now, run by the host-callback thread when a
+// cudaFreeAsync reaches the front of its stream.
+// @param devPtr Allocation.
+static void yasai_free_stream_ordered(void *devPtr) { yasai_free_now(devPtr); }
+
+__host__ cudaError_t CUDARTAPI cudaFree(void *devPtr) {
+  if (g_debug_execution >= 3) {
+    announce_call(__my_func__);
+  }
+  // yasai: cudaFree synchronizes the device implicitly, as in CUDA: kernels and copies queued
+  // before it may still use the allocation, now that their launches do not block the host.
+  if (devPtr != NULL) {
+    gpgpu_context *ctx = GPGPU_Context();
+    if (!yasai_stream_manager(ctx)->yasai_host_sync()) yasai_stream_manager(ctx)->yasai_wait_device();
+  }
+  yasai_free_now(devPtr);
   return g_last_cudaError = cudaSuccess;
 }
 __host__ cudaError_t CUDARTAPI cudaFreeHost(void *ptr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
+  }
+  // yasai: synchronizes the device implicitly, as cudaFree does: queued copies may still use the
+  // pinned buffer.
+  if (ptr != NULL) {
+    gpgpu_context *ctx = GPGPU_Context();
+    if (!yasai_stream_manager(ctx)->yasai_host_sync()) yasai_stream_manager(ctx)->yasai_wait_device();
   }
   host_window::remove(reinterpret_cast<uint64_t>(ptr));
   free(ptr);  // this will crash the system if called twice
@@ -10364,9 +10399,18 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyPeerAsync(void *dst, int dstDevice, con
 }
 
 __host__ cudaError_t CUDARTAPI cudaFreeAsync(void *devPtr, cudaStream_t hStream) {
-  // yasai: stream-ordered free is an ordinary free.
-  (void)hStream;
-  return cudaFree(devPtr);
+  // yasai: a stream-ordered free: the allocation is released when the stream reaches the free
+  // (a host-function stream operation), after the work queued before it on the stream. With
+  // YASAI_STREAM_ZERO_HOST_SYNC=1 it is released at the call, as before.
+  if (devPtr == NULL) return g_last_cudaError = cudaSuccess;
+  gpgpu_context *ctx = GPGPU_Context();
+  if (yasai_stream_manager(ctx)->yasai_host_sync()) {
+    yasai_free_now(devPtr);
+    return g_last_cudaError = cudaSuccess;
+  }
+  yasai_stream_manager(ctx)->push(stream_operation::host_fn_op(
+      yasai_free_stream_ordered, devPtr, (struct CUstream_st *)hStream));
+  return g_last_cudaError = cudaSuccess;
 }
 
 // yasai: an opened IPC event shares the exporter's counters, so cudaStreamWaitEvent and

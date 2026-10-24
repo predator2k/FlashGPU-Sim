@@ -369,6 +369,10 @@ class stream_manager {
   /// @param s Stream handle as passed by the application (resolved with yasai_resolve).
   /// @param seq Sequence bound; UINT64_MAX means everything queued so far.
   void yasai_wait_stream(CUstream_st *s, uint64_t seq);
+  /// yasai: waits until every operation queued so far on any stream (the legacy default
+  /// stream, the blocking and the non-blocking streams) has completed: the implicit device
+  /// synchronization of cudaFree. Operations pushed after the call are not waited for.
+  void yasai_wait_device();
   /// yasai: the stream an application handle denotes: NULL and cudaStreamLegacy (0x1) give
   /// NULL (the legacy default stream), cudaStreamPerThread (0x2) gives the calling thread's own
   /// blocking stream, and other handles are returned unchanged.
