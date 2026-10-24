@@ -38,7 +38,8 @@ struct _cuda_device_id {
     m_gpgpu = gpu;
   }
   struct _cuda_device_id *next() { return m_next; }
-  unsigned num_shader() const { return m_gpgpu->get_config().num_shader(); }
+  // yasai: the target's SM count (see gpgpu_sim_config::reported_num_shader).
+  unsigned num_shader() const { return m_gpgpu->get_config().reported_num_shader(); }
   int num_devices() const {
     if (m_next == NULL)
       return 1;

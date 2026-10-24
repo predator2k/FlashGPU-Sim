@@ -326,6 +326,14 @@ gpgpu_sim *gpgpu_context::gpgpu_ptx_sim_init_perf() {
       opp);  // register GPU microrachitecture options
 
   option_parser_cmdline(opp, sg_argc, sg_argv);  // parse configuration options
+  // yasai: functional simulation builds a GPU model with few cores (see yasai_size_exec_gpu).
+  // The configuration's -gpgpu_ptx_sim_mode has just overwritten the environment's mode, and
+  // each launch reads PTX_SIM_MODE_FUNC again, so the environment decides here as well.
+  {
+    const char *m = getenv("PTX_SIM_MODE_FUNC");
+    const bool functional = (m != NULL && atoi(m) != 0) || func_sim->g_ptx_sim_mode != 0;
+    the_gpgpusim->g_the_gpu_config->yasai_size_exec_gpu(functional);
+  }
   fprintf(stdout, "GPGPU-Sim: Configuration options:\n\n");
   option_parser_print(opp, stdout);
   // Set the Numeric locale to a standard locale where a decimal point is a

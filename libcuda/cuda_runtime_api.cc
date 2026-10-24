@@ -287,7 +287,8 @@ struct _cuda_device_id *gpgpu_context::GPGPUSim_Init() {
     prop->clockRate = the_gpu->shader_clock();
 #endif
 #if (CUDART_VERSION >= 2010)
-    prop->multiProcessorCount = the_gpu->get_config().num_shader();
+    // yasai: the target's SM count, also when the functional GPU model has fewer cores.
+    prop->multiProcessorCount = the_gpu->get_config().reported_num_shader();
 #endif
 #if (CUDART_VERSION >= 4000)
     prop->maxThreadsPerMultiProcessor = the_gpu->threads_per_core();
@@ -2118,7 +2119,7 @@ cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlagsInternal(
     }
     // create kernel_info based on entry
     dim3 gridDim(context->get_device()->get_gpgpu()->max_cta_per_core() *
-                 context->get_device()->get_gpgpu()->get_config().num_shader());
+                 context->get_device()->get_gpgpu()->get_config().reported_num_shader());
     dim3 blockDim(blockSize);
     // because this fuction is only checking for resource requirements, we do
     // not care which stream this kernel runs at, just picked -1

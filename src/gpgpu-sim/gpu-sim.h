@@ -468,6 +468,29 @@ class gpgpu_sim_config : public power_config,
       : m_shader_config(ctx), m_memory_config(ctx) {
     m_valid = false;
     gpgpu_ctx = ctx;
+    m_reported_num_shader = 0;
+  }
+  // yasai: sizes the executing GPU of functional simulation; called after the options are
+  // parsed and before init(). The functional simulator executes CTAs on functionalCoreSim
+  // objects, not on the shader cores of the timing model, yet the GPU model built those cores
+  // for every SM of the target (about 20 MB each: 3.8 GB at the 170 SMs of SM120_RTX5090, 0.5 GB
+  // with one). In functional mode the GPU is built with YASAI_FUNC_EXEC_SMS cores (default 1;
+  // 0 keeps the target's), and the target's SM count is kept for everything the program can
+  // observe (reported_num_shader: device properties, attributes, occupancy).
+  //   functional: true in functional simulation (PTX_SIM_MODE_FUNC=1)
+  void yasai_size_exec_gpu(bool functional) {
+    m_reported_num_shader = m_shader_config.num_shader();
+    if (!functional) return;
+    const char *e = getenv("YASAI_FUNC_EXEC_SMS");
+    const int n = e != NULL ? atoi(e) : 1;
+    if (n <= 0 || (unsigned)n >= m_reported_num_shader) return;
+    m_shader_config.n_simt_clusters = (unsigned)n;
+    m_shader_config.n_simt_cores_per_cluster = 1;
+  }
+  // yasai: SM count of the target configuration, which the program sees; num_shader() is the
+  // number of cores the GPU model was built with (see yasai_size_exec_gpu).
+  unsigned reported_num_shader() const {
+    return m_reported_num_shader ? m_reported_num_shader : num_shader();
   }
   void reg_options(class OptionParser *opp);
   void init() {
@@ -507,6 +530,8 @@ class gpgpu_sim_config : public power_config,
   unsigned num_shader() const { return m_shader_config.num_shader(); }
   unsigned num_cluster() const { return m_shader_config.n_simt_clusters; }
   unsigned get_max_concurrent_kernel() const { return max_concurrent_kernel; }
+  // yasai: SM count of the target configuration (see yasai_size_exec_gpu); 0 until sized.
+  unsigned m_reported_num_shader;
 
   /**
    * @brief Check if we are in SST mode
