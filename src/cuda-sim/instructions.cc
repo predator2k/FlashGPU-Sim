@@ -41,6 +41,7 @@
 #include "ptx_ir.h"
 #include "ptx_sim.h"
 #include "host_window.h"
+#include "fio_window.h"
 #include "shared_devmem.h"
 typedef void *yyscan_t;
 class ptx_recognizer;
@@ -2032,7 +2033,13 @@ void tensormap_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
 void fence_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   // fence instruction - memory barrier
-  // Currently treated as NOP since memory ordering is not simulated
+  // Currently treated as NOP since memory ordering is not simulated, except that a system-scope
+  // fence (fence.*.sys) makes this process's pending unordered FIO writes visible (fio_window).
+  for (int opt : pI->get_options())
+    if (opt == SYS_OPTION) {
+      fio_window::fence("fence");
+      break;
+    }
   GPPRINTF_INST_EXEC(WIP, "[STUB] fence instruction not implemented%s\n", "");
   // yasai: as membar, a host fence orders the stores of pool threads.
   std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -5414,10 +5421,15 @@ void max_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 }
 
 void membar_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
-  // handled by timing simulator
+  // handled by timing simulator; a system-scope membar also flushes pending unordered FIO writes.
   // yasai: CTAs on other pool threads (YASAI_FUNC_THREADS) observe the stores before the fence
   // no later than the stores after it.
   std::atomic_thread_fence(std::memory_order_seq_cst);
+  for (int opt : pI->get_options())
+    if (opt == SYS_OPTION) {
+      fio_window::fence("fence");
+      break;
+    }
 }
 
 void min_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
