@@ -1342,6 +1342,10 @@ static std::list<operand_info> check_operands(
     int opcode, const std::list<int> &scalar_type,
     const std::list<operand_info> &operands, gpgpu_context *ctx) {
   static int g_warn_literal_operands_two_type_inst;
+  // yasai: mixed-precision add and sub (.f32.f16, .f32.bf16) check their operands as f32
+  // instructions: a literal operand there is the f32 operand c, which takes the f32 conversion
+  if ((opcode == ADD_OP || opcode == SUB_OP) && scalar_type.size() == 2)
+    return check_operands(opcode, std::list<int>{scalar_type.front()}, operands, ctx);
   if ((opcode == CVT_OP) || (opcode == CVT_PACK_OP) || (opcode == SET_OP) || (opcode == SLCT_OP) ||
       (opcode == TEX_OP) || (opcode == MMA_OP) || (opcode == TENSOR_MMA_OP) ||
       (opcode == FMA_OP) ||
