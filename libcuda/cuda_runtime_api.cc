@@ -2062,6 +2062,9 @@ cudaError_t CUDARTAPI cudaFuncGetAttributesInternal(
     attr->ptxVersion = kinfo->ptx_version;
     attr->binaryVersion = kinfo->sm_target;
 #endif
+    if (g_debug_execution >= 3)
+      printf("GPGPU-Sim PTX: cudaFuncGetAttributes %s: ptxVersion=%d binaryVersion=%d regs=%d\n",
+             entry->get_name().c_str(), attr->ptxVersion, attr->binaryVersion, attr->numRegs);
   } else {
     // yasai: a kernel registered without PTX is not a valid device function (NCCL skips it).
     printf("GPGPU-Sim PTX: cudaFuncGetAttributes: no PTX for %s\n",
