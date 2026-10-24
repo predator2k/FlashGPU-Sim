@@ -810,7 +810,9 @@ static CUresult load_module_from_cuda_library_ptx(CUmodule *module,
 
 // yasai: indexes the PTX of a library registered after start-up (defined after the lazy
 // loading code).
+extern "C" {
 static void yasai_register_library_ptx(gpgpu_context *ctx, unsigned handle, void *fatCubin);
+}
 
 // Internal implementation for cudaRegisterFatBiaryInternal
 void **cudaRegisterFatBiaryInternal_impl(
