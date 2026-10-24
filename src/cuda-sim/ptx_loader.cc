@@ -26,6 +26,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include "yasai_func.h"
 #include "ptx_loader.h"
 #include <dirent.h>
 #include <cctype>
@@ -442,6 +443,7 @@ std::string yasai_scope_block_labels(const std::string &text, bool *changed) {
 
 symbol_table *gpgpu_context::gpgpu_ptx_sim_load_ptx_from_string(
     const char *p, unsigned source_num) {
+  std::lock_guard<std::recursive_mutex> yasai_lock(yasai_func::ptx_load_mutex());
   const std::string normalized = prepare_sass_ptxline_guide(this, p, nullptr);
   if (!normalized.empty()) return init_parser(normalized.c_str());
   char buf[1024];
@@ -483,6 +485,7 @@ symbol_table *gpgpu_context::gpgpu_ptx_sim_load_ptx_from_string(
 
 symbol_table *gpgpu_context::gpgpu_ptx_sim_load_ptx_from_filename(
     const char *filename) {
+  std::lock_guard<std::recursive_mutex> yasai_lock(yasai_func::ptx_load_mutex());
   const std::string normalized =
       prepare_sass_ptxline_guide(this, nullptr, filename);
   std::string parse_path = normalized.empty() ? filename : normalized;

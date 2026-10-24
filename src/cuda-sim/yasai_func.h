@@ -29,6 +29,7 @@
 #define YASAI_FUNC_H
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -261,6 +262,13 @@ uint16_t minifloat_encode_f16(float x);
 // global variable name and returns true, or returns false when no unloaded file defines it.
 // Null until a fat binary is registered lazily.
 extern bool (*g_lazy_load_name)(const char *name);
+
+// Mutex that serializes PTX parsing and lazy loading. The parser and the symbol tables are
+// shared by the whole process, and two threads parse at once when the simulation thread loads
+// a function body lazily (call_impl) while a host thread loads the piece of a kernel it is
+// launching, or a module image; that corrupted the parser state (a double free in call_impl).
+// Recursive, because a lazy load parses through the same entry points.
+std::recursive_mutex &ptx_load_mutex();
 
 // Function handles for function addresses held in data (indirect calls through a table, as in
 // NCCL's ncclDevFuncTable). A handle is kFunctionHandleTag | index; the index is the order in

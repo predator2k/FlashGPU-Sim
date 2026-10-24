@@ -454,6 +454,11 @@ ClusterState *cluster() { return g_cluster; }
 
 bool (*g_lazy_load_name)(const char *name) = nullptr;
 
+std::recursive_mutex &ptx_load_mutex() {
+  static std::recursive_mutex m;
+  return m;
+}
+
 namespace {
 unsigned g_current_rank = 0;  // see current_rank()
 }  // namespace

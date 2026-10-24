@@ -759,6 +759,7 @@ static std::map<unsigned, std::string> &yasai_module_ptx() {
 static CUresult load_module_from_ptx_file(CUmodule *module,
                                           const std::string &ptx_path,
                                           const char *caller) {
+  std::lock_guard<std::recursive_mutex> yasai_lock(yasai_func::ptx_load_mutex());
   gpgpu_context *ctx = GPGPU_Context();
   if (!ctx) {
     printf("ERROR: No active GPGPU context\n");
@@ -5127,6 +5128,7 @@ bool yasai_lazy_load_piece(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i, const
 // yasai_func::g_lazy_load_name: loads the file that defines name (whole-file mode) or the part
 // of it that name needs (per-kernel mode).
 bool yasai_lazy_load_name(const char *name) {
+  std::lock_guard<std::recursive_mutex> yasai_lock(yasai_func::ptx_load_mutex());
   for (yasai_lazy_ptx_t &L : g_yasai_lazy) {
     auto it = L.owner.find(name);
     if (it == L.owner.end()) continue;
