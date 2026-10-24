@@ -8860,6 +8860,15 @@ CUresult CUDAAPI cuFuncSetAttribute(CUfunction hfunc,
     return CUDA_SUCCESS;
   }
 
+  // yasai: attribute 17 (CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE, oversized shared memory beyond the
+  // opt-in limit) is newer than the CUDA 13.0 driver the simulator stands for, which rejects it.
+  // Triton 3.8 tries it first and, on the error, opts in with MAX_DYNAMIC_SHARED_SIZE_BYTES; an
+  // ignored success left the opt-in unset and the launch over 48 KB failed.
+  if ((int)attrib == 17) {
+    printf("GPGPU-Sim PTX: cuFuncSetAttribute SHARED_MEMORY_MODE (17) is not supported\n");
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
   printf("GPGPU-Sim PTX: Execution warning: ignoring call to \"%s "
          "( func=%p, attrib=%d, value=%d )\"\n",
          __my_func__, hfunc, attrib, value);
