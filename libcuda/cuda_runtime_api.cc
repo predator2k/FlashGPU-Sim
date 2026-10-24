@@ -117,6 +117,7 @@
 #include <unistd.h>
 #include <deque>
 #include <fstream>
+#include <atomic>
 #include <mutex>
 #include <functional>
 #include <iomanip>
@@ -299,15 +300,85 @@ struct _cuda_device_id *gpgpu_context::GPGPUSim_Init() {
   return the_device;
 }
 
+// yasai: lazy initialization. The registrations that the constructors of libraries with device
+// code make (__cudaRegisterFatBinary, __cudaRegisterFunction, __cudaRegisterVar,
+// __cudaRegisterTexture) are queued until the first call that needs the context; that call
+// creates the context (configuration, GPU model, device memory) and replays the queue in order.
+// A process that inherits LD_PRELOAD but makes no such call (SGLang's launcher, detokenizer and
+// resource_tracker took about 4 GB each, 2026-10-24) never initializes the simulator.
+// YASAI_SIM_LAZY_INIT=0 registers at once, as before.
+
+// One queued registration.
+struct yasai_deferred_reg {
+  // Kind of registration.
+  enum kind_t { kFatBinary, kFunction, kVar, kTexture } kind;
+  void *fat_cubin;          // kFatBinary: the fat binary wrapper
+  unsigned long long handle;  // fat binary handle returned to the caller (predicted)
+  const char *host_fun;     // kFunction: host stub address
+  char *device_fun;         // kFunction: mangled kernel name
+  const char *device_name;  // kFunction, kVar, kTexture: device name
+  int thread_limit;         // kFunction: thread limit
+  uint3 *tid, *bid;         // kFunction: unused pointers passed through
+  dim3 *bdim, *gdim;        // kFunction: unused pointers passed through
+  char *host_var;           // kVar: host shadow variable
+  char *device_address;     // kVar: device variable name
+  int ext, size, constant, global;  // kVar: flags and size
+  const struct textureReference *tex_ref;  // kTexture: texture reference
+  const void **tex_device_address;  // kTexture: device address
+  int dim, norm;            // kTexture: dimensions and normalization (ext above)
+};
+
+// Queue of registrations made before the context exists.
+static std::vector<yasai_deferred_reg> &yasai_deferred_regs() {
+  static std::vector<yasai_deferred_reg> q;
+  return q;
+}
+
+// Serializes context creation, the replay and the queueing of registrations.
+static std::recursive_mutex &yasai_init_mu() {
+  static std::recursive_mutex mu;
+  return mu;
+}
+
+// True once the context exists and the queue has been replayed.
+static std::atomic<bool> g_yasai_ctx_ready{false};
+
+// Handle the next queued fat binary will get from get_next_fat_bin_handle at replay.
+static unsigned long long g_yasai_deferred_next_handle = 1;
+
+// True when registrations are queued (YASAI_SIM_LAZY_INIT unset or nonzero).
+static bool yasai_lazy_init_enabled() {
+  static const bool on = [] {
+    const char *e = getenv("YASAI_SIM_LAZY_INIT");
+    return e == NULL || atoi(e) != 0;
+  }();
+  return on;
+}
+
+static void yasai_replay_deferred_regs(gpgpu_context *ctx);
+
 CUctx_st *GPGPUSim_Context(gpgpu_context *ctx) {
   // static CUctx_st *the_context = NULL;
+  if (g_yasai_ctx_ready.load(std::memory_order_acquire)) return ctx->the_gpgpusim->the_context;
+  std::lock_guard<std::recursive_mutex> lk(yasai_init_mu());
   CUctx_st *the_context = ctx->the_gpgpusim->the_context;
   if (the_context == NULL) {
     _cuda_device_id *the_gpu = ctx->GPGPUSim_Init();
     ctx->the_gpgpusim->the_context = new CUctx_st(the_gpu);
     the_context = ctx->the_gpgpusim->the_context;
+    // yasai: the replay re-enters here (the context now exists) on this thread only; other
+    // threads wait on the lock until it is done.
+    yasai_replay_deferred_regs(ctx);
+    g_yasai_ctx_ready.store(true, std::memory_order_release);
   }
   return the_context;
+}
+
+// yasai: true when a registration must be queued: lazy initialization on and no context yet.
+// The caller holds yasai_init_mu.
+static bool yasai_defer_registration() {
+  return yasai_lazy_init_enabled() && !g_yasai_ctx_ready.load(std::memory_order_acquire) &&
+         GPGPU_Context()->the_gpgpusim->the_context == NULL;
 }
 
 gpgpu_context *GPGPU_Context();
@@ -1202,6 +1273,47 @@ void cudaRegisterVarInternal(
                                                           size);
   } else
     cuda_not_implemented(__my_func__, __LINE__);
+}
+
+void __cudaRegisterTextureInternal(
+    void **fatCubinHandle, const struct textureReference *hostVar,
+    const void **deviceAddress, const char *deviceName, int dim, int norm, int ext,
+    gpgpu_context *gpgpu_ctx);
+
+// yasai: replays the queued registrations in order (see yasai_deferred_reg). Called once, from
+// GPGPUSim_Context, right after the context is created. A fat binary must get the handle that
+// was returned when it was queued; a different one aborts.
+//   ctx: the simulator context
+static void yasai_replay_deferred_regs(gpgpu_context *ctx) {
+  std::vector<yasai_deferred_reg> q;
+  q.swap(yasai_deferred_regs());
+  if (!q.empty())
+    printf("GPGPU-Sim PTX: yasai lazy init: replaying %zu registrations\n", q.size());
+  for (const yasai_deferred_reg &r : q) {
+    switch (r.kind) {
+      case yasai_deferred_reg::kFatBinary: {
+        void **h = cudaRegisterFatBinaryInternal(r.fat_cubin, ctx);
+        if ((unsigned long long)h != r.handle) {
+          printf("GPGPU-Sim PTX: ERROR ** lazy init: fat binary got handle %llu, queued as %llu\n",
+                 (unsigned long long)h, r.handle);
+          abort();
+        }
+        break;
+      }
+      case yasai_deferred_reg::kFunction:
+        cudaRegisterFunctionInternal((void **)r.handle, r.host_fun, r.device_fun, r.device_name,
+                                     r.thread_limit, r.tid, r.bid, r.bdim, r.gdim, ctx);
+        break;
+      case yasai_deferred_reg::kVar:
+        cudaRegisterVarInternal((void **)r.handle, r.host_var, r.device_address, r.device_name,
+                                r.ext, r.size, r.constant, r.global, ctx);
+        break;
+      case yasai_deferred_reg::kTexture:
+        __cudaRegisterTextureInternal((void **)r.handle, r.tex_ref, r.tex_device_address,
+                                      r.device_name, r.dim, r.norm, r.ext, ctx);
+        break;
+    }
+  }
 }
 
 cudaError_t cudaConfigureCallInternal(dim3 gridDim, dim3 blockDim,
@@ -5766,6 +5878,17 @@ void **CUDARTAPI __cudaRegisterFatBinarySST(const char *fn) {
 
 void **CUDARTAPI __cudaRegisterFatBinary(void *fatCubin) {
   if (!yasai_sim_process_enabled()) return &yasai_disabled_fatbin_handle;
+  {
+    std::lock_guard<std::recursive_mutex> lk(yasai_init_mu());
+    if (yasai_defer_registration()) {
+      yasai_deferred_reg r = {};
+      r.kind = yasai_deferred_reg::kFatBinary;
+      r.fat_cubin = fatCubin;
+      r.handle = g_yasai_deferred_next_handle++;
+      yasai_deferred_regs().push_back(r);
+      return (void **)r.handle;
+    }
+  }
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -5828,6 +5951,24 @@ void CUDARTAPI __cudaRegisterFunction(void **fatCubinHandle,
                                       uint3 *tid, uint3 *bid, dim3 *bDim,
                                       dim3 *gDim) {
   if (!yasai_sim_process_enabled()) return;
+  {
+    std::lock_guard<std::recursive_mutex> lk(yasai_init_mu());
+    if (yasai_defer_registration()) {
+      yasai_deferred_reg r = {};
+      r.kind = yasai_deferred_reg::kFunction;
+      r.handle = (unsigned long long)fatCubinHandle;
+      r.host_fun = hostFun;
+      r.device_fun = deviceFun;
+      r.device_name = deviceName;
+      r.thread_limit = thread_limit;
+      r.tid = tid;
+      r.bid = bid;
+      r.bdim = bDim;
+      r.gdim = gDim;
+      yasai_deferred_regs().push_back(r);
+      return;
+    }
+  }
   cudaRegisterFunctionInternal(fatCubinHandle, hostFun, deviceFun, deviceName,
                                thread_limit, tid, bid, bDim, gDim);
 }
@@ -5864,6 +6005,23 @@ extern void __cudaRegisterVar(
     const char *deviceName,  // name of variable (same as above)
     int ext, int size, int constant, int global) {
   if (!yasai_sim_process_enabled()) return;
+  {
+    std::lock_guard<std::recursive_mutex> lk(yasai_init_mu());
+    if (yasai_defer_registration()) {
+      yasai_deferred_reg r = {};
+      r.kind = yasai_deferred_reg::kVar;
+      r.handle = (unsigned long long)fatCubinHandle;
+      r.host_var = hostVar;
+      r.device_address = deviceAddress;
+      r.device_name = deviceName;
+      r.ext = ext;
+      r.size = size;
+      r.constant = constant;
+      r.global = global;
+      yasai_deferred_regs().push_back(r);
+      return;
+    }
+  }
   cudaRegisterVarInternal(fatCubinHandle, hostVar, deviceAddress, deviceName,
                           ext, size, constant, global);
 }
@@ -5921,6 +6079,22 @@ void __cudaRegisterTexture(
     int ext)  // passes in a newly created textureReference
 {
   if (!yasai_sim_process_enabled()) return;
+  {
+    std::lock_guard<std::recursive_mutex> lk(yasai_init_mu());
+    if (yasai_defer_registration()) {
+      yasai_deferred_reg r = {};
+      r.kind = yasai_deferred_reg::kTexture;
+      r.handle = (unsigned long long)fatCubinHandle;
+      r.tex_ref = hostVar;
+      r.tex_device_address = deviceAddress;
+      r.device_name = deviceName;
+      r.dim = dim;
+      r.norm = norm;
+      r.ext = ext;
+      yasai_deferred_regs().push_back(r);
+      return;
+    }
+  }
   __cudaRegisterTextureInternal(fatCubinHandle, hostVar, deviceAddress,
                                 deviceName, dim, norm, ext);
 }
