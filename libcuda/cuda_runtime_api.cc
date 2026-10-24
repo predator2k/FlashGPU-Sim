@@ -861,6 +861,14 @@ static bool &yasai_ctx_current() {
   return current;
 }
 
+/// yasai: the context states that cuCtxPushCurrent saved on the calling thread (cuCtxPopCurrent
+/// restores them).
+/// @return The calling thread's stack.
+static std::vector<bool> &yasai_ctx_stack() {
+  thread_local std::vector<bool> stack;
+  return stack;
+}
+
 /// Ordinal of the process's first allocation or kernel launch (-1 before it).
 static int g_yasai_used_ordinal = -1;
 
@@ -7519,18 +7527,24 @@ CUresult CUDAAPI cuCtxDestroy(CUcontext ctx) {
 
 #if CUDART_VERSION >= 4000
 CUresult CUDAAPI cuCtxPushCurrent(CUcontext ctx) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: makes the simulated device's one context current; the previous state is kept on the
+  // calling thread's stack for cuCtxPopCurrent.
+  if (ctx == NULL) return CUDA_ERROR_INVALID_VALUE;
+  yasai_ctx_stack().push_back(yasai_ctx_current());
+  yasai_ctx_current() = true;
   return CUDA_SUCCESS;
 }
 
 CUresult CUDAAPI cuCtxPopCurrent(CUcontext *pctx) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
+  // yasai: returns the current context (the simulated device's one context) and restores the
+  // state the matching cuCtxPushCurrent saved; without a current context it fails as the driver
+  // does.
+  if (!yasai_ctx_current()) return CUDA_ERROR_INVALID_CONTEXT;
+  if (pctx != NULL) *pctx = (CUcontext)GPGPUSim_Context(GPGPU_Context());
+  if (!yasai_ctx_stack().empty()) {
+    yasai_ctx_current() = yasai_ctx_stack().back();
+    yasai_ctx_stack().pop_back();
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
   return CUDA_SUCCESS;
 }
 
@@ -9593,17 +9607,23 @@ CUresult CUDAAPI cuCtxDestroy(CUcontext ctx) {
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuCtxPopCurrent(CUcontext *pctx) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
+  // yasai: returns the current context (the simulated device's one context) and restores the
+  // state the matching cuCtxPushCurrent saved; without a current context it fails as the driver
+  // does.
+  if (!yasai_ctx_current()) return CUDA_ERROR_INVALID_CONTEXT;
+  if (pctx != NULL) *pctx = (CUcontext)GPGPUSim_Context(GPGPU_Context());
+  if (!yasai_ctx_stack().empty()) {
+    yasai_ctx_current() = yasai_ctx_stack().back();
+    yasai_ctx_stack().pop_back();
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuCtxPushCurrent(CUcontext ctx) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: makes the simulated device's one context current; the previous state is kept on the
+  // calling thread's stack for cuCtxPopCurrent.
+  if (ctx == NULL) return CUDA_ERROR_INVALID_VALUE;
+  yasai_ctx_stack().push_back(yasai_ctx_current());
+  yasai_ctx_current() = true;
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuStreamDestroy(CUstream hStream) {
