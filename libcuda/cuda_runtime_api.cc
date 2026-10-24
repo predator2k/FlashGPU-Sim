@@ -242,16 +242,25 @@ static size_t yasai_device_mem_bytes(size_t fallback) {
   return (size_t)strtoull(v, NULL, 0) << 20;
 }
 
+// yasai: the device of the target configuration. Its properties come from the parsed
+// configuration (yasai_parse_gpu_config); the GPU model is built only when a context or a stream
+// operation needs it (_cuda_device_id::get_gpgpu), so a process that only queries the device
+// never builds it.
+static std::recursive_mutex &yasai_init_mu();
 struct _cuda_device_id *gpgpu_context::GPGPUSim_Init() {
   _cuda_device_id *the_device = the_gpgpusim->the_cude_device;
+  if (the_device) return the_device;
+  std::lock_guard<std::recursive_mutex> lk(yasai_init_mu());
+  the_device = the_gpgpusim->the_cude_device;
   if (!the_device) {
-    gpgpu_sim *the_gpu = gpgpu_ptx_sim_init_perf();
+    const gpgpu_sim_config *cfg = yasai_parse_gpu_config();
+    const shader_core_config &sc = cfg->yasai_shader_config();
 
     cudaDeviceProp *prop = (cudaDeviceProp *)calloc(sizeof(cudaDeviceProp), 1);
     snprintf(prop->name, sizeof(prop->name), "%s",
              g_gpgpusim_version_string);
-    prop->major = the_gpu->compute_capability_major();
-    prop->minor = the_gpu->compute_capability_minor();
+    prop->major = cfg->yasai_cc_major();
+    prop->minor = cfg->yasai_cc_minor();
     prop->totalGlobalMem = yasai_device_mem_bytes(0x80000000 /* 2 GB */);
     prop->memPitch = 0;
     if (prop->major >= 2) {
@@ -272,33 +281,46 @@ struct _cuda_device_id *gpgpu_context::GPGPUSim_Init() {
     prop->textureAlignment = 0;
     //        * TODO: Update the .config and xml files of all GPU config files
     //        with new value of sharedMemPerBlock and regsPerBlock
-    prop->sharedMemPerBlock = the_gpu->shared_mem_per_block();
+    // yasai: the same values gpgpu_sim's getters return, read from the configuration.
+    prop->sharedMemPerBlock = sc.gpgpu_shmem_per_block;
 #if (CUDART_VERSION > 5050)
-    prop->regsPerMultiprocessor = the_gpu->num_registers_per_core();
-    prop->sharedMemPerMultiprocessor = the_gpu->shared_mem_size();
+    prop->regsPerMultiprocessor = sc.gpgpu_shader_registers;
+    prop->sharedMemPerMultiprocessor = sc.gpgpu_shmem_size;
 #endif
 #if (CUDART_VERSION >= 9000)
-    prop->sharedMemPerBlockOptin = the_gpu->shared_mem_per_block_optin();
+    prop->sharedMemPerBlockOptin =
+        sc.gpgpu_shmem_per_block_optin == 0 ? sc.gpgpu_shmem_per_block
+                                            : sc.gpgpu_shmem_per_block_optin;
 #endif
-    prop->sharedMemPerBlock = the_gpu->shared_mem_per_block();
-    prop->regsPerBlock = the_gpu->num_registers_per_block();
-    prop->warpSize = the_gpu->wrp_size();
+    prop->regsPerBlock = sc.gpgpu_registers_per_block;
+    prop->warpSize = sc.warp_size;
 #if (CUDART_VERSION < 13000)
-    prop->clockRate = the_gpu->shader_clock();
+    prop->clockRate = cfg->get_core_freq() / 1000;
 #endif
 #if (CUDART_VERSION >= 2010)
     // yasai: the target's SM count, also when the functional GPU model has fewer cores.
-    prop->multiProcessorCount = the_gpu->get_config().reported_num_shader();
+    prop->multiProcessorCount = cfg->reported_num_shader();
 #endif
 #if (CUDART_VERSION >= 4000)
-    prop->maxThreadsPerMultiProcessor = the_gpu->threads_per_core();
+    prop->maxThreadsPerMultiProcessor = sc.n_thread_per_shader;
 #endif
-    the_gpu->set_prop(prop);
-    the_gpgpusim->the_cude_device = new _cuda_device_id(the_gpu);
+    the_gpgpusim->the_cude_device = new _cuda_device_id(this, cfg, prop);
     the_device = the_gpgpusim->the_cude_device;
   }
-  start_sim_thread(1);
   return the_device;
+}
+
+// yasai: see cuda_api_object.h. Builds the GPU model of the device's configuration, gives it the
+// properties and starts the simulation thread (which used to start at every GPGPUSim_Init).
+gpgpu_sim *_cuda_device_id::build_gpgpu() {
+  std::lock_guard<std::recursive_mutex> lk(yasai_init_mu());
+  gpgpu_sim *g = m_gpgpu.load(std::memory_order_acquire);
+  if (g != NULL) return g;
+  g = m_ctx->gpgpu_ptx_sim_init_perf();
+  g->set_prop(m_prop);
+  m_gpgpu.store(g, std::memory_order_release);
+  m_ctx->start_sim_thread(1);
+  return g;
 }
 
 // yasai: lazy initialization. The registrations that the constructors of libraries with device
@@ -358,6 +380,15 @@ static bool yasai_lazy_init_enabled() {
 
 static void yasai_replay_deferred_regs(gpgpu_context *ctx);
 
+CUctx_st *GPGPUSim_Context(gpgpu_context *ctx);
+// yasai: the stream manager, which exists once the GPU model is built; the context is created
+// (and the model built) first, as a device query no longer builds it.
+//   ctx: simulator context
+static stream_manager *yasai_stream_manager(gpgpu_context *ctx) {
+  GPGPUSim_Context(ctx);
+  return ctx->the_gpgpusim->g_stream_manager;
+}
+
 CUctx_st *GPGPUSim_Context(gpgpu_context *ctx) {
   // static CUctx_st *the_context = NULL;
   if (g_yasai_ctx_ready.load(std::memory_order_acquire)) return ctx->the_gpgpusim->the_context;
@@ -367,6 +398,7 @@ CUctx_st *GPGPUSim_Context(gpgpu_context *ctx) {
     _cuda_device_id *the_gpu = ctx->GPGPUSim_Init();
     ctx->the_gpgpusim->the_context = new CUctx_st(the_gpu);
     the_context = ctx->the_gpgpusim->the_context;
+    the_gpu->get_gpgpu();  // yasai: a context needs the GPU model
     // yasai: the replay re-enters here (the context now exists) on this thread only; other
     // threads wait on the lock until it is done.
     yasai_replay_deferred_regs(ctx);
@@ -804,7 +836,7 @@ __host__ cudaError_t CUDARTAPI cudaDeviceGetLimitInternal(
   }
   _cuda_device_id *dev = ctx->GPGPUSim_Init();
   const struct cudaDeviceProp *prop = dev->get_prop();
-  const gpgpu_sim_config &config = dev->get_gpgpu()->get_config();
+  const gpgpu_sim_config &config = dev->get_config();  // yasai: no GPU model needed
   switch (limit) {
     case 0:  // cudaLimitStackSize
       *pValue = config.stack_limit();
@@ -1621,7 +1653,7 @@ cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx
   printf("GPGPU-Sim PTX: runtime launch kernel mangled='%s'\n",
          kname.c_str());
   stream_operation op(grid, ctx->func_sim->g_ptx_sim_mode, stream);
-  ctx->the_gpgpusim->g_stream_manager->push(op);
+  yasai_stream_manager(ctx)->push(op);
   ctx->api->g_cuda_launch_stack.pop_back();
   return g_last_cudaError = cudaSuccess;
 }
@@ -1820,13 +1852,13 @@ cudaMemcpyInternal(void *dst, const void *src, size_t count,
   if (g_debug_execution >= 3)
     printf("GPGPU-Sim PTX: cudaMemcpy(): devPtr = %p\n", dst);
   if (kind == cudaMemcpyHostToDevice)
-    ctx->the_gpgpusim->g_stream_manager->push(
+    yasai_stream_manager(ctx)->push(
         stream_operation(src, (size_t)dst, count, 0));
   else if (kind == cudaMemcpyDeviceToHost)
-    ctx->the_gpgpusim->g_stream_manager->push(
+    yasai_stream_manager(ctx)->push(
         stream_operation((size_t)src, dst, count, 0));
   else if (kind == cudaMemcpyDeviceToDevice)
-    ctx->the_gpgpusim->g_stream_manager->push(
+    yasai_stream_manager(ctx)->push(
         stream_operation((size_t)src, (size_t)dst, count, 0));
   else if (kind == cudaMemcpyDefault) {
     // yasai: infer the direction from the simulated heap and the registered host windows
@@ -1839,13 +1871,13 @@ cudaMemcpyInternal(void *dst, const void *src, size_t count,
     };
     const bool sd = is_dev(src), dd = is_dev(dst);
     if (sd && dd)
-      ctx->the_gpgpusim->g_stream_manager->push(
+      yasai_stream_manager(ctx)->push(
           stream_operation((size_t)src, (size_t)dst, count, 0));  // device to device
     else if (sd)
-      ctx->the_gpgpusim->g_stream_manager->push(
+      yasai_stream_manager(ctx)->push(
           stream_operation((size_t)src, dst, count, 0));  // device to host
     else if (dd)
-      ctx->the_gpgpusim->g_stream_manager->push(
+      yasai_stream_manager(ctx)->push(
           stream_operation(src, (size_t)dst, count, 0));  // host to device
     else
       memcpy(dst, src, count);  // host to host
@@ -1983,7 +2015,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyToSymbolInternal(
   printf("GPGPU-Sim PTX: cudaMemcpyToSymbol: symbol = %p\n", symbol);
   // stream_operation( const char *symbol, const void *src, size_t count, size_t
   // offset )
-  ctx->the_gpgpusim->g_stream_manager->push(
+  yasai_stream_manager(ctx)->push(
       stream_operation(src, symbol, count, offset, 0));
   // gpgpu_ptx_sim_memcpy_symbol(symbol,src,count,offset,1,context->get_device()->get_gpgpu());
   return g_last_cudaError = cudaSuccess;
@@ -2005,7 +2037,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyFromSymbolInternal(
   // CUctx_st *context = GPGPUSim_Context();
   assert(kind == cudaMemcpyDeviceToHost);
   printf("GPGPU-Sim PTX: cudaMemcpyFromSymbol: symbol = %p\n", symbol);
-  ctx->the_gpgpusim->g_stream_manager->push(
+  yasai_stream_manager(ctx)->push(
       stream_operation(symbol, dst, count, offset, 0));
   // gpgpu_ptx_sim_memcpy_symbol(symbol,dst,count,offset,0,context->get_device()->get_gpgpu());
   return g_last_cudaError = cudaSuccess;
@@ -2047,15 +2079,15 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyAsyncInternal(
   }
   switch (kind) {
     case cudaMemcpyHostToDevice:
-      ctx->the_gpgpusim->g_stream_manager->push(
+      yasai_stream_manager(ctx)->push(
           stream_operation(snapshot(src), (size_t)dst, count, s));
       break;
     case cudaMemcpyDeviceToHost:
-      ctx->the_gpgpusim->g_stream_manager->push(
+      yasai_stream_manager(ctx)->push(
           stream_operation((size_t)src, dst, count, s));
       break;
     case cudaMemcpyDeviceToDevice:
-      ctx->the_gpgpusim->g_stream_manager->push(
+      yasai_stream_manager(ctx)->push(
           stream_operation((size_t)src, (size_t)dst, count, s));
       break;
     case cudaMemcpyDefault: {
@@ -2070,12 +2102,12 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyAsyncInternal(
       };
       const bool sd = is_dev(src), dd = is_dev(dst);
       if (sd && dd)
-        ctx->the_gpgpusim->g_stream_manager->push(
+        yasai_stream_manager(ctx)->push(
             stream_operation((size_t)src, (size_t)dst, count, s));
       else if (sd)
-        ctx->the_gpgpusim->g_stream_manager->push(stream_operation((size_t)src, dst, count, s));
+        yasai_stream_manager(ctx)->push(stream_operation((size_t)src, dst, count, s));
       else if (dd)
-        ctx->the_gpgpusim->g_stream_manager->push(stream_operation(src, (size_t)dst, count, s));
+        yasai_stream_manager(ctx)->push(stream_operation(src, (size_t)dst, count, s));
       else
         memcpy(dst, src, count);  // host to host
       break;
@@ -2178,7 +2210,7 @@ cudaMemsetAsyncInternal(void *mem, int c, size_t count, cudaStream_t stream = 0,
     GPGPUSim_Context(ctx)->get_device()->get_gpgpu()->gpu_memset((size_t)mem, c, count);
     return g_last_cudaError = cudaSuccess;
   }
-  ctx->the_gpgpusim->g_stream_manager->push(stream_operation::memset_op(
+  yasai_stream_manager(ctx)->push(stream_operation::memset_op(
       (size_t)mem, c, count, (struct CUstream_st *)stream));
   return g_last_cudaError = cudaSuccess;
 }
@@ -2439,7 +2471,7 @@ cudaDeviceGetAttributeInternal(int *value, enum cudaDeviceAttr attr, int device,
         break;
       case 13:
 #if (CUDART_VERSION >= 13000)
-        *value = dev->get_gpgpu()->shader_clock();
+        *value = dev->get_config().get_core_freq() / 1000;  // yasai: no GPU model needed
 #else
         *value = prop->clockRate;
 #endif
@@ -2536,7 +2568,7 @@ cudaDeviceGetAttributeInternal(int *value, enum cudaDeviceAttr attr, int device,
         *value = 3000000;  // value for 1080ti
         break;
       case 39:
-        *value = dev->get_gpgpu()->threads_per_core();
+        *value = prop->maxThreadsPerMultiProcessor;  // yasai: no GPU model needed
         break;
       case 40:
         *value = 0;
@@ -2598,7 +2630,7 @@ cudaDeviceGetAttributeInternal(int *value, enum cudaDeviceAttr attr, int device,
         *value = 0;
         break;
       case 97:  // cudaDevAttrMaxSharedMemoryPerBlockOptin
-        *value = dev->get_gpgpu()->shared_mem_per_block_optin();
+        *value = prop->sharedMemPerBlockOptin;  // yasai: no GPU model needed
         break;
       case 98:  // cudaDevAttrCanFlushRemoteWrites
         *value = 0;
@@ -2884,7 +2916,7 @@ __host__ cudaError_t CUDARTAPI cudaStreamCreateInternal(
   printf("GPGPU-Sim PTX: cudaStreamCreate\n");
 #if (CUDART_VERSION >= 3000)
   *stream = new struct CUstream_st();
-  ctx->the_gpgpusim->g_stream_manager->add_stream(*stream);
+  yasai_stream_manager(ctx)->add_stream(*stream);
 #else
   *stream = 0;
   printf(
@@ -2912,7 +2944,7 @@ __host__ cudaError_t CUDARTAPI cudaStreamDestroyInternal(
   // stream_manager from spinning forever to destroy non-empty streams without
   // making any forward progress.
   stream->synchronize();
-  ctx->the_gpgpusim->g_stream_manager->destroy_stream(stream);
+  yasai_stream_manager(ctx)->destroy_stream(stream);
 #endif
   return g_last_cudaError = cudaSuccess;
 }
@@ -3114,7 +3146,7 @@ __host__ cudaError_t CUDARTAPI cudaEventRecordInternal(
   struct CUstream_st *s = (struct CUstream_st *)stream;
   stream_operation op(e, s);
   e->issue();
-  ctx->the_gpgpusim->g_stream_manager->push(op);
+  yasai_stream_manager(ctx)->push(op);
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -3145,12 +3177,12 @@ __host__ cudaError_t CUDARTAPI cudaStreamWaitEventInternal(
     return g_last_cudaError = cudaSuccess;
   }
   if (!stream) {
-    ctx->the_gpgpusim->g_stream_manager->pushCudaStreamWaitEventToAllStreams(
+    yasai_stream_manager(ctx)->pushCudaStreamWaitEventToAllStreams(
         e, flags);
   } else {
     struct CUstream_st *s = (struct CUstream_st *)stream;
     stream_operation op(s, e, flags);
-    ctx->the_gpgpusim->g_stream_manager->push(op);
+    yasai_stream_manager(ctx)->push(op);
   }
   return g_last_cudaError = cudaSuccess;
 }

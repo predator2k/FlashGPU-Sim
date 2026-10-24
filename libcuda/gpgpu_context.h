@@ -138,6 +138,8 @@ class gpgpu_context {
   void print_ptx_file(const char *p, unsigned source_num, const char *filename);
   class symbol_table *init_parser(const char *);
   class gpgpu_sim *gpgpu_ptx_sim_init_perf();
+  // yasai: the target configuration, parsed once without building the GPU model.
+  class gpgpu_sim_config *yasai_parse_gpu_config();
   void start_sim_thread(int api);
   struct _cuda_device_id *GPGPUSim_Init();
   void ptx_reg_options(option_parser_t opp);

@@ -2,6 +2,7 @@
 #define __cuda_api_object_h__
 
 #include "../src/cuda-sim/yasai_func.h"
+#include <atomic>
 #include <functional>
 #include <list>
 #include <map>
@@ -32,14 +33,23 @@ struct glbmap_entry {
 typedef struct glbmap_entry glbmap_entry_t;
 
 struct _cuda_device_id {
-  _cuda_device_id(gpgpu_sim *gpu) {
+  // yasai: the device of the target configuration cfg with properties prop; the GPU model is
+  // built by get_gpgpu() on first use, so a process that only queries the device never builds
+  // it (SGLang's launcher and detokenizer).
+  //   ctx: simulator context that builds the model
+  //   cfg: parsed target configuration
+  //   prop: properties filled from cfg
+  _cuda_device_id(gpgpu_context *ctx, const gpgpu_sim_config *cfg, cudaDeviceProp *prop) {
     m_id = 0;
     m_next = NULL;
-    m_gpgpu = gpu;
+    m_gpgpu.store(NULL, std::memory_order_relaxed);
+    m_ctx = ctx;
+    m_config = cfg;
+    m_prop = prop;
   }
   struct _cuda_device_id *next() { return m_next; }
   // yasai: the target's SM count (see gpgpu_sim_config::reported_num_shader).
-  unsigned num_shader() const { return m_gpgpu->get_config().reported_num_shader(); }
+  unsigned num_shader() const { return m_config->reported_num_shader(); }
   int num_devices() const {
     if (m_next == NULL)
       return 1;
@@ -52,14 +62,27 @@ struct _cuda_device_id {
     for (unsigned i = 0; i < n; i++) p = p->m_next;
     return p;
   }
-  const struct cudaDeviceProp *get_prop() const { return m_gpgpu->get_prop(); }
+  const struct cudaDeviceProp *get_prop() const { return m_prop; }
   unsigned get_id() const { return m_id; }
+  // yasai: the parsed target configuration (available without the GPU model).
+  const gpgpu_sim_config &get_config() const { return *m_config; }
 
-  gpgpu_sim *get_gpgpu() { return m_gpgpu; }
+  // yasai: the GPU model, built on the first call (build_gpgpu).
+  gpgpu_sim *get_gpgpu() {
+    gpgpu_sim *g = m_gpgpu.load(std::memory_order_acquire);
+    return g != NULL ? g : build_gpgpu();
+  }
+  // yasai: true once the GPU model exists.
+  bool gpgpu_built() const { return m_gpgpu.load(std::memory_order_acquire) != NULL; }
 
  private:
+  // yasai: builds the GPU model and starts the simulation thread (cuda_runtime_api.cc).
+  gpgpu_sim *build_gpgpu();
   unsigned m_id;
-  class gpgpu_sim *m_gpgpu;
+  std::atomic<class gpgpu_sim *> m_gpgpu;  // GPU model; NULL until built
+  gpgpu_context *m_ctx;                     // context that builds it
+  const gpgpu_sim_config *m_config;         // target configuration
+  cudaDeviceProp *m_prop;                   // properties from m_config
   struct _cuda_device_id *m_next;
 };
 

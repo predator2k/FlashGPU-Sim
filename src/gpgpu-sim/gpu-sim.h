@@ -487,6 +487,12 @@ class gpgpu_sim_config : public power_config,
     m_shader_config.n_simt_clusters = (unsigned)n;
     m_shader_config.n_simt_cores_per_cluster = 1;
   }
+  // yasai: per-SM options of the configuration (device properties are filled from them
+  // without building the GPU model).
+  const shader_core_config &yasai_shader_config() const { return m_shader_config; }
+  // yasai: compute capability of the configuration.
+  unsigned yasai_cc_major() const { return gpgpu_compute_capability_major; }
+  unsigned yasai_cc_minor() const { return gpgpu_compute_capability_minor; }
   // yasai: SM count of the target configuration, which the program sees; num_shader() is the
   // number of cores the GPU model was built with (see yasai_size_exec_gpu).
   unsigned reported_num_shader() const {

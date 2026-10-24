@@ -310,7 +310,10 @@ void gpgpu_context::exit_simulation() {
   fflush(stdout);
 }
 
-gpgpu_sim *gpgpu_context::gpgpu_ptx_sim_init_perf() {
+// yasai: parses the target configuration once, without building the GPU model (device
+// queries are answered from it; gpgpu_ptx_sim_init_perf builds the model on first use).
+gpgpu_sim_config *gpgpu_context::yasai_parse_gpu_config() {
+  if (the_gpgpusim->g_the_gpu_config != NULL) return the_gpgpusim->g_the_gpu_config;
   srand(1);
   print_splash();
   func_sim->read_sim_environment_variables();
@@ -341,7 +344,11 @@ gpgpu_sim *gpgpu_context::gpgpu_ptx_sim_init_perf() {
   // system environment variables
   assert(setlocale(LC_NUMERIC, "C"));
   the_gpgpusim->g_the_gpu_config->init();
+  return the_gpgpusim->g_the_gpu_config;
+}
 
+gpgpu_sim *gpgpu_context::gpgpu_ptx_sim_init_perf() {
+  yasai_parse_gpu_config();
   if (the_gpgpusim->g_the_gpu_config->is_SST_mode()) {
     // Create SST specific GPGPUSim
     the_gpgpusim->g_the_gpu =
