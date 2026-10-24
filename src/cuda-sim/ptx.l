@@ -580,6 +580,8 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.wait TC; return WAIT_OPTION;
 \.parity TC; return PARITY_OPTION;
 \.mbarrier_init TC; return MBARRIER_INIT_OPTION;
+\.sync_restrict::shared::cta TC; return SYNC_RESTRICT_OPTION; /* yasai: fence.release/acquire.sync_restrict (PTX 8.6) */
+\.sync_restrict::shared::cluster TC; return SYNC_RESTRICT_OPTION;
 \.shared::cta TC; yylval->int_value = 1; return CTA_OPTION; /* yasai: 1 = state space form */
 \.shared::cluster TC; yylval->int_value = 1; return CLUSTER_OPTION; /* yasai: 1 = state space form */
 \.cluster TC; yylval->int_value = 0; return CLUSTER_OPTION;
