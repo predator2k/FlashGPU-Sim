@@ -33,6 +33,7 @@
 #include <map>
 #include <string>
 #include <cerrno>
+#include <cstring>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -646,7 +647,19 @@ char *get_app_binary_name() {
 void gpgpu_context::gpgpu_ptx_info_load_from_filename(const char *filename,
                                                       const char *arch_str,
                                                       bool compile_only) {
-  std::string ptxas_filename(std::string(filename) + "as");
+  // yasai: the ptxas output goes to a file of this process in the working directory
+  // (<PTX base name>.<host>.<pid>.<n>.ptxas) rather than next to the PTX file: ranks that load one
+  // shared PTX file (a merged NCCL module given with YASAI_PTX_LIB_OVERRIDE) would otherwise write
+  // and read the same <file>as at the same time ("maxthreads == maxnt_id" assertions at 64 ranks).
+  static int ptxas_seq = 0;
+  std::string ptxas_filename;
+  {
+    char host[256] = {0};
+    gethostname(host, sizeof(host) - 1);
+    const char *slash = strrchr(filename, '/');
+    ptxas_filename = std::string(slash ? slash + 1 : filename) + "." + host + "." +
+                     std::to_string(getpid()) + "." + std::to_string(ptxas_seq++) + ".ptxas";
+  }
   char buff[4096], extra_flags[1024];
   extra_flags[0] = 0;
   if (!device_runtime->g_cdp_enabled && !compile_only)
@@ -659,16 +672,18 @@ void gpgpu_context::gpgpu_ptx_info_load_from_filename(const char *filename,
       ptxas_clean_env_prefix(), extra_flags, filename, ptxas_filename.c_str());
   // yasai: YASAI_PTXINFO_CACHE=<dir> keeps the ptxas -v output per (PTX content, flags), so a
   // process that loads the same PTX again (every rank of a job) skips ptxas, which takes most of
-  // the load time of a large module (FlashAttention-2: 42 s of 44 s).
+  // the load time of a large module (FlashAttention-2: 42 s of 44 s). A new entry is written to a
+  // mktemp name and renamed: $$ is not unique across containers (every PID namespace reuses PIDs),
+  // so two node containers that filled the same key at once collided on one temporary name.
   const char *cache_dir = getenv("YASAI_PTXINFO_CACHE");
   if (cache_dir != NULL && cache_dir[0] != 0) {
     char cmd[8192];
     snprintf(cmd, sizeof(cmd),
              "k=$( (cat '%s'; echo '%s') | sha256sum | cut -c1-64); mkdir -p '%s'; "
              "if [ -f '%s'/$k.ptxas ]; then cp '%s'/$k.ptxas '%s'; else %s && "
-             "cp '%s' '%s'/$k.ptxas.$$ && mv '%s'/$k.ptxas.$$ '%s'/$k.ptxas; fi",
+             "t=$(mktemp '%s'/$k.ptxas.XXXXXX) && cp '%s' \"$t\" && mv \"$t\" '%s'/$k.ptxas; fi",
              filename, extra_flags, cache_dir, cache_dir, cache_dir, ptxas_filename.c_str(), buff,
-             ptxas_filename.c_str(), cache_dir, cache_dir, cache_dir);
+             cache_dir, ptxas_filename.c_str(), cache_dir);
     snprintf(buff, sizeof(buff), "%s", cmd);
   }
   int result = yasai_system(buff);
