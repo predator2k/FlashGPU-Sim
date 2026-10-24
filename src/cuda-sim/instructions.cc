@@ -477,8 +477,9 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
         } else if (info.is_param_local()) {
           result.u64 = sym->get_address() + op.get_addr_offset();
         } else if (info.is_global()) {
-          assert(op.get_addr_offset() == 0);
-          result.u64 = sym->get_address();
+          // yasai: [global_variable+offset] (nvcc -O2 unrolls byte loops over a static
+          // __device__ array into ld.global [tag+1], ...) adds the offset, as the other spaces do.
+          result.u64 = sym->get_address() + op.get_addr_offset();
         } else if (info.is_local()) {
           result.u64 = sym->get_address() + op.get_addr_offset();
         } else if (info.is_const()) {
