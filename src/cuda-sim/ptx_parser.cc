@@ -141,6 +141,12 @@ symbol_table *gpgpu_context::init_parser(const char *ptx_filename) {
 
   FILE *ptx_in;
   ptx_in = fopen(ptx_filename, "r");
+  // yasai: gpgpu_ptx_sim_load_ptx_from_string calls this with a file name it writes only when
+  // g_save_embedded_ptx is set, and parses the string itself afterwards. A file that cannot be
+  // opened used to leave the scanner on its default input, stdin: the parse read the process's
+  // standard input and the fclose below closed fd 0 (vLLM's model-inspection child then lost
+  // the pickle it reads from stdin). An empty input initializes the parser state the same way.
+  if (ptx_in == NULL) ptx_in = fopen("/dev/null", "r");
   ptx_set_in(ptx_in, ptx_parser->scanner);
   ptx_parse(ptx_parser->scanner, ptx_parser);
   ptx_in = ptx_get_in(ptx_parser->scanner);
