@@ -452,6 +452,8 @@ statement_list: directive_statement { recognizer->add_directive(); }
     | statement_list prototype_block {printf("Prototype statement detected. WARNING: this is not supported yet on GPGPU-SIM\n"); }
     | prototype_block { /* yasai: a block that starts with a call prototype (NCCL's indirect calls) */ }
 	| instruction_statement { recognizer->add_instruction(); }
+	| branchtargets_statement { /* yasai: label list of brx.idx */ }
+	| statement_list branchtargets_statement { /* yasai: label list of brx.idx */ }
 	| statement_list directive_statement { recognizer->add_directive(); }
 	| statement_list instruction_statement { recognizer->add_instruction(); }
 	| statement_list {recognizer->start_inst_group();} statement_block {recognizer->end_inst_group();}
@@ -637,6 +639,14 @@ prototype_call: OPCODE LEFT_PAREN IDENTIFIER RIGHT_PAREN COMMA operand COMMA LEF
 prototype_param: /* empty */
 	       | PARAM_DIRECTIVE B64_TYPE IDENTIFIER
 	       | PARAM_DIRECTIVE B32_TYPE IDENTIFIER
+
+/* yasai: "<tlist>: .branchtargets <label>, <label>, ...;" declares the target list of brx.idx. */
+branchtargets_statement: IDENTIFIER COLON BRANCHTARGETS_DIRECTIVE branchtarget_list SEMI_COLON { recognizer->add_branchtargets($1); }
+	;
+
+branchtarget_list: IDENTIFIER { recognizer->add_branchtarget_label($1); }
+	| branchtarget_list COMMA IDENTIFIER { recognizer->add_branchtarget_label($3); }
+	;
 
 instruction_statement:  instruction SEMI_COLON
 	| IDENTIFIER COLON { recognizer->add_label($1); }

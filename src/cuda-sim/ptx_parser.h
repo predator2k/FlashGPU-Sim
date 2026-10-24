@@ -127,6 +127,15 @@ class ptx_recognizer {
   void shared_window_space();
   // yasai: records the function's .reqnctapercluster shape.
   void req_ncta_per_cluster(int x, int y, int z);
+  // yasai: appends one label to the pending .branchtargets list.
+  //   identifier: label name
+  void add_branchtarget_label(const char *identifier);
+  // yasai: ends a .branchtargets statement: the pending labels become the target list named
+  // identifier in the current function, and identifier becomes a symbol so brx.idx can name it.
+  //   identifier: name of the target list
+  void add_branchtargets(const char *identifier);
+  // yasai: labels of the .branchtargets statement being parsed.
+  std::vector<std::string> g_branchtarget_labels;
   // yasai: marks the current instruction as bf16x2 (the type itself is stored as f16x2); no
   // effect outside an instruction (a .reg .bf16x2 declaration).
   void note_bf16x2();

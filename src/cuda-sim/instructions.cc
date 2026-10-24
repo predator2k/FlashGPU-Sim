@@ -2269,7 +2269,26 @@ void bra_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   thread->set_npc(target_pc);
 }
 
+// yasai: brx.idx{.uni} index, tlist jumps to label tlist[index]; index is a .u32 per lane, so
+// lanes of a warp may take different targets (the SIMT stack splits them and reconverges at
+// the IPDOM of the brx block). The targets are resolved at assembly (set_brx_targets). An
+// index outside the list is undefined in PTX; it aborts here. Without a target list the old
+// form (register holds the target PC) is kept.
 void brx_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  const std::vector<addr_t> &pcs = pI->brx_target_pc();
+  if (!pcs.empty()) {
+    const operand_info &index_op = pI->dst();
+    const unsigned idx =
+        thread->get_operand_value(index_op, index_op, U32_TYPE, thread, 1).u32;
+    if (idx >= pcs.size()) {
+      printf("GPGPU-Sim PTX: brx.idx index %u outside the %zu targets (%s:%u)\n", idx,
+             pcs.size(), pI->source_file(), pI->source_line());
+      abort();
+    }
+    thread->m_branch_taken = true;
+    thread->set_npc(pcs[idx]);
+    return;
+  }
   const operand_info &target = pI->dst();
   ptx_reg_t target_pc =
       thread->get_operand_value(target, target, U32_TYPE, thread, 1);

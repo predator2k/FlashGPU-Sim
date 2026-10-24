@@ -509,6 +509,17 @@ void function_info::insert_label(symbol_table *symtab, const std::string &name, 
   labels.insert(std::make_pair(std::make_pair(symtab, name), pc));
 }
 
+// yasai: see ptx_ir.h.
+const std::vector<std::string> &function_info::branch_target_list(const std::string &name) const {
+  auto i = m_branch_target_lists.find(name);
+  if (i == m_branch_target_lists.end()) {
+    printf("GPGPU-Sim PTX: Error: .branchtargets list '%s' not found in function '%s'\n",
+           name.c_str(), m_name.c_str());
+    abort();
+  }
+  return i->second;
+}
+
 unsigned function_info::find_label(symbol_table *symtab, const std::string &name) {
   symbol_table *st = symtab;
   while (st) {
@@ -691,6 +702,24 @@ void function_info::ptx_assemble() {
   for (unsigned ii = 0; ii < n;
        ii += m_instr_mem[ii]->inst_size()) {  // handle branch instructions
     ptx_instruction *pI = m_instr_mem[ii];
+    // yasai: brx.idx index, tlist: operand 1 names a .branchtargets list; each of its labels
+    // is resolved to an instruction memory index and a PC.
+    // (The list's symbol has no type, so operand 1 is tested by name only.)
+    if (pI->get_opcode() == BRX_OP && pI->get_num_operands() >= 2 &&
+        m_branch_target_lists.count(pI->operand_lookup(1).get_symbol()->name())) {
+      const std::vector<std::string> &labels =
+          branch_target_list(pI->operand_lookup(1).get_symbol()->name());
+      std::vector<unsigned> index;
+      std::vector<addr_t> pcs;
+      for (const std::string &l : labels) {
+        const unsigned k = find_label(pI->get_symbol_table(), l);
+        index.push_back(k);
+        pcs.push_back(m_instr_mem[k]->get_PC());
+      }
+      pI->set_brx_targets(index, pcs);
+      pI->operand_ref(1).set_type(label_t);  // as the target of bra below
+      continue;
+    }
     if (pI->get_opcode() == BRA_OP || pI->get_opcode() == BREAKADDR_OP ||
         pI->get_opcode() == CALLP_OP) {
       operand_info &target = pI->dst();  // get operand, e.g. target name
@@ -1544,6 +1573,9 @@ void ptx_instruction::set_opcode_and_latency() {
       op = TENSOR_CORE_STORE_OP;
       break;
     case BRA_OP:
+      op = BRANCH_OP;
+      break;
+    case BRX_OP:  // yasai: indexed jump
       op = BRANCH_OP;
       break;
     case BREAKADDR_OP:
@@ -4057,7 +4089,8 @@ void functionalCoreSim::yasai_emit_warp(const warp_inst_t &inst, unsigned w) {
   rec.is_write = inst.is_store() || inst.isatomic() || opc == RED_OP;
   rec.class_code = yasai_func::class_of(opc, space, inst.is_store(), inst.isatomic());
   // Registers: operand 0 is the destination unless the instruction writes no register.
-  const bool writes_reg = !(opc == ST_OP || opc == BRA_OP || opc == BAR_OP || opc == EXIT_OP ||
+  const bool writes_reg = !(opc == ST_OP || opc == BRA_OP || opc == BRX_OP || opc == BAR_OP ||
+                            opc == EXIT_OP ||
                             opc == RET_OP || opc == MEMBAR_OP || opc == RED_OP ||
                             opc == CP_ASYNC_OP || opc == CP_ASYNC_COMMIT_OP ||
                             opc == CP_ASYNC_WAIT_OP || opc == FENCE_OP || opc == STMATRIX_OP);

@@ -688,6 +688,22 @@ void ptx_recognizer::add_label(const char *identifier) {
 void ptx_recognizer::add_opcode(int opcode) { g_opcode = opcode; }
 
 // yasai: see ptx_parser.h.
+void ptx_recognizer::add_branchtarget_label(const char *identifier) {
+  g_branchtarget_labels.push_back(identifier);
+}
+
+// yasai: see ptx_parser.h.
+void ptx_recognizer::add_branchtargets(const char *identifier) {
+  PTX_PARSE_GPPRINTF("add_branchtargets %s", identifier);
+  parse_assert(g_func_info != NULL, ".branchtargets outside a function body");
+  if (g_current_symbol_table->lookup(identifier) == NULL)
+    g_current_symbol_table->add_variable(identifier, NULL, 0, gpgpu_ctx->g_filename,
+                                         ptx_get_lineno(scanner));
+  g_func_info->add_branch_target_list(identifier, g_branchtarget_labels);
+  g_branchtarget_labels.clear();
+}
+
+// yasai: see ptx_parser.h.
 void ptx_recognizer::req_ncta_per_cluster(int x, int y, int z) {
   if (g_func_info) g_func_info->set_req_cluster_dim(x, y, z);
 }
@@ -1201,7 +1217,8 @@ void ptx_recognizer::add_scalar_operand(const char *identifier) {
   PTX_PARSE_GPPRINTF("add_scalar_operand");
   const symbol *s = g_current_symbol_table->lookup(identifier);
   if (s == NULL) {
-    if (g_opcode == BRA_OP || g_opcode == CALLP_OP) {
+    // yasai: brx.idx may name a .branchtargets list declared later in the function.
+    if (g_opcode == BRA_OP || g_opcode == CALLP_OP || g_opcode == BRX_OP) {
       // forward branch target...
       s = g_current_symbol_table->add_variable(
           identifier, NULL, 0, gpgpu_ctx->g_filename, ptx_get_lineno(scanner));

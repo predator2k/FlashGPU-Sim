@@ -1183,6 +1183,12 @@ class ptx_instruction : public warp_inst_t {
     assert(!m_operands.empty());
     return m_operands[0];
   }
+  // yasai: writable operand n (the assembler marks the target list of brx.idx as a label).
+  //   n: operand index
+  operand_info &operand_ref(unsigned n) {
+    assert(n < m_operands.size());
+    return m_operands[n];
+  }
 
   const operand_info &src1() const {
     assert(m_operands.size() > 1);
@@ -1283,6 +1289,17 @@ class ptx_instruction : public warp_inst_t {
   addr_t get_PC() const { return m_PC; }
 
   unsigned get_m_instr_mem_index() { return m_instr_mem_index; }
+  // yasai: brx.idx targets, resolved when the function is assembled.
+  //   index: instruction memory index of each target, in list order
+  //   pc: PC of each target, in list order
+  void set_brx_targets(const std::vector<unsigned> &index, const std::vector<addr_t> &pc) {
+    m_brx_target_index = index;
+    m_brx_target_pc = pc;
+  }
+  // yasai: instruction memory index of each brx.idx target (empty for other instructions).
+  const std::vector<unsigned> &brx_target_index() const { return m_brx_target_index; }
+  // yasai: PC of each brx.idx target (empty for other instructions).
+  const std::vector<addr_t> &brx_target_pc() const { return m_brx_target_pc; }
   unsigned get_cmpop() const { return m_compare_op; }
   const symbol *get_label() const { return m_label; }
   symbol_table *get_symbol_table() const { return m_symbol_table; }
@@ -1374,6 +1391,9 @@ class ptx_instruction : public warp_inst_t {
   int m_pred_mod;
   int m_opcode;
   const symbol *m_label;
+  // yasai: brx.idx target instruction memory indices and PCs (see set_brx_targets).
+  std::vector<unsigned> m_brx_target_index;
+  std::vector<addr_t> m_brx_target_pc;
   // I need symbol table to resolve scoped labels.
   symbol_table *m_symbol_table;
   std::vector<operand_info> m_operands;
@@ -1555,6 +1575,15 @@ class function_info {
   void print_ipostdominators();
   void do_pdom();  // function to call pdom analysis
 
+  // yasai: records a .branchtargets list of this function.
+  //   name: name of the list (the label in front of .branchtargets)
+  //   labels: target label names in index order
+  void add_branch_target_list(const std::string &name, const std::vector<std::string> &labels) {
+    m_branch_target_lists[name] = labels;
+  }
+  // yasai: the .branchtargets list called name (aborts if the function has none).
+  //   name: name of the list
+  const std::vector<std::string> &branch_target_list(const std::string &name) const;
   unsigned get_num_reconvergence_pairs();
 
   void get_reconvergence_pairs(gpgpu_recon_t *recon_points);
@@ -1771,6 +1800,8 @@ class function_info {
   std::map<label_key_t, unsigned> labels;
   void insert_label(symbol_table *symtab, const std::string &name, unsigned pc);
   unsigned find_label(symbol_table *symtab, const std::string &name);
+  // yasai: .branchtargets lists by name.
+  std::map<std::string, std::vector<std::string>> m_branch_target_lists;
   unsigned num_reconvergence_pairs;
 
   // Registers/shmem/etc. used (from ptxas -v), loaded from ___.ptxinfo along

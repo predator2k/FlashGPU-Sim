@@ -429,6 +429,7 @@ void function_info::create_basic_blocks() {
     } else {
       switch (pI->get_opcode()) {
         case BRA_OP:
+        case BRX_OP:  // yasai: indexed jump
         case RET_OP:
         case EXIT_OP:
         case RETP_OP:
@@ -634,9 +635,17 @@ void function_info::connect_basic_blocks()  // iterate across m_basic_blocks of
       basic_block_t *target_bb = target_pI->get_bb();
       (*bb_itr)->successor_ids.insert(target_bb->bb_id);
       target_bb->predecessor_ids.insert((*bb_itr)->bb_id);
+    } else if (pI->get_opcode() == BRX_OP) {
+      // yasai: brx.idx links to the block of every label in its .branchtargets list.
+      for (unsigned addr : pI->brx_target_index()) {
+        basic_block_t *target_bb = m_instr_mem[addr]->get_bb();
+        (*bb_itr)->successor_ids.insert(target_bb->bb_id);
+        target_bb->predecessor_ids.insert((*bb_itr)->bb_id);
+      }
     }
 
-    if (!(pI->get_opcode() == BRA_OP && (!pI->has_pred()))) {
+    // yasai: an unpredicated brx.idx has no fall-through edge either.
+    if (!((pI->get_opcode() == BRA_OP || pI->get_opcode() == BRX_OP) && (!pI->has_pred()))) {
       // if basic block does not end in an unpredicated branch,
       // then next basic block is also successor
       // (this is better than testing for .uni)
@@ -650,7 +659,7 @@ void function_info::connect_basic_blocks()  // iterate across m_basic_blocks of
       (*bb_itr)->successor_ids.insert(next_bb->bb_id);
       next_bb->predecessor_ids.insert((*bb_itr)->bb_id);
     } else
-      assert(pI->get_opcode() == BRA_OP);
+      assert(pI->get_opcode() == BRA_OP || pI->get_opcode() == BRX_OP);
   }
 }
 bool function_info::connect_break_targets()  // connecting break instructions
@@ -1018,7 +1027,9 @@ unsigned function_info::get_num_reconvergence_pairs() {
     if (m_basic_blocks.size() == 0) return 0;
     for (unsigned i = 0; i < (m_basic_blocks.size() - 1);
          i++) {  // last basic block containing exit obviously won't have a pair
-      if (m_basic_blocks[i]->ptx_end->get_opcode() == BRA_OP) {
+      // yasai: brx.idx diverges like bra and reconverges at its block's IPDOM.
+      if (m_basic_blocks[i]->ptx_end->get_opcode() == BRA_OP ||
+          m_basic_blocks[i]->ptx_end->get_opcode() == BRX_OP) {
         num_reconvergence_pairs++;
       }
     }
@@ -1035,7 +1046,8 @@ void function_info::get_reconvergence_pairs(gpgpu_recon_t *recon_points) {
     printf("i=%d\n", i);
     fflush(stdout);
 #endif
-    if (m_basic_blocks[i]->ptx_end->get_opcode() == BRA_OP) {
+    if (m_basic_blocks[i]->ptx_end->get_opcode() == BRA_OP ||
+        m_basic_blocks[i]->ptx_end->get_opcode() == BRX_OP) {  // yasai: see above
 #ifdef DEBUG_GET_RECONVERG_PAIRS
       printf("\tbranch!\n");
       printf("\tbb_id=%d; ipdom=%d\n", m_basic_blocks[i]->bb_id,

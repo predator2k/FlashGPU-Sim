@@ -975,7 +975,8 @@ void simt_stack::update(simt_mask_t &thread_done, addr_vector_t &next_pc,
   }
 
   address_type not_taken_pc = next_inst_pc + next_inst_size;
-  assert(num_divergent_paths <= 2);
+  // yasai: brx.idx splits a warp into up to one path per lane, so the two-path limit of bra
+  // no longer holds; the loop below handles any number of paths.
   for (unsigned i = 0; i < num_divergent_paths; i++) {
     address_type tmp_next_pc = null_pc;
     simt_mask_t tmp_active_mask;
