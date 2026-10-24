@@ -59,6 +59,7 @@ struct Config {
   uint64_t idle_step_us; ///< pause between idle clock steps (YASAI_FIO_WINDOW_IDLE_STEP_US, default 20)
   uint64_t max_pending_bytes;  ///< cap on pending memory (YASAI_FIO_WINDOW_MAX_PENDING_MB, default 256)
   bool cap_fatal;        ///< abort instead of delivering early at the cap (YASAI_FIO_WINDOW_CAP_FATAL=1)
+  bool same_addr_order;  ///< keep the write order per byte (YASAI_FIO_WINDOW_SAME_ADDR_ORDER, default 1)
   std::string clock_path;   ///< shared clock file (YASAI_FIO_WINDOW_CLOCK)
   std::string record_path;  ///< FIO transport record file (YASAI_FIO_WINDOW_RECORD), empty: none
 };
@@ -92,6 +93,7 @@ Config &config() {
     cfg->idle_step_us = env_u64("YASAI_FIO_WINDOW_IDLE_STEP_US", 20);
     cfg->max_pending_bytes = std::max<uint64_t>(1, env_u64("YASAI_FIO_WINDOW_MAX_PENDING_MB", 256)) << 20;
     cfg->cap_fatal = env_u64("YASAI_FIO_WINDOW_CAP_FATAL", 0) != 0;
+    cfg->same_addr_order = env_u64("YASAI_FIO_WINDOW_SAME_ADDR_ORDER", 1) != 0;
     cfg->clock_path = env_str("YASAI_FIO_WINDOW_CLOCK", "/dev/shm/yasai-fio-window-clock");
     cfg->record_path = env_str("YASAI_FIO_WINDOW_RECORD", "");
     return cfg;
@@ -282,14 +284,14 @@ void print_stats() {
   Config &c = config();
   fprintf(stderr, "yasai fio_window stats: stores=%llu pieces=%llu flushed=%llu fences=%llu "
           "idle_steps=%llu cap_forced=%llu peak_pending_mb=%.1f tear=%llu delay=%llu dist=%s "
-          "alpha=%.2f seed=%llu flush=%s clock=%s\n",
+          "alpha=%.2f seed=%llu flush=%s clock=%s same_addr_order=%d\n",
           (unsigned long long)g_stat_stores, (unsigned long long)g_stat_pieces,
           (unsigned long long)g_stat_flushed, (unsigned long long)g_stat_fences,
           (unsigned long long)g_stat_idle_steps, (unsigned long long)g_stat_cap_forced,
           g_stat_peak_bytes / 1048576.0, (unsigned long long)c.tear_unit,
           (unsigned long long)c.delay_max, c.dist == delay_dist::pareto ? "pareto" : "uniform",
           c.alpha, (unsigned long long)c.seed, c.strict ? "strict" : "kernel_end",
-          clock().shared ? "shared" : "local");
+          clock().shared ? "shared" : "local", c.same_addr_order ? 1 : 0);
 }
 
 /// Exit handler: stops the drainer and delivers what is still pending, step by step (eventual
@@ -432,6 +434,16 @@ bool on_store(uint64_t addr, size_t bytes, const void *in) {
     Pending piece;
     piece.addr = addr + off;
     piece.deadline = now + draw_delay();
+    // Per-byte write order (default): a piece never becomes visible before an earlier pending piece
+    // that covers any of its bytes, so a later write to a location is never overwritten by an
+    // earlier one (no lost update of a flag). Writes to different locations still reorder freely.
+    if (cfg.same_addr_order && !p.by_addr.empty()) {
+      const uint64_t a = addr + off;
+      const uint64_t lo_key = a >= p.max_piece ? a - p.max_piece + 1 : 0;
+      for (auto it = p.by_addr.lower_bound(lo_key); it != p.by_addr.end() && it->first < a + n; ++it)
+        if (it->second->addr + it->second->data.size() > a)
+          piece.deadline = std::max(piece.deadline, it->second->deadline);
+    }
     piece.seq = g_seq++;
     piece.data.assign(src + off, src + off + n);
     auto ins = p.by_seq.emplace(piece.seq, std::move(piece));
