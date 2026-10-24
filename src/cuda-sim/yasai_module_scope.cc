@@ -2,6 +2,7 @@
 #include "yasai_module_scope.h"
 
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <cctype>
@@ -354,8 +355,16 @@ std::string scope_file(const std::string &path, const std::string &unit_in) {
   struct stat st;
   const bool cached = stat(out_path.c_str(), &st) == 0;
   // Written under a per-process name and renamed, so processes that share the directory (the
-  // same file, the same content) never read a partial copy.
-  const std::string tmp = out_path + ".tmp" + std::to_string(getpid());
+  // same file, the same content) never read a partial copy. yasai: the name carries the host
+  // name and a time stamp besides the PID, because containers that share YASAI_MODULE_SCOPE_DIR
+  // reuse PIDs (two ranks with PID 130 in two containers wrote one temporary file, and the
+  // second rename failed: Qwen3-235B, 2026-10-24).
+  char host[64] = {0};
+  gethostname(host, sizeof host - 1);
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  const std::string tmp = out_path + ".tmp." + host + "." + std::to_string(getpid()) + "." +
+                          std::to_string((long long)ts.tv_sec * 1000000000LL + ts.tv_nsec);
   if (!cached) {
     std::ifstream in(path);
     std::ofstream out(tmp);
@@ -373,8 +382,13 @@ std::string scope_file(const std::string &path, const std::string &unit_in) {
     }
   }
   if (!cached && rename(tmp.c_str(), out_path.c_str()) != 0) {
-    fprintf(stderr, "yasai-scope: cannot rename %s to %s\n", tmp.c_str(), out_path.c_str());
-    abort();
+    // yasai: another process may have placed the same copy meanwhile; its content is equal.
+    if (stat(out_path.c_str(), &st) == 0) {
+      unlink(tmp.c_str());
+    } else {
+      fprintf(stderr, "yasai-scope: cannot rename %s to %s\n", tmp.c_str(), out_path.c_str());
+      abort();
+    }
   }
   for (const std::string &n : names) {
     if (dup_entries.count(n)) {
