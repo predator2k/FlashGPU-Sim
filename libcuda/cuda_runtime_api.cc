@@ -1002,6 +1002,25 @@ static CUresult load_module_from_ptx_file(CUmodule *module,
   printf("GPGPU-Sim PTX: %s loading module handle %u using PTX sidecar %s\n",
          caller, module_handle, ptx_path.c_str());
 
+  // yasai: the same PTX file loaded again (Triton and DeepGEMM load one image per device or per
+  // call; images are written to content-named files) is not parsed again: parsing redeclared
+  // every kernel of the earlier module in place, and the kernel then ran with the analysis of
+  // the earlier parse and gave wrong results. The new module shares the earlier module's
+  // kernels and globals.
+  for (const auto &m : yasai_module_ptx()) {
+    if (m.second != ptx_path) continue;
+    symbol_table *loaded = context->get_symbol_table(m.first);
+    if (loaded == NULL) break;
+    context->add_binary(loaded, module_handle);
+    ctx->api->fatbinmap[module_handle] = ptx_path;
+    ctx->api->fatbin_registered[module_handle] = true;
+    yasai_module_ptx()[module_handle] = ptx_path;
+    printf("GPGPU-Sim PTX: %s: %s is already loaded as module %u; module %u shares it\n", caller,
+           ptx_path.c_str(), m.first, module_handle);
+    *module = (CUmodule)(unsigned long long)module_handle;
+    return CUDA_SUCCESS;
+  }
+
   // yasai: module-local symbols are scoped to the module (yasai_module_scope.h). The module is
   // its own unit, so a kernel name that another module already defines is renamed in it and
   // cuModuleGetFunction maps the name back per module.
