@@ -147,6 +147,7 @@
 #include "builtin_types.h"
 #include "driver_types.h"
 #include "cuda_api.h"
+#include "yasai_dark_api.h"
 #if defined(__has_include)
 #if __has_include("cudaProfiler.h")
 #include "cudaProfiler.h"
@@ -859,6 +860,14 @@ static bool yasai_ordinal_valid(int device, unsigned num_devices) {
 static bool &yasai_ctx_current() {
   static bool current = false;
   return current;
+}
+
+/// yasai: the context states that cuCtxPushCurrent saved on the calling thread (cuCtxPopCurrent
+/// restores them).
+/// @return The calling thread's stack.
+static std::vector<bool> &yasai_ctx_stack() {
+  thread_local std::vector<bool> stack;
+  return stack;
 }
 
 /// Ordinal of the process's first allocation or kernel launch (-1 before it).
@@ -4582,19 +4591,16 @@ typedef int (*ExportedFunction)();
 
 static ExportedFunction exportTable[3] = {&dummy0, &dummy0, &dummy0};
 
+// yasai: the driver's private export tables (yasai_dark_api.cc); the former placeholder returned
+// a three-entry table of dummies for every UUID (exportTable above, no longer used).
 __host__ cudaError_t CUDARTAPI cudaGetExportTable(
     const void **ppExportTable, const cudaUUID_t *pExportTableId) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("cudaGetExportTable: UUID = ");
-  for (int s = 0; s < 16; s++) {
-    printf("%#2x ", (unsigned char)(pExportTableId->bytes[s]));
-  }
-  *ppExportTable = &exportTable;
-
-  printf("\n");
-  return g_last_cudaError = cudaSuccess;
+  const CUresult r = yasai_dark_api::get_export_table(
+      ppExportTable, reinterpret_cast<const CUuuid *>(pExportTableId));
+  return g_last_cudaError = (r == CUDA_SUCCESS ? cudaSuccess : cudaErrorInvalidValue);
 }
 
 #endif
@@ -7550,18 +7556,24 @@ CUresult CUDAAPI cuCtxDestroy(CUcontext ctx) {
 
 #if CUDART_VERSION >= 4000
 CUresult CUDAAPI cuCtxPushCurrent(CUcontext ctx) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: makes the simulated device's one context current; the previous state is kept on the
+  // calling thread's stack for cuCtxPopCurrent.
+  if (ctx == NULL) return CUDA_ERROR_INVALID_VALUE;
+  yasai_ctx_stack().push_back(yasai_ctx_current());
+  yasai_ctx_current() = true;
   return CUDA_SUCCESS;
 }
 
 CUresult CUDAAPI cuCtxPopCurrent(CUcontext *pctx) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
+  // yasai: returns the current context (the simulated device's one context) and restores the
+  // state the matching cuCtxPushCurrent saved; without a current context it fails as the driver
+  // does.
+  if (!yasai_ctx_current()) return CUDA_ERROR_INVALID_CONTEXT;
+  if (pctx != NULL) *pctx = (CUcontext)GPGPUSim_Context(GPGPU_Context());
+  if (!yasai_ctx_stack().empty()) {
+    yasai_ctx_current() = yasai_ctx_stack().back();
+    yasai_ctx_stack().pop_back();
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
   return CUDA_SUCCESS;
 }
 
@@ -9604,9 +9616,8 @@ CUresult CUDAAPI cuGetExportTable(const void **ppExportTable,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  cudaError_t e = cudaGetExportTable(ppExportTable, pExportTableId);
-  assert(e == cudaSuccess);
-  return CUDA_SUCCESS;
+  // yasai: an unknown table is an error the runtime handles (it used to assert success).
+  return yasai_dark_api::get_export_table(ppExportTable, pExportTableId);
 }
 
 #if defined(CUDART_VERSION_INTERNAL) || \
@@ -9674,17 +9685,23 @@ CUresult CUDAAPI cuCtxDestroy(CUcontext ctx) {
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuCtxPopCurrent(CUcontext *pctx) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
+  // yasai: returns the current context (the simulated device's one context) and restores the
+  // state the matching cuCtxPushCurrent saved; without a current context it fails as the driver
+  // does.
+  if (!yasai_ctx_current()) return CUDA_ERROR_INVALID_CONTEXT;
+  if (pctx != NULL) *pctx = (CUcontext)GPGPUSim_Context(GPGPU_Context());
+  if (!yasai_ctx_stack().empty()) {
+    yasai_ctx_current() = yasai_ctx_stack().back();
+    yasai_ctx_stack().pop_back();
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuCtxPushCurrent(CUcontext ctx) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: makes the simulated device's one context current; the previous state is kept on the
+  // calling thread's stack for cuCtxPopCurrent.
+  if (ctx == NULL) return CUDA_ERROR_INVALID_VALUE;
+  yasai_ctx_stack().push_back(yasai_ctx_current());
+  yasai_ctx_current() = true;
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuStreamDestroy(CUstream hStream) {
