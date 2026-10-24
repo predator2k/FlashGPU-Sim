@@ -1810,6 +1810,8 @@ cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlagsInternal(
   if (flags == cudaOccupancyDefault || flags == cudaOccupancyDisableCachingOverride) {
     if (entry == NULL) {
       *numBlocks = 0;
+      printf("GPGPU-Sim PTX: cudaOccupancyMaxActiveBlocksPerMultiprocessor: no PTX for %s\n",
+             context->yasai_pending_name(hostFunc));
       return g_last_cudaError = cudaErrorInvalidDeviceFunction;
     }
     // create kernel_info based on entry
@@ -2062,6 +2064,8 @@ cudaError_t CUDARTAPI cudaFuncGetAttributesInternal(
 #endif
   } else {
     // yasai: a kernel registered without PTX is not a valid device function (NCCL skips it).
+    printf("GPGPU-Sim PTX: cudaFuncGetAttributes: no PTX for %s\n",
+           context->yasai_pending_name(hostFun));
     return g_last_cudaError = cudaErrorInvalidDeviceFunction;
   }
   return g_last_cudaError = cudaSuccess;
@@ -5300,7 +5304,11 @@ cudaError_t CUDARTAPI cudaFuncSetAttribute(const void *func,
   CUctx_st *context = GPGPUSim_Context(ctx);
   function_info *entry = context->get_kernel((const char *)func);
   // yasai: a kernel registered without PTX (none loaded for it) is not a valid device function.
-  if (entry == NULL) return g_last_cudaError = cudaErrorInvalidDeviceFunction;
+  if (entry == NULL) {
+    printf("GPGPU-Sim PTX: cudaFuncSetAttribute: no PTX for %s\n",
+           context->yasai_pending_name(func));
+    return g_last_cudaError = cudaErrorInvalidDeviceFunction;
+  }
 
   if (attr == cudaFuncAttributeMaxDynamicSharedMemorySize) {
     if (value < 0) return g_last_cudaError = cudaErrorInvalidValue;

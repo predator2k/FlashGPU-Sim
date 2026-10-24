@@ -137,12 +137,24 @@ struct CUctx_st {
       //		assert( f != NULL );
       //		m_kernel_lookup[hostFun] = f;
     } else {
+      // yasai: a fat binary without a PTX module for this architecture (for example a translation
+      // unit built as SASS only). The kernel name is kept, so a later lookup can still find the
+      // same kernel (a template instantiation is emitted in every unit that uses it) in another
+      // loaded or lazily indexed PTX file, and names it when none exists.
       m_kernel_lookup[hostFun] = NULL;
+      m_yasai_pending_kernel[hostFun] = deviceFun;
     }
   }
 
   void register_hostFun_function(const char *hostFun, function_info *f) {
     m_kernel_lookup[hostFun] = f;
+  }
+
+  // yasai: device name of a kernel registered without PTX, or "(unknown)".
+  //   hostFun: host stub address the kernel was registered with
+  const char *yasai_pending_name(const void *hostFun) const {
+    auto p = m_yasai_pending_kernel.find(hostFun);
+    return p == m_yasai_pending_kernel.end() ? "(unknown)" : p->second.c_str();
   }
 
   function_info *get_kernel(const char *hostFun) {
