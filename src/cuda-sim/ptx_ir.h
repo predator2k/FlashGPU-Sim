@@ -1604,7 +1604,12 @@ class function_info {
 
   virtual const void set_kernel_info(const struct gpgpu_ptx_sim_info &info) {
     m_kernel_info = info;
-    m_kernel_info.ptx_version = 10 * get_ptx_version().ver();
+    // yasai: cudaFuncAttributes::ptxVersion is the virtual architecture the kernel's PTX targets
+    // (major * 10 + minor, 120 for .target sm_120), not the PTX ISA version. CUB multiplies it
+    // by 10 and picks the largest entry of __CUDA_ARCH_LIST__ not above it; the ISA version (90
+    // for PTX 9.0) matched no entry of a CUDA 13 build and CUB returned
+    // cudaErrorInvalidDeviceFunction (torch.cumsum).
+    m_kernel_info.ptx_version = get_ptx_version().target();
     m_kernel_info.sm_target = get_ptx_version().target();
     // THIS DEPENDS ON ptxas being called after the PTX is parsed.
     m_kernel_info.maxthreads = maxnt_id;
