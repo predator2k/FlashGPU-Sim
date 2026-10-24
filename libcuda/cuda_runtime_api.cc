@@ -1,3 +1,4 @@
+#include "yasai_fakeenv_rec.h"
 #include <dlfcn.h>
 // This file created from cuda_runtime_api.h distributed with CUDA 1.1
 // Changes Copyright 2009,  Tor M. Aamodt, Ali Bakhoda and George L. Yuan
@@ -1141,8 +1142,39 @@ cudaError_t cudaSetupArgumentInternal(const void *arg, size_t size,
   return g_last_cudaError = cudaSuccess;
 }
 
-cudaError_t cudaLaunchInternal(const char *hostFun,
-                               gpgpu_context *gpgpu_ctx = NULL) {
+cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx);
+
+// yasai: every kernel launch (cudaLaunchKernel, cudaLaunchKernelExC, cuLaunchKernel,
+// cuLaunchKernelEx) reaches this function; with YASAI_FAKEENV_OUT set it records an api and a
+// kernel record (yasai_fakeenv_rec.h) around the launch.
+cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = NULL) {
+  yasai_rec::Recorder &rec = yasai_rec::Recorder::get();
+  gpgpu_context *ctx = gpgpu_ctx ? gpgpu_ctx : GPGPU_Context();
+  if (!rec.on() || ctx->api->g_cuda_launch_stack.empty())
+    return cudaLaunchInternalImpl(hostFun, gpgpu_ctx);
+  kernel_config config = ctx->api->g_cuda_launch_stack.back();
+  const uint64_t t0 = yasai_rec::mono_ns();
+  const uint32_t corr = rec.corr();
+  const cudaError_t ret = cudaLaunchInternalImpl(hostFun, gpgpu_ctx);
+  const uint64_t t1 = yasai_rec::mono_ns();
+  function_info *entry = GPGPUSim_Context(ctx)->get_kernel(hostFun);
+  const std::string name = entry ? entry->get_name() : std::string("unknown");
+  const gpgpu_ptx_sim_info *info = entry ? entry->get_kernel_info() : NULL;
+  const dim3 g = config.grid_dim(), b = config.block_dim();
+  rec.api("cudaLaunchKernel", t0, t1, corr, int(ret));
+  rec.write("\"rec\":\"kernel\",\"start\":%llu,\"end\":%llu,\"dev\":0,\"ctx\":1,\"stream\":%u,"
+            "\"corr\":%u,\"name\":\"%s\",\"grid\":[%u,%u,%u],\"block\":[%u,%u,%u],"
+            "\"cluster\":[1,1,1],\"smem_static\":%u,\"smem_dynamic\":%zu,\"regs\":%u,"
+            "\"local_per_thread\":0,\"graph_id\":0,\"graph_node\":0,\"launch_type\":0,"
+            "\"queued\":0,\"submitted\":0,\"device_launched\":0",
+            (unsigned long long)t0, (unsigned long long)t1,
+            rec.stream_id(config.get_stream()), corr, yasai_rec::esc(name.c_str()).c_str(),
+            g.x, g.y, g.z, b.x, b.y, b.z, info ? info->smem : 0u, (size_t)config.shared_mem(),
+            info ? info->regs : 0u);
+  return ret;
+}
+
+cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx) {
   gpgpu_context *ctx;
   if (gpgpu_ctx) {
     ctx = gpgpu_ctx;
@@ -2969,10 +3001,55 @@ __host__ cudaError_t CUDARTAPI cudaFreeArray(struct cudaArray *array) {
  *                                                                              *
  *******************************************************************************/
 
+// yasai: the fakeenv recorder (yasai_fakeenv_rec.h) records the calls below when
+// YASAI_FAKEENV_OUT is set: an api record and the device operation with the same correlation id.
+namespace {
+/// Records a copy call and its memcpy operation.
+void yasai_rec_copy(const char *api, uint64_t t0, uint32_t corr, cudaError_t ret, size_t count,
+                    int kind, const void *stream) {
+  yasai_rec::Recorder &r = yasai_rec::Recorder::get();
+  const uint64_t t1 = yasai_rec::mono_ns();
+  r.api(api, t0, t1, corr, int(ret));
+  r.write("\"rec\":\"memcpy\",\"start\":%llu,\"end\":%llu,\"dev\":0,\"ctx\":1,\"stream\":%u,"
+          "\"corr\":%u,\"bytes\":%zu,\"copy_kind\":%u,\"src_kind\":0,\"dst_kind\":0,\"graph_node\":0",
+          (unsigned long long)t0, (unsigned long long)t1, r.stream_id(stream), corr, count,
+          yasai_rec::copy_kind(kind));
+}
+
+/// Records a memset call and its memset operation.
+void yasai_rec_memset(const char *api, uint64_t t0, uint32_t corr, cudaError_t ret,
+                      size_t count, int value, const void *stream) {
+  yasai_rec::Recorder &r = yasai_rec::Recorder::get();
+  const uint64_t t1 = yasai_rec::mono_ns();
+  r.api(api, t0, t1, corr, int(ret));
+  r.write("\"rec\":\"memset\",\"start\":%llu,\"end\":%llu,\"dev\":0,\"ctx\":1,\"stream\":%u,"
+          "\"corr\":%u,\"bytes\":%zu,\"value\":%u,\"graph_node\":0",
+          (unsigned long long)t0, (unsigned long long)t1, r.stream_id(stream), corr, count,
+          unsigned(value) & 0xff);
+}
+
+/// Records a synchronization call (type: yasai_rec::SyncType).
+void yasai_rec_sync(const char *api, uint64_t t0, uint32_t corr, cudaError_t ret, int type,
+                    const void *stream, uint64_t event, uint64_t sync_id) {
+  yasai_rec::Recorder &r = yasai_rec::Recorder::get();
+  const uint64_t t1 = yasai_rec::mono_ns();
+  r.api(api, t0, t1, corr, int(ret));
+  r.write("\"rec\":\"sync\",\"start\":%llu,\"end\":%llu,\"type\":%d,\"ctx\":1,\"stream\":%u,"
+          "\"corr\":%u,\"event\":%llu,\"sync_id\":%llu",
+          (unsigned long long)t0, (unsigned long long)t1, type, r.stream_id(stream), corr,
+          (unsigned long long)event, (unsigned long long)sync_id);
+}
+}  // namespace
+
 __host__ cudaError_t CUDARTAPI cudaMemcpy(void *dst, const void *src,
                                           size_t count,
                                           enum cudaMemcpyKind kind) {
-  return cudaMemcpyInternal(dst, src, count, kind);
+  if (!yasai_rec::Recorder::get().on()) return cudaMemcpyInternal(dst, src, count, kind);
+  const uint64_t t0 = yasai_rec::mono_ns();
+  const uint32_t corr = yasai_rec::Recorder::get().corr();
+  const cudaError_t ret = cudaMemcpyInternal(dst, src, count, kind);
+  yasai_rec_copy("cudaMemcpy", t0, corr, ret, count, int(kind), nullptr);
+  return ret;
 }
 
 __host__ cudaError_t CUDARTAPI cudaMemcpyToArray(struct cudaArray *dst,
@@ -3074,7 +3151,13 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyAsync(void *dst, const void *src,
                                                size_t count,
                                                enum cudaMemcpyKind kind,
                                                cudaStream_t stream) {
-  return cudaMemcpyAsyncInternal(dst, src, count, kind, stream);
+  if (!yasai_rec::Recorder::get().on())
+    return cudaMemcpyAsyncInternal(dst, src, count, kind, stream);
+  const uint64_t t0 = yasai_rec::mono_ns();
+  const uint32_t corr = yasai_rec::Recorder::get().corr();
+  const cudaError_t ret = cudaMemcpyAsyncInternal(dst, src, count, kind, stream);
+  yasai_rec_copy("cudaMemcpyAsync", t0, corr, ret, count, int(kind), stream);
+  return ret;
 }
 
 __host__ cudaError_t CUDARTAPI cudaMemcpyToArrayAsync(
@@ -3148,13 +3231,24 @@ cudaError_t CUDARTAPI cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
  *******************************************************************************/
 
 __host__ cudaError_t CUDARTAPI cudaMemset(void *mem, int c, size_t count) {
-  return cudaMemsetInternal(mem, c, count);
+  if (!yasai_rec::Recorder::get().on()) return cudaMemsetInternal(mem, c, count);
+  const uint64_t t0 = yasai_rec::mono_ns();
+  const uint32_t corr = yasai_rec::Recorder::get().corr();
+  const cudaError_t ret = cudaMemsetInternal(mem, c, count);
+  yasai_rec_memset("cudaMemset", t0, corr, ret, count, c, nullptr);
+  return ret;
 }
 
 // memset operation is done but i think its not async?
 __host__ cudaError_t CUDARTAPI cudaMemsetAsync(void *mem, int c, size_t count,
                                                cudaStream_t stream = 0) {
-  return cudaMemsetAsyncInternal(mem, c, count, stream = 0);
+  if (!yasai_rec::Recorder::get().on()) return cudaMemsetAsyncInternal(mem, c, count, stream = 0);
+  const uint64_t t0 = yasai_rec::mono_ns();
+  const uint32_t corr = yasai_rec::Recorder::get().corr();
+  const void *recorded_stream = stream;
+  const cudaError_t ret = cudaMemsetAsyncInternal(mem, c, count, stream = 0);
+  yasai_rec_memset("cudaMemsetAsync", t0, corr, ret, count, c, recorded_stream);
+  return ret;
 }
 
 __host__ cudaError_t CUDARTAPI cudaMemset2D(void *mem, size_t pitch, int c,
@@ -3542,7 +3636,10 @@ __host__ cudaError_t CUDARTAPI cudaLaunchKernel(const char *hostFun,
  *******************************************************************************/
 
 __host__ cudaError_t CUDARTAPI cudaStreamCreate(cudaStream_t *stream) {
-  return cudaStreamCreateInternal(stream);
+  const cudaError_t ret = cudaStreamCreateInternal(stream);
+  if (ret == cudaSuccess && yasai_rec::Recorder::get().on())
+    yasai_rec::Recorder::get().stream_id(*stream);  // writes stream_created
+  return ret;
 }
 
 // TODO: introduce priorities
@@ -3575,7 +3672,12 @@ __host__ cudaError_t CUDARTAPI cudaStreamDestroy(cudaStream_t stream) {
 }
 
 __host__ cudaError_t CUDARTAPI cudaStreamSynchronize(cudaStream_t stream) {
-  return cudaStreamSynchronizeInternal(stream);
+  if (!yasai_rec::Recorder::get().on()) return cudaStreamSynchronizeInternal(stream);
+  const uint64_t t0 = yasai_rec::mono_ns();
+  const uint32_t corr = yasai_rec::Recorder::get().corr();
+  const cudaError_t ret = cudaStreamSynchronizeInternal(stream);
+  yasai_rec_sync("cudaStreamSynchronize", t0, corr, ret, yasai_rec::kStreamSync, stream, 0, 0);
+  return ret;
 }
 
 __host__ cudaError_t CUDARTAPI cudaStreamQuery(cudaStream_t stream) {
@@ -3617,13 +3719,32 @@ __host__ cudaError_t CUDARTAPI cudaEventCreate(cudaEvent_t *event) {
 
 __host__ cudaError_t CUDARTAPI cudaEventRecord(cudaEvent_t event,
                                                cudaStream_t stream) {
-  return cudaEventRecordInternal(event, stream);
+  yasai_rec::Recorder &rec = yasai_rec::Recorder::get();
+  if (!rec.on()) return cudaEventRecordInternal(event, stream);
+  const uint64_t t0 = yasai_rec::mono_ns();
+  const uint32_t corr = rec.corr();
+  const cudaError_t ret = cudaEventRecordInternal(event, stream);
+  const uint64_t uid = event ? uint64_t(((CUevent_st *)event)->get_uid()) : 0;
+  const uint64_t sync_id = rec.event_record_id(uid);
+  rec.api("cudaEventRecord", t0, yasai_rec::mono_ns(), corr, int(ret));
+  rec.write("\"rec\":\"event_record\",\"dev\":0,\"ctx\":1,\"stream\":%u,\"corr\":%u,"
+            "\"event\":%llu,\"sync_id\":%llu,\"dev_ts\":0",
+            rec.stream_id(stream), corr, (unsigned long long)uid, (unsigned long long)sync_id);
+  return ret;
 }
 
 __host__ cudaError_t CUDARTAPI cudaStreamWaitEvent(cudaStream_t stream,
                                                    cudaEvent_t event,
                                                    unsigned int flags) {
-  return cudaStreamWaitEventInternal(stream, event, flags);
+  yasai_rec::Recorder &rec = yasai_rec::Recorder::get();
+  if (!rec.on()) return cudaStreamWaitEventInternal(stream, event, flags);
+  const uint64_t t0 = yasai_rec::mono_ns();
+  const uint32_t corr = rec.corr();
+  const cudaError_t ret = cudaStreamWaitEventInternal(stream, event, flags);
+  const uint64_t uid = event ? uint64_t(((CUevent_st *)event)->get_uid()) : 0;
+  yasai_rec_sync("cudaStreamWaitEvent", t0, corr, ret, yasai_rec::kStreamWaitEvent, stream, uid,
+                 rec.event_last_id(uid));
+  return ret;
 }
 
 __host__ cudaError_t CUDARTAPI cudaEventQuery(cudaEvent_t event) {
@@ -3644,12 +3765,20 @@ __host__ cudaError_t CUDARTAPI cudaEventSynchronize(cudaEvent_t event) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
+  const bool rec_on = yasai_rec::Recorder::get().on();
+  const uint64_t t0 = rec_on ? yasai_rec::mono_ns() : 0;
+  const uint32_t corr = rec_on ? yasai_rec::Recorder::get().corr() : 0;
   printf("GPGPU-Sim API: cudaEventSynchronize ** waiting for event\n");
   fflush(stdout);
   CUevent_st *e = (CUevent_st *)event;
   while (!e->done());
   printf("GPGPU-Sim API: cudaEventSynchronize ** event detected\n");
   fflush(stdout);
+  if (rec_on) {
+    const uint64_t uid = e ? uint64_t(e->get_uid()) : 0;
+    yasai_rec_sync("cudaEventSynchronize", t0, corr, cudaSuccess, yasai_rec::kEventSync, nullptr,
+                   uid, yasai_rec::Recorder::get().event_last_id(uid));
+  }
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -4338,6 +4467,13 @@ void cuda_runtime_api::cuobjdumpInit() {
 //! Either submit PTX for simulation or convert SASS to PTXPlus and submit it
 
 // ---- yasai: lazy PTX loading ---------------------------------------------------------------
+// Architecture ("sm_XX") of the PTX files that YASAI_PTX_LIB_OVERRIDE puts in place of a
+// library's own files (their names carry none).
+static std::map<std::string, std::string> &yasai_override_arch() {
+  static std::map<std::string, std::string> m;
+  return m;
+}
+
 // A fat binary with many PTX files (libtorch_cuda.so: 418 files, 1.3 GB) used to be parsed in
 // full at registration; the parsed form took about 100 bytes per byte of PTX, so a PyTorch
 // process passed 58 GB before reaching its first kernel. With lazy loading (YASAI_LAZY_PTX,
@@ -4451,8 +4587,26 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
                                                                        : std::string::npos;
       by_library[cut == std::string::npos ? std::string() : f.substr(0, cut)][kv.first].insert(f);
     }
+  // yasai: YASAI_PTX_LIB_OVERRIDE="<library prefix>=<PTX file>[,...]" replaces the selected PTX
+  // of one library by one file (for example NCCL's rdc kernels merged into one module), while the
+  // other libraries keep theirs; the replacement keeps the architecture of the first file it
+  // replaces (for ptxas).
+  std::map<std::string, std::string> lib_override;
+  if (const char *ov = getenv("YASAI_PTX_LIB_OVERRIDE")) {
+    std::string list(ov);
+    size_t start = 0;
+    while (start < list.size()) {
+      size_t end = list.find(',', start);
+      if (end == std::string::npos) end = list.size();
+      const std::string item = list.substr(start, end - start);
+      const size_t eq = item.find('=');
+      if (eq != std::string::npos) lib_override[item.substr(0, eq)] = item.substr(eq + 1);
+      start = end + 1;
+    }
+  }
   for (auto &library : by_library) {
   std::map<unsigned, std::set<std::string>> &vf = library.second;
+  const size_t first_of_library = selected_files.size();
   if (!vf.empty()) {
     // pick selected_version: largest version <= forced_max_capability (or
     // largest available)
@@ -4514,6 +4668,21 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
       selected_files.push_back(ptx_filename);
     }
   }
+  for (const auto &ov : lib_override) {
+    const std::string &lib = library.first;
+    const size_t base = lib.rfind('/') == std::string::npos ? 0 : lib.rfind('/') + 1;
+    if (lib.compare(base, ov.first.size(), ov.first) != 0 || selected_files.size() == first_of_library)
+      continue;
+    const std::string first = selected_files[first_of_library];
+    const size_t sm_pos = first.find("sm_");
+    yasai_override_arch()[ov.second] =
+        sm_pos == std::string::npos ? "" : first.substr(sm_pos, first.find('.', sm_pos) - sm_pos);
+    printf("GPGPU-Sim PTX: %zu PTX files of %s replaced by %s\n",
+           selected_files.size() - first_of_library, lib.c_str(), ov.second.c_str());
+    selected_files.resize(first_of_library);
+    selected_files.push_back(ov.second);
+    break;
+  }
 
   }
 
@@ -4561,7 +4730,8 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
       L.files.push_back(f);
       std::string arch = "";
       size_t sm_pos = f.find("sm_");
-      if (sm_pos != std::string::npos) arch = f.substr(sm_pos, f.find('.', sm_pos) - sm_pos);
+      if (yasai_override_arch().count(f)) arch = yasai_override_arch()[f];
+      else if (sm_pos != std::string::npos) arch = f.substr(sm_pos, f.find('.', sm_pos) - sm_pos);
       L.archs.push_back(arch);
       L.loaded.push_back(false);
       std::ifstream in(f);
@@ -4816,7 +4986,12 @@ cudaError_t cudaDeviceReset(void) {
 }
 
 cudaError_t CUDARTAPI cudaDeviceSynchronize(void) {
-  return cudaDeviceSynchronizeInternal();
+  if (!yasai_rec::Recorder::get().on()) return cudaDeviceSynchronizeInternal();
+  const uint64_t t0 = yasai_rec::mono_ns();
+  const uint32_t corr = yasai_rec::Recorder::get().corr();
+  const cudaError_t ret = cudaDeviceSynchronizeInternal();
+  yasai_rec_sync("cudaDeviceSynchronize", t0, corr, ret, yasai_rec::kContextSync, nullptr, 0, 0);
+  return ret;
 }
 
 void __cudaRegisterShared(void **fatCubinHandle, void **devicePtr) {
