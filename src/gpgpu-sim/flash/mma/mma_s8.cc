@@ -63,7 +63,8 @@ void tensor_mma_s8_impl(const ptx_instruction *pI, core_t *core,
   // Matrix A fragment distribution (row-major):
   //   K=16: row = groupID for a[0..3], groupID+8 for a[4..7]
   //         col = (threadID_in_group * 4) + (i & 0x3)
-  //   K=32: row = groupID for a[0..7], groupID+8 for a[8..15]
+  //   K=32: row = groupID for a[0..3] and a[8..11], groupID+8 for a[4..7]
+  //         and a[12..15] (yasai: corrected)
   //         col = (threadID_in_group * 4) + (i & 0x3) for i<8
   //               (threadID_in_group * 4) + (i & 0x3) + 16 for i>=8
   //
@@ -165,23 +166,20 @@ void tensor_mma_s8_impl(const ptx_instruction *pI, core_t *core,
         memcpy(&a_vals[i * 4], &a_regs[i].u32, 4);
       }
 
-      // A fragment distribution for M16N8K32 (row-major)
-      // a[0..7] in row=groupID, a[8..15] in row=groupID+8
+      // A fragment distribution for M16N8K32 (row-major), PTX ISA 9.7.14.5:
+      // yasai: row = groupID for a[0..3] and a[8..11], groupID+8 for a[4..7]
+      // and a[12..15]; col = threadID_in_group*4 + (i & 3), plus 16 for
+      // i >= 8. Register by register: (row g, k lo), (row g+8, k lo),
+      // (row g, k hi), (row g+8, k hi). The upstream code took a[0..7] as
+      // row g, which swapped registers 1 and 2.
       int a_row0 = groupID, a_row1 = groupID + 8;
       int col_base = threadID_in_group * 4;
 
       // A is row-major: A[row][col] = A[row * K + col]
-      // Place a[0..7] in row=groupID
-      for (int i = 0; i < 8; i++) {
-        int col =
-            (i < 4) ? (col_base + (i & 0x3)) : (col_base + (i & 0x3) + 16);
-        A_mat[a_row0 * K + col] = a_vals[i];
-      }
-      // Place a[8..15] in row=groupID+8
-      for (int i = 8; i < 16; i++) {
-        int col =
-            (i < 12) ? (col_base + (i & 0x3)) : (col_base + (i & 0x3) + 16);
-        A_mat[a_row1 * K + col] = a_vals[i];
+      for (int i = 0; i < 16; i++) {
+        int row = ((i >> 2) & 1) ? a_row1 : a_row0;
+        int col = col_base + (i & 0x3) + (i >= 8 ? 16 : 0);
+        A_mat[row * K + col] = a_vals[i];
       }
 
       // Unpack B fragments (8 S8 values packed in 2 U32 registers)
