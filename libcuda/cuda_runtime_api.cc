@@ -7697,8 +7697,26 @@ CUresult CUDAAPI cuFuncGetAttribute(int *pi, CUfunction_attribute attrib,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  if (pi) *pi = 0;
+  // yasai: answered from the kernel's PTX information (as cudaFuncGetAttributes). Triton reads
+  // NUM_REGS, LOCAL_SIZE_BYTES and MAX_THREADS_PER_BLOCK after cuModuleGetFunction and refuses to
+  // launch when the thread limit is 0. The CUfunction of a module function is its host key.
+  if (pi == NULL) return CUDA_ERROR_INVALID_VALUE;
+  *pi = 0;
+  struct cudaFuncAttributes attr;
+  memset(&attr, 0, sizeof(attr));
+  if (hfunc == NULL ||
+      cudaFuncGetAttributesInternal(&attr, reinterpret_cast<const char *>(hfunc)) != cudaSuccess)
+    return CUDA_ERROR_INVALID_HANDLE;
+  switch ((int)attrib) {
+    case 0: *pi = attr.maxThreadsPerBlock; break;       // MAX_THREADS_PER_BLOCK
+    case 1: *pi = (int)attr.sharedSizeBytes; break;     // SHARED_SIZE_BYTES
+    case 2: *pi = (int)attr.constSizeBytes; break;      // CONST_SIZE_BYTES
+    case 3: *pi = (int)attr.localSizeBytes; break;      // LOCAL_SIZE_BYTES
+    case 4: *pi = attr.numRegs; break;                  // NUM_REGS
+    case 5: *pi = attr.ptxVersion; break;               // PTX_VERSION
+    case 6: *pi = attr.binaryVersion; break;            // BINARY_VERSION
+    default: break;                                     // others: 0
+  }
   return CUDA_SUCCESS;
 }
 
