@@ -368,7 +368,29 @@ std::string ptx_for_image(const void *image, unsigned max_capability, std::strin
       *how = "fat binary " + h + ", embedded PTX " + sel[0];
       result = sel[0];
     } else {
-      *how = "fat binary " + h + " carries no PTX";
+      // yasai: a fat binary with ELF cubins only (CuTe DSL's kernels, loaded through
+      // cudaLibraryLoadData by FlashInfer's rmsnorm under SGLang) resolves like a bare cubin:
+      // its cubins are extracted and looked up in the JIT caches (ptx_for_cubin), where the
+      // DSL's own PTX lands with CUTE_DSL_KEEP=ptx and CUTE_DSL_DUMP_DIR.
+      const std::string edir = work_dir() + "/" + h + "-elf";
+      yasai_system(("mkdir -p '" + edir + "' && cd '" + edir +
+                    "' && $CUDA_INSTALL_PATH/bin/cuobjdump -xelf all '" + file +
+                    "' > /dev/null 2>&1").c_str());
+      std::vector<std::string> cubins;
+      find_files(edir, ".cubin", &cubins);
+      std::sort(cubins.begin(), cubins.end());
+      for (const std::string &c : cubins) {
+        std::string bytes;
+        if (!read_file(c, &bytes) || bytes.size() < 64) continue;
+        std::string sub;
+        result = ptx_for_cubin((const unsigned char *)bytes.data(), bytes.size(), &sub);
+        if (!result.empty()) {
+          *how = "fat binary " + h + " (cubin only): " + sub;
+          break;
+        }
+        *how = "fat binary " + h + " carries no PTX; " + sub;
+      }
+      if (cubins.empty()) *how = "fat binary " + h + " carries no PTX";
     }
   } else if (p[0] == 0x7f && p[1] == 'E' && p[2] == 'L' && p[3] == 'F') {
     result = ptx_for_cubin(p, elf_size(p), how);
