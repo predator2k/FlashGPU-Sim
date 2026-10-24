@@ -609,6 +609,22 @@ class ptx_thread_info {
   ptx_cta_info *m_cta_info;
   ptx_reg_t m_last_set_operand_value;
 
+  // yasai: cp.async copies of this thread that have not completed. In PTX a cp.async copy is
+  // complete (and its shared-memory write visible) only after cp.async.wait_group/wait_all or the
+  // thread's cp.async.mbarrier.arrive; the hardware writes the data some time after the issue.
+  // The functional model keeps the copies here and writes them at that point, so an ordinary
+  // st.shared that another thread issues to the same bytes before the wait does not overwrite
+  // the copied data (ThunderKittens' cp.async tile loads zero-fill out-of-tile rows that alias
+  // the next swizzle column, and the copies land after those stores on the hardware).
+  struct yasai_cp_async_copy {
+    addr_t smem_addr;        ///< shared-memory address of the copy
+    unsigned size;           ///< bytes written (cp-size)
+    unsigned char data[16];  ///< the bytes (source bytes, zero-filled to cp-size)
+  };
+  std::vector<yasai_cp_async_copy> m_cp_async_open;  ///< issued since the last commit_group
+  std::list<std::vector<yasai_cp_async_copy>>
+      m_cp_async_committed;  ///< committed groups, oldest first
+
  private:
   bool m_functionalSimulationMode;
   unsigned m_uid;
