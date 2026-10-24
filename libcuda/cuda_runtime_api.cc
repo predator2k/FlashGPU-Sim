@@ -407,6 +407,15 @@ CUctx_st *GPGPUSim_Context(gpgpu_context *ctx) {
   return the_context;
 }
 
+// yasai: fork safety of lazy initialization. The prepare handler takes the initialization lock,
+// so a fork never copies a half-done context creation or replay into the child (the replaying
+// thread does not exist there); parent and child release it after the fork. A child that
+// inherits a queue replays it once on its own first context call.
+static void yasai_init_atfork_prepare() { yasai_init_mu().lock(); }
+static void yasai_init_atfork_release() { yasai_init_mu().unlock(); }
+static const int g_yasai_init_atfork =
+    pthread_atfork(yasai_init_atfork_prepare, yasai_init_atfork_release, yasai_init_atfork_release);
+
 // yasai: true when a registration must be queued: lazy initialization on and no context yet.
 // The caller holds yasai_init_mu.
 static bool yasai_defer_registration() {
@@ -3431,6 +3440,15 @@ static std::mutex g_yasai_managed_mutex;
 __host__ cudaError_t CUDARTAPI cudaFree(void *devPtr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
+  }
+  // yasai: cudaFree(0) is the CUDA idiom that creates the context; with lazy initialization it
+  // also builds the GPU model and replays the queued registrations, so a load-then-fork parent
+  // (cudaFree(0), then fork) parses the PTX once and its children inherit it. Without this the
+  // children replayed and extracted the PTX into the same directory at once, and one of them
+  // found no fat cubin for its kernel (fork check, 2026-10-24).
+  if (devPtr == NULL) {
+    GPGPUSim_Context(GPGPU_Context());
+    return g_last_cudaError = cudaSuccess;
   }
   {
     std::lock_guard<std::mutex> lock(g_yasai_managed_mutex);
