@@ -32,6 +32,12 @@ struct Registry {
   std::set<std::string> defined;                    ///< names some module defines with linkage
   std::map<std::string, std::vector<std::pair<std::string, std::string>>> renamed;  ///< name ->
                                                     ///< (file base name, renamed symbol)
+  std::map<std::string, std::string> entry_unit;    ///< .entry name -> unit that defined it first
+  std::map<std::string, std::vector<std::pair<std::string, std::string>>> entry_renamed;  ///<
+                                                    ///< .entry name -> (unit, renamed symbol)
+  std::map<std::string, std::map<std::string, std::string>> path_entries;  ///< scanned path ->
+                                                    ///< (.entry name -> renamed symbol)
+  std::map<std::string, std::string> entry_source;  ///< renamed .entry symbol -> source name
 };
 
 /// The process-wide registry.
@@ -162,11 +168,34 @@ std::string decl_name(const std::string &line, bool *linked, bool *defines) {
   return line.substr(p, e - p);
 }
 
+/// Name of the kernel that a file-scope line declares with .entry (any linkage), or "".
+/// @param line PTX line at brace depth 0.
+/// @return The entry name, or "".
+std::string entry_decl_name(const std::string &line) {
+  size_t p = line.find_first_not_of(" \t");
+  while (p != std::string::npos && p < line.size() && line[p] == '.') {
+    size_t e = p + 1;
+    while (e < line.size() && ident_char(line[e])) ++e;
+    const bool entry = line.compare(p, e - p, ".entry") == 0;
+    p = line.find_first_not_of(" \t", e);
+    if (p == std::string::npos) return "";
+    if (entry) {
+      if (!ident_start(line[p])) return "";
+      size_t n = p;
+      while (n < line.size() && ident_char(line[n])) ++n;
+      return line.substr(p, n - p);
+    }
+  }
+  return "";
+}
+
 /// Module-local names that a PTX file declares (file-scope lines at brace depth 0).
 /// @param path PTX file.
 /// @param defined Receives the names the file defines with linkage (.visible, .weak, .common).
+/// @param entries Receives the .entry names of the file, in file order.
 /// @return The names (empty when the file cannot be read).
-std::set<std::string> local_names(const std::string &path, std::set<std::string> *defined) {
+std::set<std::string> local_names(const std::string &path, std::set<std::string> *defined,
+                                  std::vector<std::string> *entries) {
   std::set<std::string> names;
   std::ifstream in(path);
   std::string line;
@@ -177,6 +206,8 @@ std::set<std::string> local_names(const std::string &path, std::set<std::string>
       const std::string n = decl_name(line, &linked, &defines);
       if (!n.empty() && !linked) names.insert(n);
       if (!n.empty() && defines) defined->insert(n);
+      const std::string en = entry_decl_name(line);
+      if (!en.empty()) entries->push_back(en);
     }
     depth += brace_delta(line);
     if (depth < 0) depth = 0;
@@ -231,14 +262,25 @@ std::string rename_line(const std::string &line, const std::set<std::string> &na
 
 }  // namespace
 
-std::string scope_file(const std::string &path) {
+std::string scope_file(const std::string &path, const std::string &unit_in) {
   const char *off = getenv("YASAI_MODULE_SCOPE");
   if (off && atoi(off) == 0) return path;
   Registry &r = registry();
   std::lock_guard<std::mutex> lock(r.mu);
   auto it = r.scoped_path.find(path);
   if (it != r.scoped_path.end()) return it->second;
-  const std::set<std::string> names = local_names(path, &r.defined);
+  std::vector<std::string> entries;
+  std::set<std::string> names = local_names(path, &r.defined, &entries);
+  // A kernel name that another unit defined first is renamed in this file, so each unit keeps
+  // its own kernel; files of one unit (one library's architecture variants) share their names.
+  const std::string unit = unit_in.empty() ? library_key(base_name(path)) : unit_in;
+  std::set<std::string> dup_entries;
+  for (const std::string &e : entries) {
+    auto o = r.entry_unit.find(e);
+    if (o == r.entry_unit.end()) r.entry_unit[e] = unit;
+    else if (o->second != unit) dup_entries.insert(e);
+  }
+  names.insert(dup_entries.begin(), dup_entries.end());
   if (names.empty()) {
     r.scoped_path[path] = path;
     return path;
@@ -281,9 +323,20 @@ std::string scope_file(const std::string &path) {
     fprintf(stderr, "yasai-scope: cannot rename %s to %s\n", tmp.c_str(), out_path.c_str());
     abort();
   }
-  for (const std::string &n : names) r.renamed[n].emplace_back(base, n + suffix);
+  for (const std::string &n : names) {
+    if (dup_entries.count(n)) {
+      r.entry_renamed[n].emplace_back(unit, n + suffix);
+      r.path_entries[path][n] = n + suffix;
+      r.entry_source[n + suffix] = n;
+    } else {
+      r.renamed[n].emplace_back(base, n + suffix);
+    }
+  }
   printf("GPGPU-Sim PTX: %zu module-local symbols of %s scoped to the module (%s)\n", names.size(),
          path.c_str(), out_path.c_str());
+  if (!dup_entries.empty())
+    printf("GPGPU-Sim PTX: %zu kernels of %s are also defined by another module and are renamed "
+           "with suffix %s\n", dup_entries.size(), path.c_str(), suffix.c_str());
   r.scoped_path[path] = out_path;
   return out_path;
 }
@@ -305,6 +358,33 @@ std::string local_name(const std::string &name, const std::string &library) {
   }
   if (it->second.size() == 1 && !r.defined.count(name)) return it->second.front().second;
   return name;
+}
+
+std::string module_entry_name(const std::string &path, const std::string &name) {
+  Registry &r = registry();
+  std::lock_guard<std::mutex> lock(r.mu);
+  auto p = r.path_entries.find(path);
+  if (p == r.path_entries.end()) return name;
+  auto e = p->second.find(name);
+  return e == p->second.end() ? name : e->second;
+}
+
+std::string library_entry_name(const std::string &name, const std::string &library) {
+  Registry &r = registry();
+  std::lock_guard<std::mutex> lock(r.mu);
+  auto it = r.entry_renamed.find(name);
+  if (it == r.entry_renamed.end() || library.empty()) return name;
+  const std::string key = library_key(base_name(library));
+  for (const auto &cand : it->second)
+    if (cand.first == key) return cand.second;
+  return name;
+}
+
+std::string source_name(const std::string &name) {
+  Registry &r = registry();
+  std::lock_guard<std::mutex> lock(r.mu);
+  auto it = r.entry_source.find(name);
+  return it == r.entry_source.end() ? name : it->second;
 }
 
 }  // namespace yasai_scope

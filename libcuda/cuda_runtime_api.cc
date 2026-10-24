@@ -1052,8 +1052,10 @@ static CUresult load_module_from_ptx_file(CUmodule *module,
   printf("GPGPU-Sim PTX: %s loading module handle %u using PTX sidecar %s\n",
          caller, module_handle, ptx_path.c_str());
 
-  // yasai: module-local symbols are scoped to the module (yasai_module_scope.h).
-  const std::string parse_path = yasai_scope::scope_file(ptx_path);
+  // yasai: module-local symbols are scoped to the module (yasai_module_scope.h). The module is
+  // its own unit, so a kernel name that another module already defines is renamed in it and
+  // cuModuleGetFunction maps the name back per module.
+  const std::string parse_path = yasai_scope::scope_file(ptx_path, ptx_path);
   symbol_table *symtab =
       ctx->gpgpu_ptx_sim_load_ptx_from_filename(parse_path.c_str());
   context->add_binary(symtab, module_handle);
@@ -1362,7 +1364,19 @@ void cudaRegisterFunctionInternal(void **fatCubinHandle, const char *hostFun,
       deviceFun, hostFun, fat_cubin_handle);
   if (context->get_device()->get_gpgpu()->get_config().use_cuobjdump())
     ctx->cuobjdumpParseBinary(fat_cubin_handle);
-  context->register_function(fat_cubin_handle, hostFun, deviceFun);
+  // yasai: a kernel that the registering library shares by name with another library was
+  // renamed in this library's PTX (yasai_module_scope.h); the host stub is tied to this fat
+  // binary, so it resolves to the library's own kernel.
+  std::string reg_library;
+  const auto late = yasai_handle_library().find(fat_cubin_handle);
+  if (late != yasai_handle_library().end()) {
+    reg_library = late->second;
+  } else {
+    const auto reg_lib = ctx->api->fatbinmap.find(int(fat_cubin_handle));
+    if (reg_lib != ctx->api->fatbinmap.end()) reg_library = reg_lib->second;
+  }
+  const std::string reg_name = yasai_scope::library_entry_name(deviceFun, reg_library);
+  context->register_function(fat_cubin_handle, hostFun, reg_name.c_str());
 }
 
 void cudaRegisterVarInternal(
@@ -1592,7 +1606,9 @@ cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = N
   const cudaError_t ret = cudaLaunchInternalImpl(hostFun, gpgpu_ctx);
   const uint64_t t1 = yasai_rec::mono_ns();
   function_info *entry = GPGPUSim_Context(ctx)->get_kernel(hostFun);
-  const std::string name = entry ? entry->get_name() : std::string("unknown");
+  // yasai: a renamed kernel (yasai_module_scope.h) is recorded under its source name
+  const std::string name =
+      entry ? yasai_scope::source_name(entry->get_name()) : std::string("unknown");
   const gpgpu_ptx_sim_info *info = entry ? entry->get_kernel_info() : NULL;
   const dim3 g = config.grid_dim(), b = config.block_dim();
   rec.api("cudaLaunchKernel", t0, t1, corr, int(ret));
@@ -7724,8 +7740,13 @@ CUresult CUDAAPI cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod,
     return CUDA_ERROR_INVALID_HANDLE;
   }
 
-  // Look up the kernel function by name in the symbol table
-  symbol *sym = symtab->lookup(name);
+  // Look up the kernel function by name in the symbol table. yasai: a kernel that this module
+  // shares by name with another module is renamed in this module (yasai_module_scope.h).
+  std::string sym_name = name;
+  const auto mod_ptx = yasai_module_ptx().find(module_handle);
+  if (mod_ptx != yasai_module_ptx().end())
+    sym_name = yasai_scope::module_entry_name(mod_ptx->second, name);
+  symbol *sym = symtab->lookup(sym_name.c_str());
   if (sym == NULL) {
     printf("ERROR: Kernel '%s' not found in module\n", name);
     return CUDA_ERROR_INVALID_HANDLE;
@@ -7741,7 +7762,7 @@ CUresult CUDAAPI cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod,
   // ! Use the deviceFunc as the hostFunc for now.
   const char *hostFunc = reinterpret_cast<const char *>(deviceFunc);
 
-  context->register_function(module_handle, hostFunc, name);
+  context->register_function(module_handle, hostFunc, sym_name.c_str());
 
   // Return the function as a CUfunction (we use the function_info pointer as
   // the handle)
@@ -11703,7 +11724,7 @@ extern "C" CUresult CUDAAPI cuKernelGetName(const char **name, void *kernel) {
   if (name == NULL || kernel == NULL) return CUDA_ERROR_INVALID_VALUE;
   static std::map<void *, std::string> names;
   function_info *f = reinterpret_cast<function_info *>(kernel);
-  names[kernel] = f->get_name();
+  names[kernel] = yasai_scope::source_name(f->get_name());  // yasai: source name if renamed
   *name = names[kernel].c_str();
   return CUDA_SUCCESS;
 }
