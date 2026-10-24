@@ -4986,6 +4986,10 @@ static void yasai_register_library_ptx(gpgpu_context *ctx, unsigned handle, void
     L.files.push_back(f);
     L.archs.push_back(yasai_jit::arch_of_ptx_file(f));
     L.loaded.push_back(false);
+    // per-kernel parsing state, one entry per file as in cuobjdumpParseBinary
+    L.vars_loaded.push_back(false);
+    L.funcs_loaded.emplace_back();
+    L.pieces.push_back(0);
     std::ifstream in(f);
     std::string line;
     while (std::getline(in, line)) {
