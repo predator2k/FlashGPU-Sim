@@ -1804,6 +1804,15 @@ class arg_buffer_t {
       : m_src_op(ctx) {
     make_copy(another);
   }
+  // yasai: a deep copy. The implicit copy constructor copied the m_param_value pointer, so
+  // copy_args_into_buffer_list's push_back of the temporary that copy_arg_to_buffer returns left
+  // the list element pointing at a buffer the temporary freed, and destroying the list freed it a
+  // second time (a call whose formal parameter is in param space: "free(): double free" in
+  // call_impl).
+  arg_buffer_t(const arg_buffer_t &another) : m_src_op(another.m_src_op) {
+    m_param_value = NULL;
+    make_copy(another);
+  }
   void make_copy(const arg_buffer_t &another) {
     m_dst = another.m_dst;
     m_src_op = another.m_src_op;
