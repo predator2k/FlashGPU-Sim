@@ -7829,13 +7829,49 @@ CUresult CUDAAPI cuStreamBatchMemOp(CUstream stream, unsigned int count,
 
 /** @} */ /* END CUDA_EVENT */
 
+// yasai: function attributes from the kernel's ptxas information and the device configuration
+// (CUfunction values are function_info pointers). Triton reads NUM_REGS, LOCAL_SIZE_BYTES and
+// MAX_DYNAMIC_SHARED_SIZE_BYTES for every kernel it loads; attributes the simulator has no
+// meaning for (cache mode, cluster preferences) read 0.
+//   pi: receives the value; attrib: attribute; hfunc: function
 CUresult CUDAAPI cuFuncGetAttribute(int *pi, CUfunction_attribute attrib,
                                     CUfunction hfunc) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  if (pi) *pi = 0;
+  if (pi == NULL) return CUDA_ERROR_INVALID_VALUE;
+  function_info *entry = reinterpret_cast<function_info *>(hfunc);
+  if (entry == NULL) return CUDA_ERROR_INVALID_HANDLE;
+  gpgpu_context *ctx = GPGPU_Context();
+  CUctx_st *context = GPGPUSim_Context(ctx);
+  gpgpu_sim *gpu = context->get_device()->get_gpgpu();
+  const struct gpgpu_ptx_sim_info *k = entry->get_kernel_info();
+  const struct cudaDeviceProp *prop = context->get_device()->get_prop();
+  switch (attrib) {
+    case CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK: {
+      struct cudaFuncAttributes fa;
+      memset(&fa, 0, sizeof(fa));
+      fa.numRegs = k->regs;
+      fa.sharedSizeBytes = k->smem;
+      *pi = k->maxthreads > 0 ? (int)k->maxthreads : (int)getMaxThreadsPerBlock(&fa, ctx);
+      break;
+    }
+    case CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES: *pi = (int)k->smem; break;
+    case CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES: *pi = (int)k->cmem; break;
+    case CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES: *pi = (int)k->lmem; break;
+    case CU_FUNC_ATTRIBUTE_NUM_REGS: *pi = (int)k->regs; break;
+    case CU_FUNC_ATTRIBUTE_PTX_VERSION: *pi = (int)k->ptx_version; break;
+    case CU_FUNC_ATTRIBUTE_BINARY_VERSION: *pi = (int)k->sm_target; break;
+    case CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: {
+      const unsigned set = gpu->has_kernel_max_dynamic_smem(entry->get_name())
+                               ? gpu->get_kernel_max_dynamic_smem(entry->get_name())
+                               : 0;
+      const unsigned optin = (unsigned)prop->sharedMemPerBlockOptin;
+      *pi = set != 0 ? (int)set : (int)(optin > k->smem ? optin - k->smem : 0);
+      break;
+    }
+    default: *pi = 0; break;
+  }
   return CUDA_SUCCESS;
 }
 
