@@ -3062,9 +3062,13 @@ __host__ cudaError_t CUDARTAPI cudaStreamSynchronizeInternal(
     yasai_stream_manager(ctx)->yasai_wait_stream(stream, UINT64_MAX);
     return g_last_cudaError = cudaSuccess;
   }
-  if (stream == NULL) ctx->synchronize();
+  // yasai (fork 1cee089d): in the former mode a created stream is waited for too; the upstream
+  // code returned before stream->synchronize().
+  if (stream == NULL)
+    ctx->synchronize();
+  else
+    stream->synchronize();
   return g_last_cudaError = cudaSuccess;
-  stream->synchronize();
 #else
   printf(
       "GPGPU-Sim PTX: WARNING: Asynchronous kernel execution not supported "

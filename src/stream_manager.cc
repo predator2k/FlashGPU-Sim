@@ -150,6 +150,9 @@ void CUstream_st::synchronize() {
     pthread_mutex_lock(&m_lock);
     done = m_operations.empty();
     pthread_mutex_unlock(&m_lock);
+    // yasai: sleep between polls, so the waiting host thread leaves the core to the simulation
+    // thread that executes the stream (one core per rank under taskset)
+    if (!done) usleep(100);
   } while (!done);
 }
 
