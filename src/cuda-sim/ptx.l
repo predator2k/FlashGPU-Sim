@@ -379,6 +379,9 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 [$%][a-zA-Z0-9_$]+  TC; yylval->string_value = strdup(yytext); return IDENTIFIER;
 
 [0-9]+\.[0-9]+ 	 TC; sscanf(yytext,"%lf", &yylval->double_value); return DOUBLE_OPERAND;
+  /* yasai: a decimal literal with a trailing point ("0." in an mma accumulator vector of
+     FlashInfer's prefill kernels); a following digit takes the rule above. */
+[0-9]+\./[^0-9a-zA-Z_] 	 TC; sscanf(yytext,"%lf", &yylval->double_value); return DOUBLE_OPERAND;
 	
 0[xX][0-9a-fA-F]+U? TC; CHECK_UNSIGNED; yylval->int_value = (long long)strtoull(yytext, NULL, 0); return INT_OPERAND;
 0[0-7]+U?   	TC; printf("GPGPU-Sim: ERROR ** parsing octal not (yet) implemented\n"); abort(); return INT_OPERAND;

@@ -657,8 +657,22 @@ void gpgpu_context::gpgpu_ptx_info_load_from_filename(const char *filename,
     char host[256] = {0};
     gethostname(host, sizeof(host) - 1);
     const char *slash = strrchr(filename, '/');
-    ptxas_filename = std::string(slash ? slash + 1 : filename) + "." + host + "." +
-                     std::to_string(getpid()) + "." + std::to_string(ptxas_seq++) + ".ptxas";
+    std::string base = slash ? slash + 1 : filename;
+    // yasai: a long base name (a JIT module named after its template parameters, behind a
+    // module-scope hash prefix and a piece suffix) is shortened to 120 characters plus a hash of
+    // the whole name, so the output name stays below the 255-byte file name limit.
+    if (base.size() > 160) {
+      uint64_t h = 1469598103934665603ull;
+      for (char c : base) {
+        h ^= uint8_t(c);
+        h *= 1099511628211ull;
+      }
+      char hx[24];
+      snprintf(hx, sizeof hx, "-%016llx", (unsigned long long)h);
+      base = base.substr(0, 120) + hx;
+    }
+    ptxas_filename = base + "." + host + "." + std::to_string(getpid()) + "." +
+                     std::to_string(ptxas_seq++) + ".ptxas";
   }
   // yasai: PTX newer than the toolkit's ptxas accepts (CuTe DSL ships its own NVVM and writes
   // ".version 9.4"; CUDA 13.0's ptxas stops at 9.0, YASAI_PTXAS_MAX_PTX_VERSION) goes to the ptxas
