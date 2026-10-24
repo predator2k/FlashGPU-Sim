@@ -266,6 +266,8 @@ class kernel_config {
   void set_block_dim(dim3 *d) { m_BlockDim = *d; }
   gpgpu_ptx_sim_arg_list_t get_args() { return m_args; }
   struct CUstream_st *get_stream() { return m_stream; }
+  /// yasai: whether arguments were set up on this configuration (a launch is consuming it).
+  bool has_args() const { return !m_args.empty(); }
 
  private:
   dim3 m_GridDim;
@@ -273,6 +275,33 @@ class kernel_config {
   size_t m_sharedMem;
   struct CUstream_st *m_stream;
   gpgpu_ptx_sim_arg_list_t m_args;
+};
+
+/// yasai: the launch configurations of the calling thread (cudaConfigureCall,
+/// __cudaPushCallConfiguration and the direct launch functions push; a launch consumes its
+/// own). One stack per thread rather than per context, so a <<<>>> launch on one thread and a
+/// direct launch on another cannot take each other's configuration. The methods are the subset
+/// of std::list that the runtime uses.
+class yasai_launch_stack {
+ public:
+  /// @return Whether the calling thread has no pushed configuration.
+  bool empty() const { return list().empty(); }
+  /// @return The calling thread's newest configuration.
+  kernel_config &back() { return list().back(); }
+  /// Drops the calling thread's newest configuration.
+  void pop_back() { list().pop_back(); }
+  /// Pushes a configuration for the calling thread.
+  /// @param c Configuration.
+  void push_back(const kernel_config &c) { list().push_back(c); }
+  /// @return Number of configurations the calling thread has pushed.
+  size_t size() const { return list().size(); }
+
+ private:
+  /// @return The calling thread's list.
+  static std::list<kernel_config> &list() {
+    thread_local std::list<kernel_config> stack;
+    return stack;
+  }
 };
 
 class cuda_runtime_api {
@@ -285,7 +314,7 @@ class cuda_runtime_api {
   // global list
   std::list<cuobjdumpSection *> cuobjdumpSectionList;
   std::list<cuobjdumpSection *> libSectionList;
-  std::list<kernel_config> g_cuda_launch_stack;
+  yasai_launch_stack g_cuda_launch_stack;  // yasai: per thread (see yasai_launch_stack)
   std::map<int, bool> fatbin_registered;
   std::map<int, std::string> fatbinmap;
   std::map<std::string, symbol_table *> name_symtab;

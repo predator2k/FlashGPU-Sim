@@ -3073,6 +3073,23 @@ __host__ cudaError_t CUDARTAPI cudaLaunchKernelInternal(
   function_info *entry = context->get_kernel(hostFun);
 #if CUDART_VERSION < 10000
   cudaConfigureCallInternal(gridDim, blockDim, sharedMem, stream, ctx);
+#else
+  // yasai: a launch through the <<<>>> stub finds the configuration that
+  // __cudaPushCallConfiguration pushed (the stub passes the same values, and no argument is set
+  // up on it yet). A direct call of cudaLaunchKernel, cudaLaunchKernelExC or
+  // cudaLaunchCooperativeKernel, as libraries make (FlashInfer's sampling kernels, CUTLASS),
+  // has none and pushes its own; it aborted with "empty launch stack" before.
+  {
+    bool pushed = false;
+    if (!ctx->api->g_cuda_launch_stack.empty()) {
+      kernel_config &top = ctx->api->g_cuda_launch_stack.back();
+      const dim3 g = top.grid_dim(), b = top.block_dim();
+      pushed = !top.has_args() && g.x == gridDim.x && g.y == gridDim.y && g.z == gridDim.z &&
+               b.x == blockDim.x && b.y == blockDim.y && b.z == blockDim.z &&
+               top.shared_mem() == sharedMem && top.get_stream() == (struct CUstream_st *)stream;
+    }
+    if (!pushed) cudaConfigureCallInternal(gridDim, blockDim, sharedMem, stream, ctx);
+  }
 #endif
   // yasai: a kernel without PTX (get_kernel named it once) is an invalid device function, as
   // on a GPU without code for it; the launch used to dereference the null entry. The launch
@@ -10640,8 +10657,7 @@ __host__ cudaError_t CUDARTAPI cudaLaunchKernelExC(
     if (config->attrs[i].id == cudaLaunchAttributeCooperative && config->attrs[i].val.cooperative)
       g_yasai_pending_cooperative = true;
 
-  cudaConfigureCallInternal(config->gridDim, config->blockDim,
-                            config->dynamicSmemBytes, config->stream);
+  // yasai: cudaLaunchKernelInternal pushes the configuration (a direct launch).
   return cudaLaunchKernelInternal((const char *)func, config->gridDim,
                                   config->blockDim, (const void **)args,
                                   config->dynamicSmemBytes, config->stream);
@@ -11037,8 +11053,7 @@ extern "C" cudaError_t CUDARTAPI cudaLaunchCooperativeKernel(const void *func, d
                                                              dim3 blockDim, void **args,
                                                              size_t sharedMem, cudaStream_t stream) {
   g_yasai_pending_cooperative = true;
-  // As cudaLaunchKernelExC: the launch configuration is pushed here (no <<<>>> stub did it).
-  cudaConfigureCallInternal(gridDim, blockDim, sharedMem, stream);
+  // As cudaLaunchKernelExC: cudaLaunchKernelInternal pushes the configuration (no <<<>>> stub).
   const cudaError_t e = cudaLaunchKernelInternal((const char *)func, gridDim, blockDim,
                                                  (const void **)args, sharedMem, stream);
   g_yasai_pending_cooperative = false;
@@ -11798,4 +11813,37 @@ extern "C" CUresult CUDAAPI cuOccupancyMaxActiveClusters(int *numClusters, CUfun
   if (!numClusters || !config) return CUDA_ERROR_INVALID_VALUE;
   *numClusters = yasai_max_active_clusters(config->attrs, config->numAttrs);
   return CUDA_SUCCESS;
+}
+
+// yasai: the per-thread default stream forms of the launch functions, which nvcc's
+// --default-stream per-thread maps cudaLaunchKernel, cudaLaunchKernelExC and
+// cudaLaunchCooperativeKernel to. A NULL stream is the calling thread's default stream
+// (cudaStreamPerThread); otherwise they are the plain functions.
+// @param s Stream given by the caller.
+// @return The stream to launch on.
+static cudaStream_t yasai_ptsz_stream(cudaStream_t s) {
+  return s == NULL ? reinterpret_cast<cudaStream_t>(uintptr_t(2)) : s;
+}
+
+extern "C" __host__ cudaError_t CUDARTAPI cudaLaunchKernel_ptsz(const void *func, dim3 gridDim,
+                                                                dim3 blockDim, void **args,
+                                                                size_t sharedMem,
+                                                                cudaStream_t stream) {
+  return cudaLaunchKernel((const char *)func, gridDim, blockDim, (const void **)args, sharedMem,
+                          yasai_ptsz_stream(stream));
+}
+
+extern "C" __host__ cudaError_t CUDARTAPI cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_t *config,
+                                                                   const void *func, void **args) {
+  if (config == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  cudaLaunchConfig_t c = *config;
+  c.stream = yasai_ptsz_stream(c.stream);
+  return cudaLaunchKernelExC(&c, func, args);
+}
+
+extern "C" __host__ cudaError_t CUDARTAPI cudaLaunchCooperativeKernel_ptsz(
+    const void *func, dim3 gridDim, dim3 blockDim, void **args, size_t sharedMem,
+    cudaStream_t stream) {
+  return cudaLaunchCooperativeKernel(func, gridDim, blockDim, args, sharedMem,
+                                     yasai_ptsz_stream(stream));
 }
