@@ -33,4 +33,11 @@ void gpgpusim_cuda_vprintf(const class ptx_instruction* pI,
                            class ptx_thread_info* thread,
                            const class function_info* target_func);
 
+// yasai: the intrinsic for CUDA's device assert (__assertfail): prints the assertion of the
+// calling thread; the trap that follows the call ends the thread.
+//   pI: the call instruction; thread: calling thread; target_func: the declared __assertfail
+void yasai_cuda_assertfail(const class ptx_instruction* pI,
+                           class ptx_thread_info* thread,
+                           const class function_info* target_func);
+
 #endif

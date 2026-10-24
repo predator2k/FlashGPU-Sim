@@ -116,3 +116,58 @@ void gpgpusim_cuda_vprintf(const ptx_instruction *pI, ptx_thread_info *thread,
   free(fmtstr);
   free(arg_list);
 }
+
+
+// yasai: reads the value of parameter arg of a call (as gpgpusim_cuda_vprintf does).
+//   pI: the call; thread: calling thread; target_func: callee; arg: parameter index
+static unsigned long long yasai_call_param(const ptx_instruction *pI, ptx_thread_info *thread,
+                                           const function_info *target_func, unsigned arg) {
+  const operand_info &actual_param_op = pI->operand_lookup(target_func->has_return() + 1 + arg);
+  const symbol *formal_param = target_func->get_arg(arg);
+  unsigned long long buffer[8] = {0};
+  unsigned size = formal_param->get_size_in_bytes();
+  if (size > sizeof(buffer)) size = sizeof(buffer);
+  if (actual_param_op.is_param_local())
+    thread->m_local_mem->read(actual_param_op.get_symbol()->get_address(), size, buffer);
+  return buffer[0];
+}
+
+// yasai: a NUL-terminated string at a generic address of the calling thread (at most n bytes).
+//   pI: the call; thread: calling thread; target_func: callee; arg: parameter index; n: limit
+static std::string yasai_call_string(const ptx_instruction *pI, ptx_thread_info *thread,
+                                     const function_info *target_func, unsigned arg, unsigned n) {
+  addr_t addr = (addr_t)yasai_call_param(pI, thread, target_func, arg);
+  if (addr == 0) return "(null)";
+  const operand_info &actual_param_op = pI->operand_lookup(target_func->has_return() + 1 + arg);
+  memory_space *mem = NULL;
+  memory_space_t space = generic_space;
+  decode_space(space, thread, actual_param_op, mem, addr);
+  std::string out;
+  for (unsigned i = 0; i < n; i++) {
+    char b = 0;
+    mem->read(addr + i, 1, &b);
+    if (b == 0) break;
+    out.push_back(b);
+  }
+  return out;
+}
+
+// yasai: __assertfail(message, file, line, function, charSize): prints the device assertion of
+// the calling thread as the CUDA driver does (the first 16 per process).
+//   pI: the call; thread: calling thread; target_func: the declared __assertfail
+void yasai_cuda_assertfail(const ptx_instruction *pI, ptx_thread_info *thread,
+                           const function_info *target_func) {
+  static unsigned printed = 0;
+  if (printed >= 16 || target_func->num_args() < 4) return;
+  printed++;
+  const std::string msg = yasai_call_string(pI, thread, target_func, 0, 512);
+  const std::string file = yasai_call_string(pI, thread, target_func, 1, 512);
+  const unsigned line = (unsigned)yasai_call_param(pI, thread, target_func, 2);
+  const std::string func = yasai_call_string(pI, thread, target_func, 3, 512);
+  const dim3 cta = thread->get_ctaid();
+  const dim3 tid = thread->get_tid();
+  printf("GPGPU-Sim PTX: device assert: %s:%u: %s: block: [%u,%u,%u], thread: [%u,%u,%u] "
+         "Assertion `%s` failed.\n",
+         file.c_str(), line, func.c_str(), cta.x, cta.y, cta.z, tid.x, tid.y, tid.z, msg.c_str());
+  fflush(stdout);
+}

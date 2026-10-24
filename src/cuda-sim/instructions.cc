@@ -2700,6 +2700,14 @@ void call_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     gpgpusim_cuda_vprintf(pI, thread, target_func);
     return;
   }
+  // yasai: CUDA's device assert. The driver provides __assertfail; PTX only declares it
+  // (.extern .func), so a call used to jump to an unassembled address (segfault in
+  // getExecuteWarp). It prints the assertion like the driver does and returns; the trap that
+  // follows the call in the PTX ends the thread.
+  if (fname == "__assertfail") {
+    yasai_cuda_assertfail(pI, thread, target_func);
+    return;
+  }
 #if (CUDART_VERSION >= 5000)
   // Jin: handle device runtime apis for CDP
   else if (fname == "cudaGetParameterBufferV2") {
