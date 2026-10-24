@@ -29,6 +29,7 @@
 #define YASAI_FUNC_H
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -44,6 +45,11 @@ struct Config {
   bool cta_sample = false;   // YASAI_CTA_SAMPLE
   std::string trace_dir;     // YASAI_TRACE_DIR: directory of the per-kernel warp traces; empty disables
   uint64_t trace_max_bytes = 0;  // YASAI_TRACE_MAX_MB in bytes; 0 means no limit
+  // YASAI_LAUNCH_ONLY_REGEX: kernels whose mangled name matches (std::regex, ECMAScript, searched
+  // anywhere in the name) are launched and recorded but none of their CTAs execute, so their
+  // outputs keep the previous memory contents. Meant for kernels whose values do not matter in a
+  // run, such as the random initialization of dummy weights; empty disables.
+  std::string launch_only_regex;
 };
 
 // Returns the process-wide configuration.
@@ -132,6 +138,9 @@ bool skip_fp_value(const ptx_instruction *pI, unsigned lane_id);
 // equals the lowest interior index (2). The second index in each dimension gives the per-
 // dimension address stride used by the synthesis. Without YASAI_CTA_SAMPLE every CTA runs.
 bool cta_is_representative(Dim3 grid, unsigned cta_linear_id);
+
+// True when the current kernel (kernel_begin) matches YASAI_LAUNCH_ONLY_REGEX: no CTA runs.
+bool launch_only();
 
 // Functional mbarrier model. FlashGPU-Sim keeps mbarrier state only in the timing model
 // (barrier_set_t), so in PTX_SIM_MODE_FUNC=1 an mbarrier.try_wait never succeeds and every kernel
@@ -253,6 +262,13 @@ uint16_t minifloat_encode_f16(float x);
 // global variable name and returns true, or returns false when no unloaded file defines it.
 // Null until a fat binary is registered lazily.
 extern bool (*g_lazy_load_name)(const char *name);
+
+// Mutex that serializes PTX parsing and lazy loading. The parser and the symbol tables are
+// shared by the whole process, and two threads parse at once when the simulation thread loads
+// a function body lazily (call_impl) while a host thread loads the piece of a kernel it is
+// launching, or a module image; that corrupted the parser state (a double free in call_impl).
+// Recursive, because a lazy load parses through the same entry points.
+std::recursive_mutex &ptx_load_mutex();
 
 // Function handles for function addresses held in data (indirect calls through a table, as in
 // NCCL's ncclDevFuncTable). A handle is kFunctionHandleTag | index; the index is the order in

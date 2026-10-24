@@ -115,7 +115,9 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <deque>
 #include <fstream>
+#include <mutex>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -747,9 +749,17 @@ static std::string get_cuda_library_ptx_path() {
   return std::string();
 }
 
+// yasai: PTX file of each module handle loaded from PTX (cuLibraryEnumerateKernels lists its
+// entries).
+static std::map<unsigned, std::string> &yasai_module_ptx() {
+  static std::map<unsigned, std::string> m;
+  return m;
+}
+
 static CUresult load_module_from_ptx_file(CUmodule *module,
                                           const std::string &ptx_path,
                                           const char *caller) {
+  std::lock_guard<std::recursive_mutex> yasai_lock(yasai_func::ptx_load_mutex());
   gpgpu_context *ctx = GPGPU_Context();
   if (!ctx) {
     printf("ERROR: No active GPGPU context\n");
@@ -773,6 +783,7 @@ static CUresult load_module_from_ptx_file(CUmodule *module,
   ctx->api->fatbinmap[module_handle] = ptx_path;
   ctx->api->fatbin_registered[module_handle] = true;
   ctx->api->name_symtab[ptx_path] = symtab;
+  yasai_module_ptx()[module_handle] = ptx_path;
 
   std::string arch = ptx_target_from_file(ptx_path);
   if (arch.empty()) {
@@ -1204,12 +1215,29 @@ cudaError_t cudaSetupArgumentInternal(const void *arg, size_t size,
 
 cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx);
 
+// yasai: stream capture (CUDA graphs; implemented at the end of this file). Each returns true
+// when the stream is being captured and the operation was recorded into its graph instead of
+// being issued.
+static bool yasai_capture_kernel(const char *hostFun, kernel_config &config);
+static bool yasai_capture_memcpy(void *dst, const void *src, size_t count, enum cudaMemcpyKind kind,
+                                 cudaStream_t stream);
+static bool yasai_capture_memset(void *mem, int value, size_t count, cudaStream_t stream);
+static bool yasai_capture_host_fn(cudaStream_t stream, cudaHostFn_t fn, void *user);
+static bool yasai_capture_event_record(cudaEvent_t event, cudaStream_t stream);
+static bool yasai_capture_wait_event(cudaStream_t stream, cudaEvent_t event);
+
 // yasai: every kernel launch (cudaLaunchKernel, cudaLaunchKernelExC, cuLaunchKernel,
 // cuLaunchKernelEx) reaches this function; with YASAI_FAKEENV_OUT set it records an api and a
 // kernel record (yasai_fakeenv_rec.h) around the launch.
 cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = NULL) {
   yasai_rec::Recorder &rec = yasai_rec::Recorder::get();
   gpgpu_context *ctx = gpgpu_ctx ? gpgpu_ctx : GPGPU_Context();
+  // yasai: a launch into a capturing stream becomes a kernel node of the captured graph.
+  if (!ctx->api->g_cuda_launch_stack.empty() &&
+      yasai_capture_kernel(hostFun, ctx->api->g_cuda_launch_stack.back())) {
+    ctx->api->g_cuda_launch_stack.pop_back();
+    return g_last_cudaError = cudaSuccess;
+  }
   if (!rec.on() || ctx->api->g_cuda_launch_stack.empty())
     return cudaLaunchInternalImpl(hostFun, gpgpu_ctx);
   kernel_config config = ctx->api->g_cuda_launch_stack.back();
@@ -2607,6 +2635,13 @@ __host__ cudaError_t CUDARTAPI cudaLaunchKernelInternal(
 #if CUDART_VERSION < 10000
   cudaConfigureCallInternal(gridDim, blockDim, sharedMem, stream, ctx);
 #endif
+  // yasai: a kernel without PTX (get_kernel named it once) is an invalid device function, as
+  // on a GPU without code for it; the launch used to dereference the null entry. The launch
+  // configuration pushed for this call is dropped so the next launch finds its own.
+  if (entry == NULL) {
+    if (!ctx->api->g_cuda_launch_stack.empty()) ctx->api->g_cuda_launch_stack.pop_back();
+    return g_last_cudaError = cudaErrorInvalidDeviceFunction;
+  }
   for (unsigned i = 0; i < entry->num_args(); i++) {
     std::pair<size_t, unsigned> p = entry->get_param_config(i);
     cudaSetupArgumentInternal(args[i], p.first, p.second);
@@ -3225,6 +3260,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyAsync(void *dst, const void *src,
                                                size_t count,
                                                enum cudaMemcpyKind kind,
                                                cudaStream_t stream) {
+  if (yasai_capture_memcpy(dst, src, count, kind, stream)) return g_last_cudaError = cudaSuccess;
   if (!yasai_rec::Recorder::get().on())
     return cudaMemcpyAsyncInternal(dst, src, count, kind, stream);
   const uint64_t t0 = yasai_rec::mono_ns();
@@ -3316,6 +3352,7 @@ __host__ cudaError_t CUDARTAPI cudaMemset(void *mem, int c, size_t count) {
 // memset operation is done but i think its not async?
 __host__ cudaError_t CUDARTAPI cudaMemsetAsync(void *mem, int c, size_t count,
                                                cudaStream_t stream = 0) {
+  if (yasai_capture_memset(mem, c, count, stream)) return g_last_cudaError = cudaSuccess;
   if (!yasai_rec::Recorder::get().on()) return cudaMemsetAsyncInternal(mem, c, count, stream = 0);
   const uint64_t t0 = yasai_rec::mono_ns();
   const uint32_t corr = yasai_rec::Recorder::get().corr();
@@ -3433,32 +3470,12 @@ __host__ cudaError_t CUDARTAPI cudaDeviceGetByPCIBusId(int *device, const char *
 
 // yasai: graph construction calls that NCCL uses only while a stream is being captured; the
 // simulator never reports capturing (cudaStreamIsCapturing), so these are not reached.
-__host__ cudaError_t CUDARTAPI cudaGraphAddDependencies(cudaGraph_t, const cudaGraphNode_t *,
-                                                        const cudaGraphNode_t *,
-                                                        const cudaGraphEdgeData *, size_t) {
-  return g_last_cudaError = cudaErrorNotSupported;
-}
 
 // yasai: see cudaGraphAddDependencies.
-__host__ cudaError_t CUDARTAPI cudaGraphAddEventRecordNode(cudaGraphNode_t *, cudaGraph_t,
-                                                           const cudaGraphNode_t *, size_t,
-                                                           cudaEvent_t) {
-  return g_last_cudaError = cudaErrorNotSupported;
-}
 
 // yasai: see cudaGraphAddDependencies.
-__host__ cudaError_t CUDARTAPI cudaGraphRetainUserObject(cudaGraph_t, cudaUserObject_t,
-                                                         unsigned int, unsigned int) {
-  return g_last_cudaError = cudaErrorNotSupported;
-}
 
 // yasai: see cudaGraphAddDependencies.
-__host__ cudaError_t CUDARTAPI cudaStreamUpdateCaptureDependencies(cudaStream_t,
-                                                                   cudaGraphNode_t *,
-                                                                   const cudaGraphEdgeData *,
-                                                                   size_t, unsigned int) {
-  return g_last_cudaError = cudaErrorNotSupported;
-}
 
 // yasai: memory pools are not modeled; a pool is a token and allocations from it are ordinary
 // cudaMalloc allocations.
@@ -3531,17 +3548,8 @@ __host__ cudaError_t CUDARTAPI cudaGraphConditionalHandleCreate(cudaGraphConditi
 }
 
 // yasai: see cudaDeviceGetGraphMemAttribute.
-__host__ cudaError_t CUDARTAPI cudaStreamBeginCaptureToGraph(cudaStream_t, cudaGraph_t,
-                                                             const cudaGraphNode_t *,
-                                                             const cudaGraphEdgeData *, size_t,
-                                                             enum cudaStreamCaptureMode) {
-  return g_last_cudaError = cudaErrorNotSupported;
-}
 
 // yasai: see cudaDeviceGetGraphMemAttribute.
-__host__ cudaError_t CUDARTAPI cudaUserObjectRelease(cudaUserObject_t, unsigned int) {
-  return g_last_cudaError = cudaSuccess;
-}
 
 // yasai: legacy IPC (yasai_vmm, shared_devmem): the handle carries the ref of the allocation's
 // memfd; the peer maps that segment at a fresh device address of its own.
@@ -3845,6 +3853,7 @@ __host__ cudaError_t CUDARTAPI cudaEventCreate(cudaEvent_t *event) {
 __host__ cudaError_t CUDARTAPI cudaEventRecord(cudaEvent_t event,
                                                cudaStream_t stream) {
   yasai_rec::Recorder &rec = yasai_rec::Recorder::get();
+  if (yasai_capture_event_record(event, stream)) return g_last_cudaError = cudaSuccess;
   if (!rec.on()) return cudaEventRecordInternal(event, stream);
   const uint64_t t0 = yasai_rec::mono_ns();
   const uint32_t corr = rec.corr();
@@ -3862,6 +3871,7 @@ __host__ cudaError_t CUDARTAPI cudaStreamWaitEvent(cudaStream_t stream,
                                                    cudaEvent_t event,
                                                    unsigned int flags) {
   yasai_rec::Recorder &rec = yasai_rec::Recorder::get();
+  if (yasai_capture_wait_event(stream, event)) return g_last_cudaError = cudaSuccess;
   if (!rec.on()) return cudaStreamWaitEventInternal(stream, event, flags);
   const uint64_t t0 = yasai_rec::mono_ns();
   const uint32_t corr = rec.corr();
@@ -5130,6 +5140,7 @@ bool yasai_lazy_load_piece(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i, const
 // yasai_func::g_lazy_load_name: loads the file that defines name (whole-file mode) or the part
 // of it that name needs (per-kernel mode).
 bool yasai_lazy_load_name(const char *name) {
+  std::lock_guard<std::recursive_mutex> yasai_lock(yasai_func::ptx_load_mutex());
   for (yasai_lazy_ptx_t &L : g_yasai_lazy) {
     auto it = L.owner.find(name);
     if (it == L.owner.end()) continue;
@@ -6001,8 +6012,9 @@ cudaError_t CUDARTAPI cudaLibraryLoadData(
   }
   if (library == NULL) return g_last_cudaError = cudaErrorInvalidValue;
 
+  // yasai: the code image is resolved like a cuModuleLoadData image (yasai_load_module_image).
   CUmodule module = NULL;
-  CUresult result = load_module_from_cuda_library_ptx(&module, __my_func__);
+  CUresult result = yasai_load_module_image(&module, code, __my_func__);
   if (result != CUDA_SUCCESS) {
     return g_last_cudaError = cudaErrorInvalidValue;
   }
@@ -7934,8 +7946,26 @@ CUresult CUDAAPI cuFuncGetAttribute(int *pi, CUfunction_attribute attrib,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  if (pi) *pi = 0;
+  // yasai: answered from the kernel's PTX information (as cudaFuncGetAttributes). Triton reads
+  // NUM_REGS, LOCAL_SIZE_BYTES and MAX_THREADS_PER_BLOCK after cuModuleGetFunction and refuses to
+  // launch when the thread limit is 0. The CUfunction of a module function is its host key.
+  if (pi == NULL) return CUDA_ERROR_INVALID_VALUE;
+  *pi = 0;
+  struct cudaFuncAttributes attr;
+  memset(&attr, 0, sizeof(attr));
+  if (hfunc == NULL ||
+      cudaFuncGetAttributesInternal(&attr, reinterpret_cast<const char *>(hfunc)) != cudaSuccess)
+    return CUDA_ERROR_INVALID_HANDLE;
+  switch ((int)attrib) {
+    case 0: *pi = attr.maxThreadsPerBlock; break;       // MAX_THREADS_PER_BLOCK
+    case 1: *pi = (int)attr.sharedSizeBytes; break;     // SHARED_SIZE_BYTES
+    case 2: *pi = (int)attr.constSizeBytes; break;      // CONST_SIZE_BYTES
+    case 3: *pi = (int)attr.localSizeBytes; break;      // LOCAL_SIZE_BYTES
+    case 4: *pi = attr.numRegs; break;                  // NUM_REGS
+    case 5: *pi = attr.ptxVersion; break;               // PTX_VERSION
+    case 6: *pi = attr.binaryVersion; break;            // BINARY_VERSION
+    default: break;                                     // others: 0
+  }
   return CUDA_SUCCESS;
 }
 
@@ -9632,12 +9662,6 @@ __host__ cudaError_t CUDARTAPI cudaMemPoolTrimTo(cudaMemPool_t memPool, size_t m
   return g_last_cudaError = cudaSuccess;
 }
 
-__host__ cudaError_t CUDARTAPI cudaStreamIsCapturing(cudaStream_t stream, enum cudaStreamCaptureStatus *pCaptureStatus) {
-  // yasai: no stream is ever capturing in the simulator.
-  (void)stream;
-  if (pCaptureStatus) *pCaptureStatus = cudaStreamCaptureStatusNone;
-  return g_last_cudaError = cudaSuccess;
-}
 
 __host__ cudaError_t CUDARTAPI cudaMallocAsync(void **devPtr, size_t size, cudaStream_t hStream) {
   // yasai: stream-ordered allocation is an ordinary allocation.
@@ -9686,45 +9710,14 @@ __host__ __cudart_builtin__ cudaError_t CUDARTAPI cudaGetDeviceProperties_v2(str
   return cudaGetDevicePropertiesInternal(prop, device);
 }
 
-__host__ cudaError_t CUDARTAPI cudaGraphDebugDotPrint(cudaGraph_t graph, const char *path, unsigned int flags) {
-  cuda_error_not_impl;
-}
 
-__host__ cudaError_t CUDARTAPI cudaGraphDestroy(cudaGraph_t graph) {
-  cuda_error_not_impl;
-}
 
-__host__ cudaError_t CUDARTAPI cudaGraphExecDestroy(cudaGraphExec_t graphExec) {
-  cuda_error_not_impl;
-}
 
-__host__ cudaError_t CUDARTAPI cudaGraphGetNodes(cudaGraph_t graph, cudaGraphNode_t *nodes, size_t *numNodes) {
-  cuda_error_not_impl;
-}
 
-__host__ cudaError_t CUDARTAPI cudaGraphInstantiate(cudaGraphExec_t *pGraphExec, cudaGraph_t graph, unsigned long long flags __dv(0)) {
-  cuda_error_not_impl;
-}
 
-__host__ cudaError_t CUDARTAPI cudaGraphInstantiateWithFlags(cudaGraphExec_t *pGraphExec, cudaGraph_t graph, unsigned long long flags __dv(0)) {
-  cuda_error_not_impl;
-}
 
-__host__ cudaError_t CUDARTAPI cudaGraphLaunch(cudaGraphExec_t graphExec, cudaStream_t stream) {
-  cuda_error_not_impl;
-}
 
-__host__ cudaError_t CUDARTAPI cudaGraphNodeGetDependencies(
-    cudaGraphNode_t node, cudaGraphNode_t *pDependencies,
-    size_t *pNumDependencies) {
-  cuda_error_not_impl;
-}
 
-__host__ cudaError_t CUDARTAPI cudaUserObjectCreate(
-    cudaUserObject_t *object_out, void *ptr, cudaHostFn_t destroy,
-    unsigned int initialRefcount, unsigned int flags) {
-  cuda_error_not_impl;
-}
 
 typedef void (CUDART_CB *cudaStreamCallback_t)(cudaStream_t stream, cudaError_t status, void *userData);
 
@@ -9733,24 +9726,8 @@ __host__ cudaError_t CUDARTAPI cudaStreamAddCallback(cudaStream_t stream,
   cuda_error_not_impl;
 }
 
-__host__ cudaError_t CUDARTAPI cudaStreamBeginCapture(cudaStream_t stream, enum cudaStreamCaptureMode mode) {
-  cuda_error_not_impl;
-}
 
-__host__ cudaError_t CUDARTAPI cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t *pGraph) {
-  cuda_error_not_impl;
-}
 
-__host__ cudaError_t CUDARTAPI cudaStreamGetCaptureInfo_v2(cudaStream_t stream, enum cudaStreamCaptureStatus *captureStatus_out, unsigned long long *id_out __dv(0), cudaGraph_t *graph_out __dv(0), const cudaGraphNode_t **dependencies_out __dv(0), size_t *numDependencies_out __dv(0)) {
-  // yasai: no stream is ever capturing in the simulator.
-  (void)stream;
-  if (captureStatus_out) *captureStatus_out = cudaStreamCaptureStatusNone;
-  if (id_out) *id_out = 0;
-  if (graph_out) *graph_out = NULL;
-  if (dependencies_out) *dependencies_out = NULL;
-  if (numDependencies_out) *numDependencies_out = 0;
-  return g_last_cudaError = cudaSuccess;
-}
 
 
 // yasai: looks a function up in this shared library itself (not in a real libcuda).
@@ -9884,6 +9861,7 @@ __host__ cudaError_t CUDARTAPI _cudaLaunchKernelEx(
 __host__ cudaError_t CUDARTAPI cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void *userData) {
   // yasai: runs the host function after the stream's earlier work, in the calling thread.
   if (fn == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  if (yasai_capture_host_fn(stream, fn, userData)) return g_last_cudaError = cudaSuccess;
   cudaError_t e = cudaStreamSynchronize(stream);
   if (e != cudaSuccess) return e;
   fn(userData);
@@ -9915,20 +9893,6 @@ extern "C" __host__ cudaError_t CUDARTAPI cudaStreamGetId(cudaStream_t hStream,
 }
 
 // yasai: CUDA 13 form of cudaStreamGetCaptureInfo; no stream is ever capturing.
-extern "C" __host__ cudaError_t CUDARTAPI cudaStreamGetCaptureInfo(
-    cudaStream_t stream, enum cudaStreamCaptureStatus *captureStatus_out,
-    unsigned long long *id_out, cudaGraph_t *graph_out,
-    const cudaGraphNode_t **dependencies_out, const cudaGraphEdgeData **edgeData_out,
-    size_t *numDependencies_out) {
-  (void)stream;
-  if (captureStatus_out) *captureStatus_out = cudaStreamCaptureStatusNone;
-  if (id_out) *id_out = 0;
-  if (graph_out) *graph_out = NULL;
-  if (dependencies_out) *dependencies_out = NULL;
-  if (edgeData_out) *edgeData_out = NULL;
-  if (numDependencies_out) *numDependencies_out = 0;
-  return g_last_cudaError = cudaSuccess;
-}
 
 // yasai: layout of CUlaunchConfig in CUDA 13's cuda.h (CUlaunchConfig_st), which the headers
 // bundled with this simulator do not declare.
@@ -10068,4 +10032,652 @@ extern "C" cudaError_t CUDARTAPI cudaOccupancyMaxActiveBlocksPerMultiprocessor(
     int *numBlocks, const void *func, int blockSize, size_t dynamicSMemSize) {
   return cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(numBlocks, (const char *)func,
                                                                 blockSize, dynamicSMemSize, 0);
+}
+
+// ---- yasai: CUDA graphs: stream capture records operations, a graph launch replays them -----
+// Capture: while a stream is being captured, every kernel launch, cudaMemcpyAsync,
+// cudaMemsetAsync, cudaLaunchHostFunc and cudaEventRecord issued to it becomes a node of the
+// stream's graph instead of running. A stream that waits on an event recorded during the capture
+// joins the capture (fork/join of multi-stream capture, as NCCL's strong streams and PyTorch's
+// side streams do), and its operations go to the same graph. cudaStreamEndCapture on the origin
+// stream ends the capture for every joined stream.
+// Replay: cudaGraphLaunch issues the nodes in capture order on the launch stream, so the graph
+// runs as one stream (the dependencies of the captured graph are never violated by a serial
+// order that respects the capture order). Kernel arguments are copied at capture time, as the
+// CUDA graph does; copies and memsets read and write their addresses at replay time. Host
+// functions run at replay time in the launching thread, after the stream's earlier work.
+// Not modeled: graph nodes added explicitly (cudaGraphAddKernelNode and friends, except event
+// record nodes), conditional nodes, device-side graph launch, and graph memory nodes.
+
+// One node of a captured graph.
+struct CUgraphNode_st {
+  enum Kind { KERNEL, MEMCPY, MEMSET, HOST_FN, EVENT_RECORD } kind = KERNEL;  // what it does
+  const char *host_fun = nullptr;   // KERNEL: host key of the kernel
+  dim3 grid, block;                 // KERNEL: launch shape
+  size_t smem = 0;                  // KERNEL: dynamic shared memory bytes
+  dim3 cluster = dim3(1, 1, 1);     // KERNEL: cluster shape of a launch with that attribute
+  std::vector<std::vector<unsigned char>> arg_bytes;  // KERNEL: argument copies, in list order
+  std::vector<std::pair<size_t, size_t>> arg_cfg;     // KERNEL: (size, offset) of each argument
+  void *dst = nullptr;              // MEMCPY / MEMSET: destination
+  const void *src = nullptr;        // MEMCPY: source
+  size_t count = 0;                 // MEMCPY / MEMSET: bytes
+  enum cudaMemcpyKind copy_kind = cudaMemcpyDefault;  // MEMCPY: direction
+  int value = 0;                    // MEMSET: byte value
+  cudaHostFn_t fn = nullptr;        // HOST_FN: function
+  void *user = nullptr;             // HOST_FN: its argument
+  cudaEvent_t event = nullptr;      // EVENT_RECORD: event recorded on the launch stream
+};
+
+// A user object (cudaUserObjectCreate): reference counted, destructor run at the last release.
+struct CUuserObject_st {
+  void *ptr = nullptr;              // the object
+  cudaHostFn_t destroy = nullptr;   // its destructor
+  long refs = 0;                    // references held
+};
+
+// A graph: its nodes in capture order and the user-object references it holds.
+struct CUgraph_st {
+  std::deque<CUgraphNode_st> nodes;                         // stable addresses for node handles
+  unsigned long long capture_id = 0;                        // id of the capture that built it
+  std::vector<std::pair<cudaUserObject_t, unsigned>> user_objects;  // retained objects, counts
+};
+
+// An executable graph: a copy of the graph's nodes.
+struct CUgraphExec_st {
+  std::vector<CUgraphNode_st> nodes;  // nodes in replay order
+};
+
+namespace {
+std::mutex g_yasai_graph_mu;                               // guards the capture maps
+std::map<cudaStream_t, cudaGraph_t> g_yasai_capturing;     // capturing stream -> its graph
+std::map<cudaStream_t, cudaStream_t> g_yasai_capture_origin;  // joined stream -> origin stream
+std::map<cudaEvent_t, cudaGraph_t> g_yasai_capture_events;  // event recorded during a capture
+unsigned long long g_yasai_next_capture_id = 1;            // capture ids handed out
+
+// The graph that stream is being captured into, or NULL.
+//   stream  any stream
+cudaGraph_t yasai_graph_of(cudaStream_t stream) {
+  std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
+  auto it = g_yasai_capturing.find(stream);
+  return it == g_yasai_capturing.end() ? nullptr : it->second;
+}
+
+// Releases count references of a user object; the last one runs its destructor.
+//   obj    the object
+//   count  references to release
+void yasai_user_object_release(cudaUserObject_t obj, unsigned count) {
+  if (obj == nullptr) return;
+  obj->refs -= (long)count;
+  if (obj->refs <= 0) {
+    if (obj->destroy) obj->destroy(obj->ptr);
+    delete obj;
+  }
+}
+
+// Issues one node on a stream (graph replay).
+//   n       the node
+//   stream  the launch stream
+cudaError_t yasai_replay_node(const CUgraphNode_st &n, cudaStream_t stream) {
+  gpgpu_context *ctx = GPGPU_Context();
+  switch (n.kind) {
+    case CUgraphNode_st::KERNEL: {
+      cudaConfigureCallInternal(n.grid, n.block, n.smem, stream, ctx);
+      // kernel_config::set_arg pushes to the front, so the list order is restored by replaying
+      // the arguments last to first
+      for (size_t i = n.arg_bytes.size(); i > 0; --i)
+        cudaSetupArgumentInternal(n.arg_bytes[i - 1].data(), n.arg_cfg[i - 1].first,
+                                  n.arg_cfg[i - 1].second, ctx);
+      g_yasai_pending_cluster = n.cluster;
+      return cudaLaunchInternal(n.host_fun, ctx);
+    }
+    case CUgraphNode_st::MEMCPY:
+      return cudaMemcpyAsync(n.dst, n.src, n.count, n.copy_kind, stream);
+    case CUgraphNode_st::MEMSET:
+      return cudaMemsetAsync(n.dst, n.value, n.count, stream);
+    case CUgraphNode_st::HOST_FN:
+      return cudaLaunchHostFunc(stream, n.fn, n.user);
+    case CUgraphNode_st::EVENT_RECORD:
+      return cudaEventRecord(n.event, stream);
+  }
+  return cudaSuccess;
+}
+
+// Appends a node to the graph of a capturing stream; false when the stream is not capturing.
+//   stream  the stream the operation was issued to
+//   node    the node
+bool yasai_capture_append(cudaStream_t stream, CUgraphNode_st &&node) {
+  cudaGraph_t g = yasai_graph_of(stream);
+  if (g == nullptr) return false;
+  std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
+  g->nodes.push_back(std::move(node));
+  return true;
+}
+}  // namespace
+
+static bool yasai_capture_kernel(const char *hostFun, kernel_config &config) {
+  if (yasai_graph_of(config.get_stream()) == nullptr) return false;
+  CUgraphNode_st n;
+  n.kind = CUgraphNode_st::KERNEL;
+  n.host_fun = hostFun;
+  n.grid = config.grid_dim();
+  n.block = config.block_dim();
+  n.smem = config.shared_mem();
+  n.cluster = g_yasai_pending_cluster;
+  g_yasai_pending_cluster = dim3(1, 1, 1);
+  for (const gpgpu_ptx_sim_arg &a : config.get_args()) {
+    const unsigned char *p = static_cast<const unsigned char *>(a.m_start);
+    n.arg_bytes.emplace_back(p, p + a.m_nbytes);
+    n.arg_cfg.emplace_back(a.m_nbytes, a.m_offset);
+  }
+  return yasai_capture_append(config.get_stream(), std::move(n));
+}
+
+static bool yasai_capture_memcpy(void *dst, const void *src, size_t count, enum cudaMemcpyKind kind,
+                                 cudaStream_t stream) {
+  CUgraphNode_st n;
+  n.kind = CUgraphNode_st::MEMCPY;
+  n.dst = dst;
+  n.src = src;
+  n.count = count;
+  n.copy_kind = kind;
+  return yasai_capture_append(stream, std::move(n));
+}
+
+static bool yasai_capture_memset(void *mem, int value, size_t count, cudaStream_t stream) {
+  CUgraphNode_st n;
+  n.kind = CUgraphNode_st::MEMSET;
+  n.dst = mem;
+  n.value = value;
+  n.count = count;
+  return yasai_capture_append(stream, std::move(n));
+}
+
+static bool yasai_capture_host_fn(cudaStream_t stream, cudaHostFn_t fn, void *user) {
+  CUgraphNode_st n;
+  n.kind = CUgraphNode_st::HOST_FN;
+  n.fn = fn;
+  n.user = user;
+  return yasai_capture_append(stream, std::move(n));
+}
+
+static bool yasai_capture_event_record(cudaEvent_t event, cudaStream_t stream) {
+  cudaGraph_t g = yasai_graph_of(stream);
+  if (g == nullptr) return false;
+  {
+    std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
+    g_yasai_capture_events[event] = g;
+  }
+  CUgraphNode_st n;
+  n.kind = CUgraphNode_st::EVENT_RECORD;
+  n.event = event;
+  return yasai_capture_append(stream, std::move(n));
+}
+
+static bool yasai_capture_wait_event(cudaStream_t stream, cudaEvent_t event) {
+  std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
+  auto ev = g_yasai_capture_events.find(event);
+  const bool capturing = g_yasai_capturing.count(stream) > 0;
+  if (ev == g_yasai_capture_events.end()) return capturing;  // inside a capture: ordering only
+  if (!capturing) {
+    // fork: the waiting stream joins the capture of the event's graph
+    g_yasai_capturing[stream] = ev->second;
+    for (const auto &kv : g_yasai_capturing)
+      if (kv.second == ev->second && !g_yasai_capture_origin.count(kv.first) && kv.first != stream)
+        g_yasai_capture_origin[stream] = kv.first;
+  }
+  return true;
+}
+
+extern "C" {
+
+// cudaStreamBeginCapture: starts recording the operations of stream into a new graph.
+//   stream  a created stream (the legacy default stream cannot be captured)
+//   mode    capture mode (not used: every mode records the same way)
+__host__ cudaError_t CUDARTAPI cudaStreamBeginCapture(cudaStream_t stream,
+                                                      enum cudaStreamCaptureMode mode) {
+  (void)mode;
+  if (stream == NULL) return g_last_cudaError = cudaErrorStreamCaptureUnsupported;
+  std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
+  if (g_yasai_capturing.count(stream)) return g_last_cudaError = cudaErrorIllegalState;
+  cudaGraph_t g = new CUgraph_st();
+  g->capture_id = g_yasai_next_capture_id++;
+  g_yasai_capturing[stream] = g;
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaStreamEndCapture: ends the capture of stream and of every stream that joined it.
+//   stream  the stream the capture began on
+//   pGraph  receives the graph
+__host__ cudaError_t CUDARTAPI cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t *pGraph) {
+  std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
+  auto it = g_yasai_capturing.find(stream);
+  if (it == g_yasai_capturing.end() || pGraph == NULL) return g_last_cudaError = cudaErrorIllegalState;
+  cudaGraph_t g = it->second;
+  for (auto i = g_yasai_capturing.begin(); i != g_yasai_capturing.end();)
+    if (i->second == g) {
+      g_yasai_capture_origin.erase(i->first);
+      i = g_yasai_capturing.erase(i);
+    } else {
+      ++i;
+    }
+  for (auto i = g_yasai_capture_events.begin(); i != g_yasai_capture_events.end();)
+    i = i->second == g ? g_yasai_capture_events.erase(i) : std::next(i);
+  *pGraph = g;
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaStreamBeginCaptureToGraph: capture into an existing graph (appends to its nodes).
+//   stream, graph, dependencies, edge data, count, mode  as in the CUDA runtime API
+__host__ cudaError_t CUDARTAPI cudaStreamBeginCaptureToGraph(cudaStream_t stream, cudaGraph_t graph,
+                                                             const cudaGraphNode_t *,
+                                                             const cudaGraphEdgeData *, size_t,
+                                                             enum cudaStreamCaptureMode) {
+  if (stream == NULL || graph == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
+  if (g_yasai_capturing.count(stream)) return g_last_cudaError = cudaErrorIllegalState;
+  if (graph->capture_id == 0) graph->capture_id = g_yasai_next_capture_id++;
+  g_yasai_capturing[stream] = graph;
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaStreamIsCapturing: active while stream records into a graph.
+//   stream          any stream
+//   pCaptureStatus  receives the status
+__host__ cudaError_t CUDARTAPI cudaStreamIsCapturing(cudaStream_t stream,
+                                                     enum cudaStreamCaptureStatus *pCaptureStatus) {
+  if (pCaptureStatus == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  *pCaptureStatus = yasai_graph_of(stream) ? cudaStreamCaptureStatusActive : cudaStreamCaptureStatusNone;
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaStreamGetCaptureInfo (CUDA 13 form): status, capture id and graph of stream; the
+// dependency set is reported empty (replay is in capture order).
+//   stream and outputs  as in the CUDA runtime API; every output may be NULL
+__host__ cudaError_t CUDARTAPI cudaStreamGetCaptureInfo(
+    cudaStream_t stream, enum cudaStreamCaptureStatus *captureStatus_out,
+    unsigned long long *id_out, cudaGraph_t *graph_out,
+    const cudaGraphNode_t **dependencies_out, const cudaGraphEdgeData **edgeData_out,
+    size_t *numDependencies_out) {
+  cudaGraph_t g = yasai_graph_of(stream);
+  if (captureStatus_out)
+    *captureStatus_out = g ? cudaStreamCaptureStatusActive : cudaStreamCaptureStatusNone;
+  if (id_out) *id_out = g ? g->capture_id : 0;
+  if (graph_out) *graph_out = g;
+  if (dependencies_out) *dependencies_out = NULL;
+  if (edgeData_out) *edgeData_out = NULL;
+  if (numDependencies_out) *numDependencies_out = 0;
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaStreamGetCaptureInfo_v2: cudaStreamGetCaptureInfo without edge data.
+//   stream and outputs  as in the CUDA runtime API
+__host__ cudaError_t CUDARTAPI cudaStreamGetCaptureInfo_v2(
+    cudaStream_t stream, enum cudaStreamCaptureStatus *captureStatus_out,
+    unsigned long long *id_out, cudaGraph_t *graph_out,
+    const cudaGraphNode_t **dependencies_out, size_t *numDependencies_out) {
+  return cudaStreamGetCaptureInfo(stream, captureStatus_out, id_out, graph_out, dependencies_out,
+                                  NULL, numDependencies_out);
+}
+
+// cudaStreamUpdateCaptureDependencies: dependencies are implied by capture order; accepted.
+//   (parameters as in the CUDA runtime API; not used)
+__host__ cudaError_t CUDARTAPI cudaStreamUpdateCaptureDependencies(cudaStream_t, cudaGraphNode_t *,
+                                                                   const cudaGraphEdgeData *,
+                                                                   size_t, unsigned int) {
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaGraphCreate: an empty graph.
+//   pGraph  receives the graph
+//   flags   must be 0
+__host__ cudaError_t CUDARTAPI cudaGraphCreate(cudaGraph_t *pGraph, unsigned int flags) {
+  (void)flags;
+  if (pGraph == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  *pGraph = new CUgraph_st();
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaGraphDestroy: releases the graph's user-object references and frees it.
+//   graph  the graph
+__host__ cudaError_t CUDARTAPI cudaGraphDestroy(cudaGraph_t graph) {
+  if (graph == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  for (const auto &uo : graph->user_objects) yasai_user_object_release(uo.first, uo.second);
+  delete graph;
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaGraphGetNodes: the node count (nodes NULL) or up to *numNodes node handles.
+//   graph, nodes, numNodes  as in the CUDA runtime API
+__host__ cudaError_t CUDARTAPI cudaGraphGetNodes(cudaGraph_t graph, cudaGraphNode_t *nodes,
+                                                 size_t *numNodes) {
+  if (graph == NULL || numNodes == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  if (nodes != NULL) {
+    const size_t n = std::min(*numNodes, graph->nodes.size());
+    for (size_t i = 0; i < n; ++i) nodes[i] = &graph->nodes[i];
+    for (size_t i = n; i < *numNodes; ++i) nodes[i] = NULL;
+  }
+  *numNodes = graph->nodes.size();
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaGraphNodeGetDependencies: dependencies are implied by order; none are reported.
+//   node, pDependencies, pNumDependencies  as in the CUDA runtime API
+__host__ cudaError_t CUDARTAPI cudaGraphNodeGetDependencies(cudaGraphNode_t node,
+                                                            cudaGraphNode_t *pDependencies,
+                                                            size_t *pNumDependencies) {
+  (void)node;
+  (void)pDependencies;
+  if (pNumDependencies) *pNumDependencies = 0;
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaGraphAddDependencies: dependencies are implied by order; accepted.
+//   (parameters as in the CUDA runtime API; not used)
+__host__ cudaError_t CUDARTAPI cudaGraphAddDependencies(cudaGraph_t, const cudaGraphNode_t *,
+                                                        const cudaGraphNode_t *,
+                                                        const cudaGraphEdgeData *, size_t) {
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaGraphAddEventRecordNode: appends an event record node (NCCL's graph mixing).
+//   pGraphNode, graph, dependencies, count, event  as in the CUDA runtime API
+__host__ cudaError_t CUDARTAPI cudaGraphAddEventRecordNode(cudaGraphNode_t *pGraphNode,
+                                                           cudaGraph_t graph,
+                                                           const cudaGraphNode_t *, size_t,
+                                                           cudaEvent_t event) {
+  if (graph == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
+  graph->nodes.emplace_back();
+  graph->nodes.back().kind = CUgraphNode_st::EVENT_RECORD;
+  graph->nodes.back().event = event;
+  if (pGraphNode) *pGraphNode = &graph->nodes.back();
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaUserObjectCreate: a reference-counted object whose destructor runs at the last release.
+//   object_out, ptr, destroy, initialRefcount, flags  as in the CUDA runtime API
+__host__ cudaError_t CUDARTAPI cudaUserObjectCreate(cudaUserObject_t *object_out, void *ptr,
+                                                    cudaHostFn_t destroy,
+                                                    unsigned int initialRefcount,
+                                                    unsigned int flags) {
+  (void)flags;
+  if (object_out == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  cudaUserObject_t o = new CUuserObject_st();
+  o->ptr = ptr;
+  o->destroy = destroy;
+  o->refs = initialRefcount;
+  *object_out = o;
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaUserObjectRetain: adds count references.
+//   object, count  as in the CUDA runtime API
+__host__ cudaError_t CUDARTAPI cudaUserObjectRetain(cudaUserObject_t object, unsigned int count) {
+  if (object == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  object->refs += count;
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaUserObjectRelease: drops count references (the last runs the destructor).
+//   object, count  as in the CUDA runtime API
+__host__ cudaError_t CUDARTAPI cudaUserObjectRelease(cudaUserObject_t object, unsigned int count) {
+  if (object == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  yasai_user_object_release(object, count);
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaGraphRetainUserObject: the graph takes count references (moved from the caller with
+// cudaGraphUserObjectMove, otherwise added).
+//   graph, object, count, flags  as in the CUDA runtime API
+__host__ cudaError_t CUDARTAPI cudaGraphRetainUserObject(cudaGraph_t graph, cudaUserObject_t object,
+                                                         unsigned int count, unsigned int flags) {
+  if (graph == NULL || object == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  if (!(flags & cudaGraphUserObjectMove)) object->refs += count;
+  graph->user_objects.emplace_back(object, count);
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaGraphInstantiate: an executable copy of the graph's nodes.
+//   pGraphExec, graph, flags  as in the CUDA runtime API
+__host__ cudaError_t CUDARTAPI cudaGraphInstantiate(cudaGraphExec_t *pGraphExec, cudaGraph_t graph,
+                                                    unsigned long long flags) {
+  (void)flags;
+  if (pGraphExec == NULL || graph == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  cudaGraphExec_t e = new CUgraphExec_st();
+  e->nodes.assign(graph->nodes.begin(), graph->nodes.end());
+  *pGraphExec = e;
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaGraphInstantiateWithFlags: as cudaGraphInstantiate.
+//   pGraphExec, graph, flags  as in the CUDA runtime API
+__host__ cudaError_t CUDARTAPI cudaGraphInstantiateWithFlags(cudaGraphExec_t *pGraphExec,
+                                                             cudaGraph_t graph,
+                                                             unsigned long long flags) {
+  return cudaGraphInstantiate(pGraphExec, graph, flags);
+}
+
+// cudaGraphExecUpdate: the executable graph takes the nodes of graph.
+//   graphExec, graph, resultInfo  as in the CUDA runtime API
+__host__ cudaError_t CUDARTAPI cudaGraphExecUpdate(cudaGraphExec_t graphExec, cudaGraph_t graph,
+                                                   cudaGraphExecUpdateResultInfo *resultInfo) {
+  if (graphExec == NULL || graph == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  graphExec->nodes.assign(graph->nodes.begin(), graph->nodes.end());
+  if (resultInfo) {
+    memset(resultInfo, 0, sizeof(*resultInfo));
+    resultInfo->result = cudaGraphExecUpdateSuccess;
+  }
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaGraphUpload: nothing to upload in the simulator.
+//   graphExec, stream  as in the CUDA runtime API
+__host__ cudaError_t CUDARTAPI cudaGraphUpload(cudaGraphExec_t graphExec, cudaStream_t stream) {
+  (void)stream;
+  return g_last_cudaError = graphExec ? cudaSuccess : cudaErrorInvalidValue;
+}
+
+// cudaGraphLaunch: replays the nodes in order on stream; into a capturing stream the nodes are
+// appended to that capture instead.
+//   graphExec, stream  as in the CUDA runtime API
+__host__ cudaError_t CUDARTAPI cudaGraphLaunch(cudaGraphExec_t graphExec, cudaStream_t stream) {
+  if (graphExec == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  if (cudaGraph_t g = yasai_graph_of(stream)) {
+    std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
+    for (const CUgraphNode_st &n : graphExec->nodes) g->nodes.push_back(n);
+    return g_last_cudaError = cudaSuccess;
+  }
+  for (const CUgraphNode_st &n : graphExec->nodes) {
+    const cudaError_t e = yasai_replay_node(n, stream);
+    if (e != cudaSuccess) return g_last_cudaError = e;
+  }
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaGraphExecDestroy: frees the executable graph.
+//   graphExec  as in the CUDA runtime API
+__host__ cudaError_t CUDARTAPI cudaGraphExecDestroy(cudaGraphExec_t graphExec) {
+  delete graphExec;
+  return g_last_cudaError = cudaSuccess;
+}
+
+// cudaGraphDebugDotPrint: writes a one-line summary instead of a DOT graph.
+//   graph, path, flags  as in the CUDA runtime API
+__host__ cudaError_t CUDARTAPI cudaGraphDebugDotPrint(cudaGraph_t graph, const char *path,
+                                                      unsigned int flags) {
+  (void)flags;
+  if (graph == NULL || path == NULL) return g_last_cudaError = cudaErrorInvalidValue;
+  if (FILE *f = fopen(path, "w")) {
+    fprintf(f, "digraph yasai { /* %zu nodes in capture order */ }\n", graph->nodes.size());
+    fclose(f);
+  }
+  return g_last_cudaError = cudaSuccess;
+}
+
+// Driver API equivalents (cuStream*Capture*, cuGraph*): the runtime functions above.
+//   (parameters as in cuda.h)
+CUresult CUDAAPI cuStreamBeginCapture_v2(CUstream hStream, CUstreamCaptureMode mode) {
+  return cudaStreamBeginCapture((cudaStream_t)hStream, (enum cudaStreamCaptureMode)mode) == cudaSuccess
+             ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+CUresult CUDAAPI cuStreamEndCapture(CUstream hStream, CUgraph *phGraph) {
+  return cudaStreamEndCapture((cudaStream_t)hStream, (cudaGraph_t *)phGraph) == cudaSuccess
+             ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+CUresult CUDAAPI cuStreamIsCapturing(CUstream hStream, CUstreamCaptureStatus *captureStatus) {
+  enum cudaStreamCaptureStatus st;
+  cudaStreamIsCapturing((cudaStream_t)hStream, &st);
+  if (captureStatus) *captureStatus = (CUstreamCaptureStatus)st;
+  return CUDA_SUCCESS;
+}
+CUresult CUDAAPI cuGraphCreate(CUgraph *phGraph, unsigned int flags) {
+  return cudaGraphCreate((cudaGraph_t *)phGraph, flags) == cudaSuccess ? CUDA_SUCCESS
+                                                                        : CUDA_ERROR_INVALID_VALUE;
+}
+CUresult CUDAAPI cuGraphInstantiateWithFlags(CUgraphExec *phGraphExec, CUgraph hGraph,
+                                             unsigned long long flags) {
+  return cudaGraphInstantiate((cudaGraphExec_t *)phGraphExec, (cudaGraph_t)hGraph, flags) == cudaSuccess
+             ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+CUresult CUDAAPI cuGraphLaunch(CUgraphExec hGraphExec, CUstream hStream) {
+  return cudaGraphLaunch((cudaGraphExec_t)hGraphExec, (cudaStream_t)hStream) == cudaSuccess
+             ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+CUresult CUDAAPI cuGraphDestroy(CUgraph hGraph) {
+  return cudaGraphDestroy((cudaGraph_t)hGraph) == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+CUresult CUDAAPI cuGraphExecDestroy(CUgraphExec hGraphExec) {
+  return cudaGraphExecDestroy((cudaGraphExec_t)hGraphExec) == cudaSuccess ? CUDA_SUCCESS
+                                                                          : CUDA_ERROR_INVALID_VALUE;
+}
+CUresult CUDAAPI cuGraphUpload(CUgraphExec hGraphExec, CUstream hStream) {
+  return cudaGraphUpload((cudaGraphExec_t)hGraphExec, (cudaStream_t)hStream) == cudaSuccess
+             ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+}  // extern "C"
+
+// ---- yasai: driver library API (DeepGEMM's JIT loads its kernels this way) ------------------
+// A CUlibrary is a module handle and a CUkernel is the CUfunction of cuModuleGetFunction (the
+// kernel's host key). Types are written as void pointers because the bundled cuda_api.h predates
+// the library API.
+
+// Entry names of a module loaded from PTX, in file order.
+//   module  module handle
+static std::vector<std::string> yasai_module_entries(CUmodule module) {
+  std::vector<std::string> names;
+  auto it = yasai_module_ptx().find((unsigned)(unsigned long long)module);
+  if (it == yasai_module_ptx().end()) return names;
+  std::ifstream in(it->second.c_str());
+  std::string line;
+  while (std::getline(in, line)) {
+    const size_t e = line.find(".entry");
+    if (e == std::string::npos) continue;
+    size_t b = e + 6;
+    while (b < line.size() && isspace((unsigned char)line[b])) ++b;
+    size_t f = b;
+    while (f < line.size() && (isalnum((unsigned char)line[f]) || line[f] == '_' || line[f] == '$')) ++f;
+    if (f > b) names.push_back(line.substr(b, f - b));
+  }
+  return names;
+}
+
+// cuLibraryLoadData: the image as for cuModuleLoadData.
+//   library, code, options  as in cuda.h (options not used)
+extern "C" CUresult CUDAAPI cuLibraryLoadData(void **library, const void *code, void *, void **,
+                                              unsigned, void *, void **, unsigned) {
+  if (library == NULL) return CUDA_ERROR_INVALID_VALUE;
+  CUmodule module = NULL;
+  const CUresult r = yasai_load_module_image(&module, code, __my_func__);
+  *library = (void *)module;
+  return r;
+}
+
+// cuLibraryLoadFromFile: a .cubin with its .ptx beside it loads that PTX; any other file is read
+// and resolved as a module image.
+//   library, fileName, options  as in cuda.h (options not used)
+extern "C" CUresult CUDAAPI cuLibraryLoadFromFile(void **library, const char *fileName, void *,
+                                                  void **, unsigned, void *, void **, unsigned) {
+  if (library == NULL || fileName == NULL) return CUDA_ERROR_INVALID_VALUE;
+  CUmodule module = NULL;
+  const std::string sidecar = sidecar_ptx_for_module(fileName);
+  CUresult r;
+  if (!sidecar.empty()) {
+    r = load_module_from_ptx_file(&module, sidecar, __my_func__);
+  } else {
+    std::ifstream in(fileName, std::ios::binary);
+    if (!in.good()) return CUDA_ERROR_FILE_NOT_FOUND;
+    std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    bytes.push_back('\0');
+    r = yasai_load_module_image(&module, bytes.data(), __my_func__);
+  }
+  *library = (void *)module;
+  return r;
+}
+
+// cuLibraryUnload: modules stay loaded.
+//   library  as in cuda.h
+extern "C" CUresult CUDAAPI cuLibraryUnload(void *library) {
+  (void)library;
+  return CUDA_SUCCESS;
+}
+
+// cuLibraryGetModule: the library is a module.
+//   pMod, library  as in cuda.h
+extern "C" CUresult CUDAAPI cuLibraryGetModule(CUmodule *pMod, void *library) {
+  if (pMod == NULL) return CUDA_ERROR_INVALID_VALUE;
+  *pMod = (CUmodule)library;
+  return CUDA_SUCCESS;
+}
+
+// cuLibraryGetKernel: the kernel of that name.
+//   pKernel, library, name  as in cuda.h
+extern "C" CUresult CUDAAPI cuLibraryGetKernel(void **pKernel, void *library, const char *name) {
+  if (pKernel == NULL) return CUDA_ERROR_INVALID_VALUE;
+  CUfunction f = NULL;
+  const CUresult r = cuModuleGetFunction(&f, (CUmodule)library, name);
+  *pKernel = (void *)f;
+  return r;
+}
+
+// cuLibraryGetKernelCount: number of entries of the library's PTX.
+//   count, library  as in cuda.h
+extern "C" CUresult CUDAAPI cuLibraryGetKernelCount(unsigned int *count, void *library) {
+  if (count == NULL) return CUDA_ERROR_INVALID_VALUE;
+  *count = (unsigned)yasai_module_entries((CUmodule)library).size();
+  return CUDA_SUCCESS;
+}
+
+// cuLibraryEnumerateKernels: up to numKernels kernels, in PTX file order.
+//   kernels, numKernels, library  as in cuda.h
+extern "C" CUresult CUDAAPI cuLibraryEnumerateKernels(void **kernels, unsigned int numKernels,
+                                                      void *library) {
+  if (kernels == NULL) return CUDA_ERROR_INVALID_VALUE;
+  const std::vector<std::string> names = yasai_module_entries((CUmodule)library);
+  for (unsigned i = 0; i < numKernels && i < names.size(); ++i) {
+    CUfunction f = NULL;
+    const CUresult r = cuModuleGetFunction(&f, (CUmodule)library, names[i].c_str());
+    if (r != CUDA_SUCCESS) return r;
+    kernels[i] = (void *)f;
+  }
+  return CUDA_SUCCESS;
+}
+
+// cuKernelGetFunction: a kernel is its function.
+//   pFunc, kernel  as in cuda.h
+extern "C" CUresult CUDAAPI cuKernelGetFunction(CUfunction *pFunc, void *kernel) {
+  if (pFunc == NULL) return CUDA_ERROR_INVALID_VALUE;
+  *pFunc = (CUfunction)kernel;
+  return CUDA_SUCCESS;
+}
+
+// cuKernelGetName: the entry name of the kernel.
+//   name, kernel  as in cuda.h
+extern "C" CUresult CUDAAPI cuKernelGetName(const char **name, void *kernel) {
+  if (name == NULL || kernel == NULL) return CUDA_ERROR_INVALID_VALUE;
+  static std::map<void *, std::string> names;
+  function_info *f = reinterpret_cast<function_info *>(kernel);
+  names[kernel] = f->get_name();
+  *name = names[kernel].c_str();
+  return CUDA_SUCCESS;
 }

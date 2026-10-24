@@ -31,9 +31,14 @@ namespace yasai_jit {
 ///   how             set to a one-line description of the resolution (for the log)
 std::string ptx_for_image(const void *image, unsigned max_capability, std::string *how);
 
-/// PTX files of a library or module file (one selected architecture per file), or empty.
+/// PTX files of a library or module file, every architecture, in order of preference: the
+/// architectures at most max_capability from the highest down (a suffixed one such as sm_120f or
+/// sm_90a before the plain one of the same number), then the higher ones from the lowest up.
+/// A library compiles each source for its own set of architectures (vLLM's _C: one kernel only
+/// for sm_90a, sm_100a and sm_120, another for sm_80 to sm_120f), so the choice is per kernel:
+/// an index that keeps the first file defining a name gets that kernel's best architecture.
 ///   path            the .so, .cubin or .fatbin file
-///   max_capability  highest PTX architecture to select (0: the highest available)
+///   max_capability  highest preferred PTX architecture (0: all count as at most it)
 std::vector<std::string> ptx_files_of_library(const std::string &path, unsigned max_capability);
 
 /// Architecture ("sm_XX", with suffix letters) named in an extracted PTX file name, or "".

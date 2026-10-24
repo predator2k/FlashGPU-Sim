@@ -3,6 +3,7 @@
 #include "yasai_func.h"
 
 #include <chrono>
+#include <regex>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -110,6 +111,7 @@ const Config &config() {
     c.skip_fp = env_flag("YASAI_SKIP_FP");
     c.cta_sample = env_flag("YASAI_CTA_SAMPLE");
     if (const char *d = std::getenv("YASAI_TRACE_DIR")) c.trace_dir = d;
+    if (const char *r = std::getenv("YASAI_LAUNCH_ONLY_REGEX")) c.launch_only_regex = r;
     if (const char *m = std::getenv("YASAI_TRACE_MAX_MB"))
       c.trace_max_bytes = std::strtoull(m, nullptr, 10) << 20;
     return c;
@@ -117,9 +119,17 @@ const Config &config() {
   return cfg;
 }
 
+// True while the current kernel matches YASAI_LAUNCH_ONLY_REGEX (set by kernel_begin).
+static bool g_launch_only = false;
+
 void kernel_begin(const std::string &name, Dim3 grid, Dim3 block) {
   g_counters = KernelCounters();
   g_name = name;
+  if (!config().launch_only_regex.empty()) {
+    static const std::regex rx(config().launch_only_regex);
+    g_launch_only = std::regex_search(name, rx);
+    if (g_launch_only) std::printf("yasai-func launch-only kernel=%s\n", name.c_str());
+  }
   g_grid = grid;
   g_block = block;
   g_trace = TraceState();
@@ -382,7 +392,10 @@ bool skip_fp_value(const ptx_instruction *pI, unsigned lane_id) {
   return skip;
 }
 
+bool launch_only() { return g_launch_only; }
+
 bool cta_is_representative(Dim3 g, unsigned cta_linear_id) {
+  if (g_launch_only) return false;
   if (!config().cta_sample) return true;
   const unsigned x = cta_linear_id % g.x;
   const unsigned y = (cta_linear_id / g.x) % g.y;
@@ -440,6 +453,11 @@ ClusterState *g_cluster = nullptr;  // see cluster()
 ClusterState *cluster() { return g_cluster; }
 
 bool (*g_lazy_load_name)(const char *name) = nullptr;
+
+std::recursive_mutex &ptx_load_mutex() {
+  static std::recursive_mutex m;
+  return m;
+}
 
 namespace {
 unsigned g_current_rank = 0;  // see current_rank()

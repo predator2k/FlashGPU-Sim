@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <tuple>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -318,7 +319,19 @@ std::vector<std::string> ptx_files_of_library(const std::string &path, unsigned 
   std::lock_guard<std::mutex> lock(jit_mutex());
   const std::string dir = work_dir() + "/lib-" +
                           hash_hex((const unsigned char *)path.data(), path.size());
-  return select_arch(extract_ptx(path, dir), max_capability);
+  std::vector<std::string> files = extract_ptx(path, dir);
+  // rank: (0, -arch, plain) for architectures within the capability, (1, arch, plain) above it
+  auto rank = [max_capability](const std::string &f) {
+    const std::string a = arch_of_ptx_file(f);
+    const unsigned n = arch_number(a);
+    const int plain = (!a.empty() && isalpha((unsigned char)a.back())) ? 0 : 1;
+    const bool within = max_capability == 0 || n <= max_capability;
+    return std::make_tuple(within ? 0 : 1, within ? -(long)n : (long)n, plain);
+  };
+  std::stable_sort(files.begin(), files.end(), [&](const std::string &x, const std::string &y) {
+    return rank(x) < rank(y);
+  });
+  return files;
 }
 
 std::string ptx_for_image(const void *image, unsigned max_capability, std::string *how) {
