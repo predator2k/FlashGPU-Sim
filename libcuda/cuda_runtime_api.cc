@@ -1533,7 +1533,9 @@ cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx
       return g_last_cudaError = cudaErrorInvalidConfiguration;
     }
   }
-  struct CUstream_st *stream = config.get_stream();
+  // yasai: cudaStreamLegacy and cudaStreamPerThread handles denote real streams.
+  struct CUstream_st *stream =
+      yasai_stream_manager(ctx)->yasai_resolve(config.get_stream());
 
   function_info *entry = context->get_kernel(hostFun);
   const struct gpgpu_ptx_sim_info *kernel_info = entry->get_kernel_info();
@@ -1852,13 +1854,13 @@ cudaMemcpyInternal(void *dst, const void *src, size_t count,
   if (g_debug_execution >= 3)
     printf("GPGPU-Sim PTX: cudaMemcpy(): devPtr = %p\n", dst);
   if (kind == cudaMemcpyHostToDevice)
-    yasai_stream_manager(ctx)->push(
+    yasai_stream_manager(ctx)->push_sync(
         stream_operation(src, (size_t)dst, count, 0));
   else if (kind == cudaMemcpyDeviceToHost)
-    yasai_stream_manager(ctx)->push(
+    yasai_stream_manager(ctx)->push_sync(
         stream_operation((size_t)src, dst, count, 0));
   else if (kind == cudaMemcpyDeviceToDevice)
-    yasai_stream_manager(ctx)->push(
+    yasai_stream_manager(ctx)->push_sync(
         stream_operation((size_t)src, (size_t)dst, count, 0));
   else if (kind == cudaMemcpyDefault) {
     // yasai: infer the direction from the simulated heap and the registered host windows
@@ -1871,13 +1873,13 @@ cudaMemcpyInternal(void *dst, const void *src, size_t count,
     };
     const bool sd = is_dev(src), dd = is_dev(dst);
     if (sd && dd)
-      yasai_stream_manager(ctx)->push(
+      yasai_stream_manager(ctx)->push_sync(
           stream_operation((size_t)src, (size_t)dst, count, 0));  // device to device
     else if (sd)
-      yasai_stream_manager(ctx)->push(
+      yasai_stream_manager(ctx)->push_sync(
           stream_operation((size_t)src, dst, count, 0));  // device to host
     else if (dd)
-      yasai_stream_manager(ctx)->push(
+      yasai_stream_manager(ctx)->push_sync(
           stream_operation(src, (size_t)dst, count, 0));  // host to device
     else
       memcpy(dst, src, count);  // host to host
@@ -2015,7 +2017,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyToSymbolInternal(
   printf("GPGPU-Sim PTX: cudaMemcpyToSymbol: symbol = %p\n", symbol);
   // stream_operation( const char *symbol, const void *src, size_t count, size_t
   // offset )
-  yasai_stream_manager(ctx)->push(
+  yasai_stream_manager(ctx)->push_sync(
       stream_operation(src, symbol, count, offset, 0));
   // gpgpu_ptx_sim_memcpy_symbol(symbol,src,count,offset,1,context->get_device()->get_gpgpu());
   return g_last_cudaError = cudaSuccess;
@@ -2037,7 +2039,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyFromSymbolInternal(
   // CUctx_st *context = GPGPUSim_Context();
   assert(kind == cudaMemcpyDeviceToHost);
   printf("GPGPU-Sim PTX: cudaMemcpyFromSymbol: symbol = %p\n", symbol);
-  yasai_stream_manager(ctx)->push(
+  yasai_stream_manager(ctx)->push_sync(
       stream_operation(symbol, dst, count, offset, 0));
   // gpgpu_ptx_sim_memcpy_symbol(symbol,dst,count,offset,0,context->get_device()->get_gpgpu());
   return g_last_cudaError = cudaSuccess;
@@ -2087,8 +2089,12 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyAsyncInternal(
       push_h2d(src);
       break;
     case cudaMemcpyDeviceToHost:
-      yasai_stream_manager(ctx)->push(
-          stream_operation((size_t)src, dst, count, s));
+      // yasai: a copy to pageable host memory is synchronous for the host, as in CUDA.
+      if (host_window::contains((unsigned long long)dst, 1))
+        yasai_stream_manager(ctx)->push(stream_operation((size_t)src, dst, count, s));
+      else
+        yasai_stream_manager(ctx)->push_sync(
+            stream_operation((size_t)src, dst, count, s));
       break;
     case cudaMemcpyDeviceToDevice:
       yasai_stream_manager(ctx)->push(
@@ -2108,8 +2114,11 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyAsyncInternal(
       if (sd && dd)
         yasai_stream_manager(ctx)->push(
             stream_operation((size_t)src, (size_t)dst, count, s));
-      else if (sd)
+      else if (sd && host_window::contains((unsigned long long)dst, 1))
         yasai_stream_manager(ctx)->push(stream_operation((size_t)src, dst, count, s));
+      else if (sd)  // yasai: to pageable host memory, synchronous for the host
+        yasai_stream_manager(ctx)->push_sync(
+            stream_operation((size_t)src, dst, count, s));
       else if (dd)
         push_h2d(src);
       else
@@ -2188,9 +2197,10 @@ __host__ cudaError_t CUDARTAPI cudaMemsetInternal(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  CUctx_st *context = GPGPUSim_Context(ctx);
-  gpgpu_t *gpu = context->get_device()->get_gpgpu();
-  gpu->gpu_memset((size_t)mem, c, count);
+  // yasai: a legacy-stream operation (ordered after the earlier work of the legacy and the
+  // blocking streams) that has completed when the call returns.
+  yasai_stream_manager(ctx)->push_sync(
+      stream_operation::memset_op((size_t)mem, c, count, NULL));
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -2965,6 +2975,14 @@ __host__ cudaError_t CUDARTAPI cudaStreamSynchronizeInternal(
     announce_call(__my_func__);
   }
 #if (CUDART_VERSION >= 3000)
+  // yasai: waits for the stream's work queued so far (for the legacy default stream also for
+  // that of the blocking streams). The former code synchronized the whole device for the
+  // legacy stream and returned at once for any other stream; YASAI_STREAM_ZERO_HOST_SYNC=1
+  // keeps it.
+  if (!yasai_stream_manager(ctx)->yasai_host_sync()) {
+    yasai_stream_manager(ctx)->yasai_wait_stream(stream, UINT64_MAX);
+    return g_last_cudaError = cudaSuccess;
+  }
   if (stream == NULL) ctx->synchronize();
   return g_last_cudaError = cudaSuccess;
   stream->synchronize();
@@ -3180,7 +3198,7 @@ __host__ cudaError_t CUDARTAPI cudaStreamWaitEventInternal(
         "before calling cudaStreamWaitEvent.\nNothin    g to be done.\n");
     return g_last_cudaError = cudaSuccess;
   }
-  if (!stream) {
+  if (!stream && yasai_stream_manager(ctx)->yasai_host_sync()) {
     yasai_stream_manager(ctx)->pushCudaStreamWaitEventToAllStreams(
         e, flags);
   } else {
@@ -4062,7 +4080,12 @@ __host__ cudaError_t CUDARTAPI cudaStreamCreateWithPriority(
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  return cudaStreamCreate(stream);
+  // yasai: cudaStreamNonBlocking is kept (the stream is then not ordered against the legacy
+  // default stream); priorities are not modelled.
+  const cudaError_t ret = cudaStreamCreate(stream);
+  if (ret == cudaSuccess && (flags & cudaStreamNonBlocking))
+    ((struct CUstream_st *)*stream)->yasai_set_nonblocking(true);
+  return ret;
 }
 
 __host__ cudaError_t CUDARTAPI
@@ -4078,7 +4101,11 @@ cudaStreamCreateWithFlags(cudaStream_t *stream, unsigned int flags) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  return cudaStreamCreate(stream);
+  // yasai: cudaStreamNonBlocking is kept, as in cudaStreamCreateWithPriority.
+  const cudaError_t ret = cudaStreamCreate(stream);
+  if (ret == cudaSuccess && (flags & cudaStreamNonBlocking))
+    ((struct CUstream_st *)*stream)->yasai_set_nonblocking(true);
+  return ret;
 }
 
 __host__ cudaError_t CUDARTAPI cudaStreamDestroy(cudaStream_t stream) {
@@ -10469,9 +10496,20 @@ __host__ cudaError_t CUDARTAPI _cudaLaunchKernelEx(
 }
 
 __host__ cudaError_t CUDARTAPI cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void *userData) {
-  // yasai: runs the host function after the stream's earlier work, in the calling thread.
+  // yasai: a stream operation; the host-callback thread calls fn when the stream reaches it, and
+  // the stream continues when fn returns (as the CUDA driver's callback thread does). With
+  // YASAI_STREAM_ZERO_HOST_SYNC=1 the former behaviour (wait for the stream, then call fn in
+  // the calling thread) is kept.
   if (fn == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   if (yasai_capture_host_fn(stream, fn, userData)) return g_last_cudaError = cudaSuccess;
+  {
+    gpgpu_context *hctx = GPGPU_Context();
+    if (!yasai_stream_manager(hctx)->yasai_host_sync()) {
+      yasai_stream_manager(hctx)->push(
+          stream_operation::host_fn_op(fn, userData, (struct CUstream_st *)stream));
+      return g_last_cudaError = cudaSuccess;
+    }
+  }
   cudaError_t e = cudaStreamSynchronize(stream);
   if (e != cudaSuccess) return e;
   fn(userData);

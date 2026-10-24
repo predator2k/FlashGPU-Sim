@@ -32,6 +32,79 @@
 #include "gpgpu-sim/gpu-sim.h"
 #include "gpgpusim_entrypoint.h"
 
+#include <unistd.h>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+namespace {
+
+// yasai: the host-callback thread. cudaLaunchHostFunc operations are handed to it by the
+// simulation thread when they reach the front of their stream; it calls the functions one at a
+// time in that order (as the CUDA driver's callback thread does) and completes each operation
+// on its stream when the function returns, so the stream's next operation can start. The
+// simulation thread therefore never runs application code and never waits for it.
+class yasai_host_callbacks {
+ public:
+  // Queues fn(user) for stream s.
+  void post(void (*fn)(void *), void *user, CUstream_st *s) {
+    {
+      std::lock_guard<std::mutex> lk(m_mu);
+      m_queue.push_back(item{fn, user, s});
+    }
+    m_cv.notify_one();
+  }
+  // The instance of this process; a forked child gets a new one with its own thread.
+  static yasai_host_callbacks &get() {
+    static yasai_host_callbacks *inst = NULL;
+    static pid_t owner = 0;
+    static std::mutex create_mu;
+    std::lock_guard<std::mutex> lk(create_mu);
+    if (inst == NULL || owner != getpid()) {
+      inst = new yasai_host_callbacks();  // the parent's instance is left alone in a child
+      owner = getpid();
+    }
+    return *inst;
+  }
+
+ private:
+  struct item {
+    void (*fn)(void *);  // host function
+    void *user;          // its argument
+    CUstream_st *stream;  // stream whose front operation it is
+  };
+  yasai_host_callbacks() {
+    std::thread([this] { run(); }).detach();
+  }
+  // Calls the queued functions in order.
+  void run() {
+    for (;;) {
+      item it;
+      {
+        std::unique_lock<std::mutex> lk(m_mu);
+        m_cv.wait(lk, [this] { return !m_queue.empty(); });
+        it = m_queue.front();
+        m_queue.pop_front();
+      }
+      it.fn(it.user);
+      it.stream->record_next_done();
+    }
+  }
+  std::mutex m_mu;
+  std::condition_variable m_cv;
+  std::deque<item> m_queue;
+};
+
+// yasai: sleeps for a growing interval (20 us up to 1 ms) between polls of a host wait.
+void yasai_backoff(unsigned *us) {
+  usleep(*us);
+  if (*us < 1000) *us *= 2;
+}
+
+}  // namespace
+
 unsigned CUstream_st::sm_next_stream_uid = 0;
 
 // SST memcpy callbacks
@@ -72,6 +145,14 @@ void CUstream_st::synchronize() {
     done = m_operations.empty();
     pthread_mutex_unlock(&m_lock);
   } while (!done);
+}
+
+bool CUstream_st::yasai_front_seq(uint64_t *seq) {
+  pthread_mutex_lock(&m_lock);
+  const bool any = !m_operations.empty();
+  if (any) *seq = m_operations.front().yasai_seq();
+  pthread_mutex_unlock(&m_lock);
+  return any;
 }
 
 void CUstream_st::push(const stream_operation &op) {
@@ -143,6 +224,10 @@ bool stream_operation::do_operation(gpgpu_sim *gpu) {
     case stream_memset:
       gpu->gpu_memset(m_device_address_dst, m_memset_value, m_cnt);
       m_stream->record_next_done();
+      break;
+    case stream_host_fn:
+      // yasai: completed by the host-callback thread when the function returns.
+      yasai_host_callbacks::get().post(m_host_fn, m_host_fn_user, m_stream);
       break;
     case stream_memcpy_device_to_device:
       if (g_debug_execution >= 3) printf("memcpy device-to-device\n");
@@ -257,6 +342,8 @@ stream_manager::stream_manager(gpgpu_sim *gpu, bool cuda_launch_blocking) {
   m_gpu = gpu;
   m_service_stream_zero = false;
   m_cuda_launch_blocking = cuda_launch_blocking;
+  const char *hs = getenv("YASAI_STREAM_ZERO_HOST_SYNC");
+  m_yasai_host_sync = hs != NULL && atoi(hs) != 0;
   pthread_mutex_init(&m_lock, NULL);
   m_last_stream = m_streams.begin();
 }
@@ -348,9 +435,41 @@ void stream_manager::stop_all_running_kernels() {
   pthread_mutex_unlock(&m_lock);
 }
 
+bool stream_manager::yasai_eligible(CUstream_st *s, uint64_t seq) {
+  if (s->yasai_nonblocking()) return true;
+  uint64_t f = 0;
+  if (s == &m_stream_zero) {
+    for (CUstream_st *b : m_streams)
+      if (!b->yasai_nonblocking() && b->yasai_front_seq(&f) && f < seq) return false;
+    return true;
+  }
+  return !(m_stream_zero.yasai_front_seq(&f) && f < seq);
+}
+
 stream_operation stream_manager::front() {
   // called by gpu simulation thread
   stream_operation result;
+  // yasai: legacy default stream semantics on the device side. The streams (the legacy one
+  // first) are scanned round-robin from the one after the last served, and the first idle
+  // stream whose front operation is eligible (yasai_eligible) provides the next operation.
+  if (!m_cuda_launch_blocking && !m_yasai_host_sync) {
+    std::vector<CUstream_st *> c;
+    c.reserve(m_streams.size() + 1);
+    c.push_back(&m_stream_zero);
+    for (CUstream_st *s : m_streams) c.push_back(s);
+    const size_t n = c.size();
+    for (size_t i = 1; i <= n; i++) {
+      const size_t idx = (m_yasai_rr + i) % n;
+      CUstream_st *s = c[idx];
+      uint64_t f = 0;
+      if (s->busy() || !s->yasai_front_seq(&f) || !yasai_eligible(s, f)) continue;
+      m_yasai_rr = idx;
+      result = s->next();
+      if (result.is_kernel()) m_grid_id_to_stream[result.get_kernel()->get_uid()] = s;
+      break;
+    }
+    return result;
+  }
   //    if( concurrent_streams_empty() )
   m_service_stream_zero = true;
   if (m_service_stream_zero) {
@@ -410,6 +529,7 @@ void stream_manager::destroy_stream(CUstream_st *stream) {
   }
   delete stream;
   m_last_stream = m_streams.begin();
+  m_yasai_rr = 0;
   pthread_mutex_unlock(&m_lock);
 }
 
@@ -460,8 +580,76 @@ void stream_manager::print_impl(FILE *fp) {
   if (!m_stream_zero.empty()) m_stream_zero.print(fp);
 }
 
-void stream_manager::push(stream_operation op) {
-  struct CUstream_st *stream = op.get_stream();
+CUstream_st *stream_manager::yasai_resolve(CUstream_st *s) {
+  const uintptr_t h = (uintptr_t)s;
+  if (h == 0 || h == 1) return NULL;  // NULL, cudaStreamLegacy
+  if (h != 2) return s;               // cudaStreamPerThread is 0x2
+  pthread_mutex_lock(&m_lock);
+  CUstream_st *&mine = m_yasai_per_thread[pthread_self()];
+  if (mine == NULL) {
+    mine = new CUstream_st();  // a blocking stream of the calling thread, never destroyed
+    m_streams.push_back(mine);
+  }
+  CUstream_st *r = mine;
+  pthread_mutex_unlock(&m_lock);
+  return r;
+}
+
+void stream_manager::push_sync(stream_operation op) {
+  CUstream_st *s = yasai_resolve(op.get_stream());
+  const uint64_t seq = push(op);
+  CUstream_st *target = (s && !m_cuda_launch_blocking) ? s : &m_stream_zero;
+  unsigned us = 20;
+  uint64_t f = 0;
+  while (target->yasai_front_seq(&f) && f <= seq) yasai_backoff(&us);
+}
+
+void stream_manager::yasai_wait_stream(CUstream_st *handle, uint64_t seq) {
+  CUstream_st *s = yasai_resolve(handle);
+  pthread_mutex_lock(&m_lock);
+  if (seq == UINT64_MAX) seq = m_yasai_next_seq - 1;
+  pthread_mutex_unlock(&m_lock);
+  unsigned us = 20;
+  for (;;) {
+    bool busy = false;
+    uint64_t f = 0;
+    pthread_mutex_lock(&m_lock);
+    if (s != NULL) {
+      busy = s->yasai_front_seq(&f) && f <= seq;
+    } else {
+      busy = m_stream_zero.yasai_front_seq(&f) && f <= seq;
+      for (CUstream_st *b : m_streams)
+        if (!busy && !b->yasai_nonblocking() && b->yasai_front_seq(&f) && f <= seq) busy = true;
+    }
+    pthread_mutex_unlock(&m_lock);
+    if (!busy) return;
+    yasai_backoff(&us);
+  }
+}
+
+uint64_t stream_manager::push(stream_operation op) {
+  struct CUstream_st *stream = yasai_resolve(op.get_stream());
+  op.set_stream(stream);
+  if (!m_cuda_launch_blocking && !m_yasai_host_sync) {
+    // yasai: no host wait; see front() and yasai_eligible.
+    pthread_mutex_lock(&m_lock);
+    const uint64_t seq = m_yasai_next_seq++;
+    op.yasai_set_seq(seq);
+    if (!m_gpu->cycle_insn_cta_max_hit()) {
+      if (stream) {
+        stream->push(op);
+      } else {
+        op.set_stream(&m_stream_zero);
+        m_stream_zero.push(op);
+      }
+    } else {
+      printf("GPGPU-Sim API: Maximum cycle, instruction, or CTA count hit. Skipping:");
+      op.print(stdout);
+      printf("\n");
+    }
+    pthread_mutex_unlock(&m_lock);
+    return seq;
+  }
 
   // block if stream 0 (or concurrency disabled) and pending concurrent
   // operations exist
@@ -473,6 +661,8 @@ void stream_manager::push(stream_operation op) {
   };
 
   pthread_mutex_lock(&m_lock);
+  const uint64_t seq = m_yasai_next_seq++;
+  op.yasai_set_seq(seq);
   if (!m_gpu->cycle_insn_cta_max_hit()) {
     // Accept the stream operation if the maximum cycle/instruction/cta counts
     // are not triggered
@@ -503,6 +693,7 @@ void stream_manager::push(stream_operation op) {
       if (wait_amount > wait_cap) wait_amount = wait_cap;
     }
   }
+  return seq;
 }
 
 void stream_manager::pushCudaStreamWaitEventToAllStreams(CUevent_st *e,

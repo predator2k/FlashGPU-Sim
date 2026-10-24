@@ -32,7 +32,9 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <time.h>
+#include <stdint.h>
 #include <list>
+#include <map>
 #include <memory>
 #include "abstract_hardware_model.h"
 
@@ -114,7 +116,8 @@ enum stream_operation_type {
   stream_kernel_launch,
   stream_event,
   stream_wait_event,
-  stream_memset  // yasai: cudaMemsetAsync, performed in stream order
+  stream_memset,  // yasai: cudaMemsetAsync, performed in stream order
+  stream_host_fn  // yasai: cudaLaunchHostFunc, run by the host-callback thread in stream order
 };
 
 class stream_operation {
@@ -129,6 +132,22 @@ class stream_operation {
     stream_operation op(size_t(0), dst, cnt, stream);
     op.m_type = stream_memset;
     op.m_memset_value = value;
+    return op;
+  }
+  /// yasai: a host function call fn(user) in stream order (cudaLaunchHostFunc). The simulation
+  /// thread hands it to the host-callback thread, and the stream's next operation starts when
+  /// the function has returned.
+  /// @param fn Host function.
+  /// @param user Its argument.
+  /// @param stream Stream.
+  /// @return The operation.
+  static stream_operation host_fn_op(void (*fn)(void *), void *user, struct CUstream_st *stream) {
+    stream_operation op;
+    op.m_type = stream_host_fn;
+    op.m_host_fn = fn;
+    op.m_host_fn_user = user;
+    op.m_stream = stream;
+    op.m_done = false;
     return op;
   }
   stream_operation() {
@@ -249,8 +268,15 @@ class stream_operation {
   void print(FILE *fp) const;
   struct CUstream_st *get_stream() { return m_stream; }
   void set_stream(CUstream_st *stream) { m_stream = stream; }
+  /// yasai: host-order sequence number, assigned by stream_manager::push (0 before).
+  uint64_t yasai_seq() const { return m_yasai_seq; }
+  /// yasai: sets the sequence number (stream_manager::push only).
+  void yasai_set_seq(uint64_t seq) { m_yasai_seq = seq; }
 
  private:
+  uint64_t m_yasai_seq = 0;          ///< yasai: host-order sequence number
+  void (*m_host_fn)(void *) = NULL;  ///< yasai: host function of a stream_host_fn operation
+  void *m_host_fn_user = NULL;       ///< yasai: its argument
   struct CUstream_st *m_stream;
 
   bool m_done;
@@ -285,6 +311,15 @@ struct CUstream_st {
   stream_operation &front() { return m_operations.front(); }
   void print(FILE *fp);
   unsigned get_uid() const { return m_uid; }
+  /// yasai: sequence number of the front operation (the running or the next one).
+  /// @param seq Output.
+  /// @return False when the stream is empty.
+  bool yasai_front_seq(uint64_t *seq);
+  /// yasai: a stream created with cudaStreamNonBlocking is not ordered against the legacy
+  /// default stream.
+  bool yasai_nonblocking() const { return m_yasai_nonblocking; }
+  /// yasai: sets the cudaStreamNonBlocking property (at creation).
+  void yasai_set_nonblocking(bool nb) { m_yasai_nonblocking = nb; }
   // yasai: a forked child inherits the lock in whatever state the parent's threads left it.
   void reset_lock_after_fork() { pthread_mutex_init(&m_lock, NULL); }
 
@@ -294,6 +329,7 @@ struct CUstream_st {
 
   std::list<stream_operation> m_operations;
   bool m_pending;  // front operation has started but not yet completed
+  bool m_yasai_nonblocking = false;  // yasai: created with cudaStreamNonBlocking
 
   pthread_mutex_t m_lock;  // ensure only one host or gpu manipulates stream
                            // operation at one time
@@ -311,7 +347,28 @@ class stream_manager {
   bool empty_protected();
   bool empty();
   void print(FILE *fp);
-  void push(stream_operation op);
+  /// yasai: queues op on its stream and returns its sequence number. Unless the manager is in
+  /// launch-blocking mode (or YASAI_STREAM_ZERO_HOST_SYNC=1 restores the former host waits),
+  /// the call does not wait: the order of the legacy default stream against the blocking
+  /// streams is enforced by front() on the simulation thread (see yasai_eligible).
+  /// @param op Operation; its stream handle is resolved with yasai_resolve.
+  /// @return Sequence number of the operation.
+  uint64_t push(stream_operation op);
+  /// yasai: push for a synchronous API (cudaMemcpy, cudaMemset, cudaMemcpyToSymbol, a
+  /// pageable cudaMemcpyAsync to the host): returns when the operation has completed.
+  /// @param op Operation.
+  void push_sync(stream_operation op);
+  /// yasai: waits until the operations with sequence number <= seq of stream s have
+  /// completed; for the legacy default stream also those of every blocking stream.
+  /// @param s Stream handle as passed by the application (resolved with yasai_resolve).
+  /// @param seq Sequence bound; UINT64_MAX means everything queued so far.
+  void yasai_wait_stream(CUstream_st *s, uint64_t seq);
+  /// yasai: the stream an application handle denotes: NULL and cudaStreamLegacy (0x1) give
+  /// NULL (the legacy default stream), cudaStreamPerThread (0x2) gives the calling thread's own
+  /// blocking stream, and other handles are returned unchanged.
+  /// @param s Handle.
+  /// @return Stream, or NULL for the legacy default stream.
+  CUstream_st *yasai_resolve(CUstream_st *s);
   void pushCudaStreamWaitEventToAllStreams(CUevent_st *e, unsigned int flags);
   bool operation(bool *sim);
   void stop_all_running_kernels();
@@ -323,6 +380,9 @@ class stream_manager {
     for (CUstream_st *s : m_streams) s->reset_lock_after_fork();
   }
   bool is_blocking() { return m_cuda_launch_blocking; };
+  /// yasai: whether the former host-side waits of the legacy default stream are in force
+  /// (launch-blocking mode or YASAI_STREAM_ZERO_HOST_SYNC=1).
+  bool yasai_host_sync() const { return m_cuda_launch_blocking || m_yasai_host_sync; }
 
  private:
   void print_impl(FILE *fp);
@@ -333,6 +393,15 @@ class stream_manager {
   std::map<unsigned, CUstream_st *> m_grid_id_to_stream;
   CUstream_st m_stream_zero;
   bool m_service_stream_zero;
+  // yasai: whether the front operation (sequence number seq) of stream s may start: an
+  // operation of the legacy stream waits for every earlier operation of the blocking streams,
+  // an operation of a blocking stream waits for every earlier legacy-stream operation, and a
+  // non-blocking stream is ordered only by itself. Called with m_lock held.
+  bool yasai_eligible(CUstream_st *s, uint64_t seq);
+  uint64_t m_yasai_next_seq = 1;  // yasai: next sequence number (under m_lock)
+  size_t m_yasai_rr = 0;          // yasai: round-robin position of front()
+  bool m_yasai_host_sync = false;  // yasai: YASAI_STREAM_ZERO_HOST_SYNC=1, the former waits
+  std::map<pthread_t, CUstream_st *> m_yasai_per_thread;  // yasai: cudaStreamPerThread
   pthread_mutex_t m_lock;
   std::list<struct CUstream_st *>::iterator m_last_stream;
 };
