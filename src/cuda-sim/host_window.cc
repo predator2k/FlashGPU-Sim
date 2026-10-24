@@ -2,6 +2,8 @@
 #include "host_window.h"
 
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -105,7 +107,17 @@ void add(uint64_t base, size_t bytes, range_kind kind, void *mc, uint64_t mc_off
     auto prev = std::prev(it);
     if (prev->first + prev->second.bytes > base) it = prev;
   }
-  while (it != m.end() && it->first < base + bytes) it = m.erase(it);
+  while (it != m.end() && it->first < base + bytes) {
+    // A replaced range usually means two registrations disagree about an address range.
+    if (getenv("YASAI_HW_DEBUG"))
+      fprintf(stderr, "host_window: [0x%llx, +%zu) kind %d replaces [0x%llx, +%zu) kind %d\n",
+              (unsigned long long)base, bytes, int(kind), (unsigned long long)it->first,
+              it->second.bytes, int(it->second.kind));
+    it = m.erase(it);
+  }
+  if (getenv("YASAI_HW_DEBUG"))
+    fprintf(stderr, "host_window: add [0x%llx, +%zu) kind %d\n", (unsigned long long)base, bytes,
+            int(kind));
   m[base] = entry{bytes, kind, mc, mc_offset};
   g_count.store(m.size(), std::memory_order_release);
 }

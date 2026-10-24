@@ -31,6 +31,14 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "cuda-sim.h"
+#include <shared_mutex>
+
+// yasai: guards cuda_sim::g_pc_to_finfo. PTX pieces are assembled (map insertions) while
+// kernels run and look up reconvergence points (map lookups) on another thread.
+static std::shared_mutex &yasai_pc_finfo_mu() {
+  static std::shared_mutex *m = new std::shared_mutex;
+  return *m;
+}
 #include "../yasai_subprocess.h"
 
 #include "instructions.h"
@@ -645,6 +653,24 @@ void function_info::ptx_assemble() {
   // reserve is cumulative. s_g_pc_to_insn.reserve(s_g_pc_to_insn.size() +
   // MAX_INST_SIZE*m_instructions.size());
   gpgpu_ctx->s_g_pc_to_insn.reserve(MAX_INST_SIZE * m_instructions.size());
+  // yasai: PTX is parsed while kernels run (per-kernel pieces from host threads, lazy function
+  // bodies from the simulation thread), and warps fetch instructions from this vector without
+  // a lock. A reallocation by push_back would free the array under a fetching warp, so the
+  // vector reserves a large capacity once, at the first assembly, before any kernel runs:
+  // YASAI_PC_RESERVE entries (default 2^28; only touched pages take memory).
+  {
+    static bool reserved = false;
+    if (!reserved) {
+      reserved = true;
+      const char *e = getenv("YASAI_PC_RESERVE");
+      const size_t want = e ? strtoull(e, nullptr, 0) : (size_t(1) << 28);
+      if (gpgpu_ctx->s_g_pc_to_insn.capacity() < want) gpgpu_ctx->s_g_pc_to_insn.reserve(want);
+    }
+    if (gpgpu_ctx->s_g_pc_to_insn.size() + MAX_INST_SIZE * (m_instructions.size() + 1) >
+        gpgpu_ctx->s_g_pc_to_insn.capacity())
+      printf("GPGPU-Sim PTX: WARNING: instruction memory exceeds YASAI_PC_RESERVE; it is "
+             "reallocated, which is unsafe while kernels run\n");
+  }
   for (i = m_instructions.begin(); i != m_instructions.end(); i++) {
     ptx_instruction *pI = *i;
     if (pI->is_label()) {
@@ -652,7 +678,10 @@ void function_info::ptx_assemble() {
       insert_label(pI->get_symbol_table(), l->name(), n);
       // labels[l->name()] = n;
     } else {
-      gpgpu_ctx->func_sim->g_pc_to_finfo[PC] = this;
+      {
+        std::unique_lock<std::shared_mutex> lk(yasai_pc_finfo_mu());
+        gpgpu_ctx->func_sim->g_pc_to_finfo[PC] = this;
+      }
       m_instr_mem[n] = pI;
       gpgpu_ctx->s_g_pc_to_insn.push_back(pI);
       assert(pI == gpgpu_ctx->s_g_pc_to_insn[PC]);
@@ -970,6 +999,7 @@ void gpgpu_t::gpu_memset(size_t dst_start_addr, int c, size_t count) {
 }
 
 void cuda_sim::ptx_print_insn(address_type pc, FILE *fp) {
+  std::shared_lock<std::shared_mutex> lk(yasai_pc_finfo_mu());
   std::map<unsigned, function_info *>::iterator f = g_pc_to_finfo.find(pc);
   if (f == g_pc_to_finfo.end()) {
     fprintf(fp, "<no instruction at address 0x%llx>", pc);
@@ -981,6 +1011,7 @@ void cuda_sim::ptx_print_insn(address_type pc, FILE *fp) {
 }
 
 std::string cuda_sim::ptx_get_insn_str(address_type pc) {
+  std::shared_lock<std::shared_mutex> lk(yasai_pc_finfo_mu());
   std::map<unsigned, function_info *>::iterator f = g_pc_to_finfo.find(pc);
   if (f == g_pc_to_finfo.end()) {
 #define STR_SIZE 255
@@ -4119,7 +4150,18 @@ void functionalCoreSim::yasai_barrier(const warp_inst_t &inst, unsigned w) {
     if (inst.active(l)) t0 = m_thread[w * m_warp_size + l];
   unsigned id = 0;
   unsigned count = (unsigned)-1;
-  if (t0 != NULL && pb->get_num_operands() >= 1) {
+  if (t0 != NULL && const_cast<ptx_instruction *>(pb)->barrier_op() == RED_OPTION) {
+    // barrier.red.op.pred d, id{, count}, p: operand 0 is the predicate result, the id and
+    // the optional count follow. Reading the id from operand 0 used the predicate value as the
+    // id and the id as the thread count, so the barrier released at once (NCCL's barrierAny
+    // before posting a step: a peer read data that other warps had not written yet).
+    const operand_info &op1 = pb->src1();
+    id = t0->get_operand_value(op1, op1, U32_TYPE, t0, 1).u32;
+    if (pb->get_num_operands() > 3) {
+      const operand_info &op2 = pb->src2();
+      count = t0->get_operand_value(op2, op2, U32_TYPE, t0, 1).u32;
+    }
+  } else if (t0 != NULL && pb->get_num_operands() >= 1) {
     const operand_info &op0 = pb->dst();
     id = t0->get_operand_value(op0, op0, U32_TYPE, t0, 1).u32;
     if (pb->get_num_operands() >= 2) {
@@ -4338,9 +4380,13 @@ address_type cuda_sim::get_converge_point(address_type pc) {
   // branch has no immediate postdominator in the function (i.e., due to
   // multiple return points).
 
-  std::map<unsigned, function_info *>::iterator f = g_pc_to_finfo.find(pc);
-  assert(f != g_pc_to_finfo.end());
-  function_info *finfo = f->second;
+  function_info *finfo;
+  {
+    std::shared_lock<std::shared_mutex> lk(yasai_pc_finfo_mu());
+    std::map<unsigned, function_info *>::iterator f = g_pc_to_finfo.find(pc);
+    assert(f != g_pc_to_finfo.end());
+    finfo = f->second;
+  }
   rec_pts tmp = find_reconvergence_points(finfo);
 
   int i = 0;

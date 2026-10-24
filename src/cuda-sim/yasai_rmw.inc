@@ -344,6 +344,37 @@ void multimem_ld_reduce_impl(const ptx_instruction *pI, ptx_thread_info *thread)
   const bool fp = k == yasai_rmw::elem::f16 || k == yasai_rmw::elem::bf16 ||
                   k == yasai_rmw::elem::f32 || k == yasai_rmw::elem::f64;
   const unsigned op = pI->get_atomic();
+  // YASAI_MC_DEBUG=1: prints the targets and the values of 8-byte integer reductions (the
+  // step counters NCCL's NVLS kernels synchronize on).
+  static const bool mc_debug = getenv("YASAI_MC_DEBUG") != NULL;
+  static int mc_debug_data = 0;
+  if (mc_debug && fp && thread->get_laneid() == 0 && mc_debug_data < 64) {
+    mc_debug_data++;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    printf("yasai-mc: t %lld.%06ld data ld_reduce off 0x%llx targets %d:", (long long)ts.tv_sec,
+           ts.tv_nsec / 1000, (unsigned long long)off, nt);
+    for (int t = 0; t < nt; t++) {
+      uint32_t v = 0;
+      host_window::read(tg[t], 4, &v);
+      float f;
+      memcpy(&f, &v, 4);
+      printf(" %g", f);
+    }
+    printf("\n");
+  }
+  if (mc_debug && eb == 8 && !fp && thread->get_laneid() == 0) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    printf("yasai-mc: t %lld.%06ld ld_reduce op %u off 0x%llx targets %d:", (long long)ts.tv_sec,
+           ts.tv_nsec / 1000, op, (unsigned long long)off, nt);
+    for (int t = 0; t < nt; t++) {
+      uint64_t v = 0;
+      host_window::read(tg[t], 8, &v);
+      printf(" %llu", (unsigned long long)v);
+    }
+    printf("\n");
+  }
   ptx_reg_t out[8];
   for (unsigned e = 0; e < n; e++) {
     out[e].u64 = 0;
