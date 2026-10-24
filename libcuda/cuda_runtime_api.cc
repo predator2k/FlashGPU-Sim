@@ -5173,6 +5173,38 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
   }
 
   }
+  // yasai: an override for a library that carries no PTX of its own adds its file. A library
+  // built with separable compilation (bitsandbytes) keeps the PTX in its objects' relocatable
+  // device code and registers only device-linked cubins, so cuobjdump lists no PTX for it and
+  // the loop above never sees it. The architecture comes from the file's .target line.
+  for (const auto &ov : lib_override) {
+    bool listed = false;
+    for (const auto &library : by_library) {
+      const std::string &lib = library.first;
+      const size_t base = lib.rfind('/') == std::string::npos ? 0 : lib.rfind('/') + 1;
+      listed = listed || lib.compare(base, ov.first.size(), ov.first) == 0;
+    }
+    if (listed) continue;
+    std::ifstream in(ov.second);
+    std::string line, arch;
+    while (arch.empty() && std::getline(in, line)) {
+      const size_t t = line.find(".target");
+      const size_t sm = line.find("sm_", t == std::string::npos ? line.size() : t);
+      if (t != std::string::npos && sm != std::string::npos) {
+        size_t e = sm + 3;
+        while (e < line.size() && isalnum((unsigned char)line[e])) ++e;
+        arch = line.substr(sm, e - sm);
+      }
+    }
+    if (arch.empty()) {
+      printf("GPGPU-Sim PTX: override %s has no .target line, skipped\n", ov.second.c_str());
+      continue;
+    }
+    yasai_override_arch()[ov.second] = arch;
+    selected_files.push_back(ov.second);
+    printf("GPGPU-Sim PTX: %s carries no PTX; %s (%s) added for it\n", ov.first.c_str(),
+           ov.second.c_str(), arch.c_str());
+  }
 
   // Parse the selected files (if any)
   const char *selected_ptx_override = getenv("GPGPUSIM_SELECTED_PTX_OVERRIDE");
