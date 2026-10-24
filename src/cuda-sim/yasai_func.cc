@@ -2,6 +2,8 @@
 // sampling. See yasai_func.h for the environment switches.
 #include "yasai_func.h"
 
+#include <shared_mutex>
+
 #include <chrono>
 #include <regex>
 #include <cmath>
@@ -676,7 +678,15 @@ std::unordered_map<const symbol *, uint64_t> g_func_handles;
 
 }  // namespace
 
+/// Guards g_func_symbols and g_func_handles: handles are created while PTX is parsed (on any
+/// thread) and resolved by indirect calls on the simulation thread.
+std::shared_mutex &func_handles_mu() {
+  static std::shared_mutex *m = new std::shared_mutex;
+  return *m;
+}
+
 uint64_t function_handle(const symbol *s) {
+  std::unique_lock<std::shared_mutex> lk(func_handles_mu());
   auto it = g_func_handles.find(s);
   if (it != g_func_handles.end()) return it->second;
   const uint64_t h = kFunctionHandleTag | uint64_t(g_func_symbols.size());
@@ -687,6 +697,7 @@ uint64_t function_handle(const symbol *s) {
 
 const symbol *function_of(uint64_t value) {
   if ((value & 0xffff000000000000ull) != kFunctionHandleTag) return nullptr;
+  std::shared_lock<std::shared_mutex> lk(func_handles_mu());
   const uint64_t idx = value & 0x0000ffffffffffffull;
   return idx < g_func_symbols.size() ? g_func_symbols[idx] : nullptr;
 }
