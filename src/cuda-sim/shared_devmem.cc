@@ -220,6 +220,22 @@ bool eager_memfd() {
   return on;
 }
 
+/// Pinned memory of this process (VmPin of /proc/self/status, which counts RDMA registrations).
+/// @return Pinned kB, or 0 when unknown.
+long pinned_kb() {
+  FILE *f = fopen("/proc/self/status", "r");
+  if (!f) return 0;
+  char line[256];
+  long kb = 0;
+  while (fgets(line, sizeof line, f))
+    if (strncmp(line, "VmPin:", 6) == 0) {
+      kb = atol(line + 6);
+      break;
+    }
+  fclose(f);
+  return kb;
+}
+
 /// Places object bytes at a fixed address and registers the range; the caller holds st().mu.
 /// @param va Address.
 /// @param size Length.
@@ -297,6 +313,40 @@ void hook_write(void *mc, uint64_t off, size_t bytes, const void *in) {
            (long long)ts.tv_sec, ts.tv_nsec / 1000, (unsigned long long)off,
            (unsigned long long)v, n);
   }
+}
+
+/// Moves an anonymous cudaMalloc allocation into a new segment mapped at the same address: its
+/// non-zero chunks are copied (pages that were never written stay holes) and the segment then
+/// replaces the anonymous mapping. The caller holds st().mu and has synchronized the device, so no
+/// kernel writes the allocation meanwhile. A registration that pinned the anonymous pages before
+/// (ibv_reg_mr without the yasai_devmem_prepare_pin hook) would keep the old pages, so a conversion
+/// while the process holds pinned memory prints a warning.
+/// @param b First address.
+/// @param a The allocation.
+/// @return True on success.
+bool convert_anon_locked(uint64_t b, allocation &a) {
+  const size_t len = round_up(a.size, kPage);
+  if (const long kb = pinned_kb())
+    fprintf(stderr, "shared_devmem: WARNING: allocation 0x%llx (%zu bytes) becomes a shared "
+            "segment while the process holds %ld kB of pinned memory; an RDMA registration of "
+            "this allocation made earlier would keep its old pages (YASAI_DEVMEM_EAGER_MEMFD=1 "
+            "avoids the conversion)\n", (unsigned long long)b, a.size, kb);
+  int fd = new_memfd(len);
+  if (fd < 0) return false;
+  void *tmp = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (tmp == MAP_FAILED) {
+    close(fd);
+    return false;
+  }
+  copy_nonzero(static_cast<char *>(tmp), reinterpret_cast<const char *>(b), len);
+  munmap(tmp, len);
+  if (!place_locked(b, len, 0, fd, false)) {
+    close(fd);
+    return false;
+  }
+  a.seg = wrap_locked(fd, len);
+  a.anon = false;
+  return true;
 }
 
 /// In a forked child: moves every cudaMalloc segment inherited from the parent into a segment
@@ -566,25 +616,7 @@ bool ipc_export(uint64_t addr, const read_fn &read_old, std::string *ref, uint64
   allocation &a = it->second;
   const uint64_t b = it->first;
   if (!a.seg && a.anon) {
-    // Anonymous allocation: its non-zero chunks move into a new segment that then replaces the
-    // anonymous mapping at the same address (pages that were never written stay holes). The
-    // caller has synchronized the device (export_needs_copy), so no kernel writes meanwhile.
-    const size_t len = round_up(a.size, kPage);
-    int fd = new_memfd(len);
-    if (fd < 0) return false;
-    void *tmp = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (tmp == MAP_FAILED) {
-      close(fd);
-      return false;
-    }
-    copy_nonzero(static_cast<char *>(tmp), reinterpret_cast<const char *>(b), len);
-    munmap(tmp, len);
-    if (!place_locked(b, len, 0, fd, false)) {
-      close(fd);
-      return false;
-    }
-    a.seg = wrap_locked(fd, len);
-    a.anon = false;
+    if (!convert_anon_locked(b, a)) return false;
   } else if (!a.seg) {
     // Storage allocation (YASAI_DEVMEM_HOST=0): move its contents into a segment mapped at the
     // same address, so the owner's pointers stay valid.
@@ -620,13 +652,29 @@ bool ipc_export(uint64_t addr, const read_fn &read_old, std::string *ref, uint64
   return true;
 }
 
-bool export_needs_copy(uint64_t addr) {
+bool export_needs_copy(uint64_t addr) { return range_needs_copy(addr, 1); }
+
+bool range_needs_copy(uint64_t addr, size_t bytes) {
   std::lock_guard<std::mutex> lock(st().mu);
   state &s = st();
   auto it = s.allocs.upper_bound(addr);
-  if (it == s.allocs.begin()) return false;
-  --it;
-  return addr < it->first + it->second.size && !it->second.seg;
+  if (it != s.allocs.begin()) --it;
+  for (; it != s.allocs.end() && it->first < addr + (bytes ? bytes : 1); ++it)
+    if (it->first + it->second.size > addr && it->second.anon) return true;
+  return false;
+}
+
+bool share_range(uint64_t addr, size_t bytes) {
+  init_once();
+  std::lock_guard<std::mutex> lock(st().mu);
+  state &s = st();
+  auto it = s.allocs.upper_bound(addr);
+  if (it != s.allocs.begin()) --it;
+  bool ok = true;
+  for (; it != s.allocs.end() && it->first < addr + (bytes ? bytes : 1); ++it)
+    if (it->first + it->second.size > addr && it->second.anon)
+      ok = convert_anon_locked(it->first, it->second) && ok;
+  return ok;
 }
 
 bool ipc_open(const char *ref, size_t size, uint64_t va) {

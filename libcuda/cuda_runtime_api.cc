@@ -4082,16 +4082,34 @@ __host__ cudaError_t CUDARTAPI cudaGraphConditionalHandleCreate(cudaGraphConditi
 
 // yasai: legacy IPC (yasai_vmm, shared_devmem): the handle carries the ref of the allocation's
 // memfd; the peer maps that segment at a fresh device address of its own.
+// yasai: moves the anonymous cudaMalloc allocations overlapping [ptr, ptr + bytes) into shared
+// segments (shared_devmem::share_range) after synchronizing the device, so that no kernel writes
+// them during the copy. Called before an export or a pinning registration.
+//   ptr: first address; bytes: length (0 counts as 1)
+static void yasai_share_device_range(const void *ptr, size_t bytes) {
+  const uint64_t a = reinterpret_cast<uint64_t>(ptr);
+  if (!shared_devmem::range_needs_copy(a, bytes)) return;
+  cudaDeviceSynchronizeInternal();
+  shared_devmem::share_range(a, bytes);
+}
+
+// yasai: hook for wrappers of RDMA registration (the fakeenv verbs recorder calls it before
+// ibv_reg_mr and ibv_reg_mr_iova2): device memory in [addr, addr + bytes) becomes a shared
+// segment before the registration pins its pages.
+//   addr: first address; bytes: length
+//   returns 0
+extern "C" int yasai_devmem_prepare_pin(const void *addr, size_t bytes) {
+  yasai_share_device_range(addr, bytes);
+  return 0;
+}
+
 __host__ cudaError_t CUDARTAPI cudaIpcGetMemHandle(cudaIpcMemHandle_t *handle,
                                                    void *devPtr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
   if (!handle) return g_last_cudaError = cudaErrorInvalidValue;
-  // yasai: the first export of a cudaMalloc allocation copies it into a shared segment; no
-  // kernel may write it during the copy.
-  if (shared_devmem::export_needs_copy(reinterpret_cast<uint64_t>(devPtr)))
-    cudaDeviceSynchronizeInternal();
+  yasai_share_device_range(devPtr, 1);
   if (!yasai_vmm::ipc_get_mem_handle(yasai_current_gpu(), handle,
                                      reinterpret_cast<uint64_t>(devPtr)))
     return g_last_cudaError = cudaErrorInvalidValue;
@@ -8582,6 +8600,13 @@ CUresult CUDAAPI cuPointerSetAttribute(const void *value,
                                        CUdeviceptr ptr) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
+  }
+  // yasai: SYNC_MEMOPS marks memory that third-party DMA (GPUDirect RDMA) will access; NCCL, UCX
+  // and NVSHMEM set it before registering a device buffer, so the buffer becomes a shared segment
+  // now (copies are synchronous in the simulator, so the attribute itself changes nothing).
+  if (attribute == CU_POINTER_ATTRIBUTE_SYNC_MEMOPS) {
+    yasai_share_device_range(reinterpret_cast<const void *>(ptr), 1);
+    return CUDA_SUCCESS;
   }
   printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
   return CUDA_SUCCESS;

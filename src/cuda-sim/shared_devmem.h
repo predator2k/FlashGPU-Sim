@@ -13,7 +13,11 @@
 //     host threads and other processes see the same bytes with acquire/release visibility.
 //     cudaMalloc memory starts as private anonymous memory at its device address, so reading a
 //     page that was never written maps the zero page and costs no memory (a read fault on a
-//     memfd hole allocates the page); YASAI_DEVMEM_EAGER_MEMFD=1 maps a memfd at once.
+//     memfd hole allocates the page); YASAI_DEVMEM_EAGER_MEMFD=1 maps a memfd at once. Such an
+//     allocation becomes a segment at the same address on its first legacy IPC export, on
+//     cuPointerSetAttribute(SYNC_MEMOPS) (the GPUDirect RDMA idiom before a registration) and
+//     through yasai_devmem_prepare_pin(), which the verbs recorder calls before ibv_reg_mr, so
+//     that a pinning registration never holds pages that a later conversion replaces.
 //     YASAI_DEVMEM_HOST=0 restores the simulator's own storage for cudaMalloc (legacy IPC then
 //     moves an allocation into a memfd when it is first exported).
 //   * A segment is reached from another process through its owner's descriptor, by the path
@@ -173,6 +177,20 @@ bool ipc_export(uint64_t addr, const read_fn &read_old, std::string *ref, uint64
 /// @param addr Address inside a cudaMalloc allocation.
 /// @return True when the export will copy.
 bool export_needs_copy(uint64_t addr);
+
+/// Whether any cudaMalloc allocation overlapping [addr, addr + bytes) is still anonymous memory.
+/// @param addr First address.
+/// @param bytes Length (0 counts as 1).
+/// @return True when share_range() would copy.
+bool range_needs_copy(uint64_t addr, size_t bytes);
+
+/// Moves every anonymous cudaMalloc allocation overlapping [addr, addr + bytes) into a segment
+/// mapped at the same address, before an API that pins or shares the pages (an RDMA
+/// registration) sees them. The caller has synchronized the device.
+/// @param addr First address.
+/// @param bytes Length (0 counts as 1).
+/// @return True when every overlapping allocation is a segment afterwards.
+bool share_range(uint64_t addr, size_t bytes);
 
 /// Legacy IPC open: maps the segment `ref` of `size` bytes at device address `va` (taken by the
 /// caller from the device heap).
