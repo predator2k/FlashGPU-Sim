@@ -99,9 +99,16 @@ uint64_t g_stat_stores = 0, g_stat_pieces = 0, g_stat_flushed = 0, g_stat_fences
 void stats_arm() {
   static bool armed = []{
     if (getenv("YASAI_FIO_WINDOW_STATS"))
-      atexit([]{ fprintf(stderr, "yasai fio_window stats: stores=%llu pieces=%llu flushed=%llu fences=%llu\n",
-                         (unsigned long long)g_stat_stores, (unsigned long long)g_stat_pieces,
-                         (unsigned long long)g_stat_flushed, (unsigned long long)g_stat_fences); });
+      atexit([]{
+        // The settings go on the same line, so a run record carries the tear unit and seed.
+        Config &c = config();
+        fprintf(stderr, "yasai fio_window stats: stores=%llu pieces=%llu flushed=%llu fences=%llu "
+                "tear=%llu delay=%llu seed=%llu flush=%s\n",
+                (unsigned long long)g_stat_stores, (unsigned long long)g_stat_pieces,
+                (unsigned long long)g_stat_flushed, (unsigned long long)g_stat_fences,
+                (unsigned long long)c.tear_unit, (unsigned long long)c.delay_max,
+                (unsigned long long)c.seed, c.strict ? "strict" : "kernel_end");
+      });
     return true;
   }();
   (void)armed;
