@@ -115,13 +115,13 @@ lib$(PROG).a: $(OBJS)
 	ar rcs $(OUTPUT_DIR)/lib$(PROG).a $(OBJS)
 
 $(OUTPUT_DIR)/%.o: %.cc
-	$(CPP) $(CXXFLAGS) -I./ -I$(OUTPUT_DIR) -I$(CUDA_INSTALL_PATH)/include  -c $< -o $@
+	$(CPP) $(CXXFLAGS) -I./ -I$(OUTPUT_DIR) -I$(CUDA_INSTALL_PATH)/include -MMD -MP -c $< -o $@
 
 $(OUTPUT_DIR)/%.o: %.c
-	$(CPP) $(CCFLAGS) -I./ -I$(OUTPUT_DIR) -I$(CUDA_INSTALL_PATH)/include  -c $< -o $@
+	$(CPP) $(CCFLAGS) -I./ -I$(OUTPUT_DIR) -I$(CUDA_INSTALL_PATH)/include -MMD -MP -c $< -o $@
 
 $(OUTPUT_DIR)/%.o: $(OUTPUT_DIR)/%.c
-	$(CPP) $(CCFLAGS) -I./ -I$(OUTPUT_DIR) -I$(CUDA_INSTALL_PATH)/include  -c $< -o $@
+	$(CPP) $(CCFLAGS) -I./ -I$(OUTPUT_DIR) -I$(CUDA_INSTALL_PATH)/include -MMD -MP -c $< -o $@
 
 $(OUTPUT_DIR)/cuobjdump_parser.c: cuobjdump.y
 	$(YACC) $(YFLAGS) -p cuobjdump_  -o$@ $< --file-prefix=$(OUTPUT_DIR)/cuobjdump
@@ -149,3 +149,8 @@ clean:
 
 include $(OUTPUT_DIR)/Makefile.makedepend
 
+# yasai: -MMD -MP writes <object>.d with every header and .def file the object includes
+# (opcodes.def, the generated ptx.tab.h, instructions.h, ptx_parser_decode.def), so an
+# edit of one rebuilds every object that includes it; makedepend missed headers in other
+# directories.
+-include $(wildcard $(OUTPUT_DIR)/*.d)

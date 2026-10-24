@@ -120,34 +120,34 @@ depend:
 
 $(OUTPUT_DIR)/%.$(OEXT): %.cc
 	@mkdir -p $(dir $@)
-	$(CPP) $(OPTFLAGS) $(CXXFLAGS) $(POWER_FLAGS) -o $@ -c $<
+	$(CPP) $(OPTFLAGS) $(CXXFLAGS) $(POWER_FLAGS) -MMD -MP -o $@ -c $<
 
 # Specific rule for flash subdirectory
 $(OUTPUT_DIR)/flash/%.$(OEXT): flash/%.cc | $(OUTPUT_DIR)/flash
-	$(CPP) $(OPTFLAGS) $(CXXFLAGS) $(POWER_FLAGS) -o $@ -c $<
+	$(CPP) $(OPTFLAGS) $(CXXFLAGS) $(POWER_FLAGS) -MMD -MP -o $@ -c $<
 
 # Specific rule for flash/mma subdirectory
 $(OUTPUT_DIR)/flash/mma/%.$(OEXT): flash/mma/%.cc | $(OUTPUT_DIR)/flash/mma
-	$(CPP) $(OPTFLAGS) $(CXXFLAGS) $(POWER_FLAGS) -o $@ -c $<
+	$(CPP) $(OPTFLAGS) $(CXXFLAGS) $(POWER_FLAGS) -MMD -MP -o $@ -c $<
 
 $(OUTPUT_DIR)/flash/instruction_cache/%.$(OEXT): flash/instruction_cache/%.cc | $(OUTPUT_DIR)/flash/instruction_cache
-	$(CPP) $(OPTFLAGS) $(CXXFLAGS) $(POWER_FLAGS) -o $@ -c $<
+	$(CPP) $(OPTFLAGS) $(CXXFLAGS) $(POWER_FLAGS) -MMD -MP -o $@ -c $<
 
 # Specific rule for flash/wgmma subdirectory
 $(OUTPUT_DIR)/flash/wgmma/%.$(OEXT): flash/wgmma/%.cc | $(OUTPUT_DIR)/flash/wgmma
-	$(CPP) $(OPTFLAGS) $(CXXFLAGS) $(POWER_FLAGS) -o $@ -c $<
+	$(CPP) $(OPTFLAGS) $(CXXFLAGS) $(POWER_FLAGS) -MMD -MP -o $@ -c $<
 
 # Specific rule for flash/ptx_sched subdirectory
 $(OUTPUT_DIR)/flash/ptx_sched/%.$(OEXT): flash/ptx_sched/%.cc | $(OUTPUT_DIR)/flash/ptx_sched
-	$(CPP) $(OPTFLAGS) $(CXXFLAGS) $(POWER_FLAGS) -o $@ -c $<
+	$(CPP) $(OPTFLAGS) $(CXXFLAGS) $(POWER_FLAGS) -MMD -MP -o $@ -c $<
 
 # Specific rule for flash/tcgen05 subdirectory
 $(OUTPUT_DIR)/flash/tcgen05/%.$(OEXT): flash/tcgen05/%.cc | $(OUTPUT_DIR)/flash/tcgen05
-	$(CPP) $(OPTFLAGS) $(CXXFLAGS) $(POWER_FLAGS) -o $@ -c $<
+	$(CPP) $(OPTFLAGS) $(CXXFLAGS) $(POWER_FLAGS) -MMD -MP -o $@ -c $<
 
 # Specific rule for flash/gem5 subdirectory
 $(OUTPUT_DIR)/flash/gem5/%.$(OEXT): flash/gem5/%.cc | $(OUTPUT_DIR)/flash/gem5
-	$(CPP) $(OPTFLAGS) $(CXXFLAGS) $(POWER_FLAGS) -o $@ -c $<
+	$(CPP) $(OPTFLAGS) $(CXXFLAGS) $(POWER_FLAGS) -MMD -MP -o $@ -c $<
 
 clean:
 	rm -f *.o core *~ *.a 
@@ -161,3 +161,9 @@ $(OUTPUT_DIR)/../cuda-sim/ptx.tab.h:
 	make -C ../cuda-sim/ $(OUTPUT_DIR)/../cuda-sim/ptx.tab.c
 
 include $(OUTPUT_DIR)/Makefile.makedepend
+
+# yasai: -MMD -MP writes <object>.d with every header and .def file the object includes
+# (opcodes.def, the generated ptx.tab.h, instructions.h, ptx_parser_decode.def), so an
+# edit of one rebuilds every object that includes it; makedepend missed headers in other
+# directories.
+-include $(shell find $(OUTPUT_DIR) -name '*.d' 2>/dev/null)

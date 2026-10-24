@@ -81,16 +81,16 @@ libgpgpu_ptx_sim.a: $(OBJS)
 	ar rcs $(OUTPUT_DIR)/libgpgpu_ptx_sim.a $(OUTPUT_DIR)/ptx.tab.o $(OUTPUT_DIR)/lex.ptx_.o $(OUTPUT_DIR)/ptxinfo.tab.o $(OUTPUT_DIR)/lex.ptxinfo_.o $(OBJS)
 
 $(OUTPUT_DIR)/ptx.tab.o: $(OUTPUT_DIR)/ptx.tab.c
-	$(CPP) -c $(CXX_OPT) -DYYDEBUG $(OUTPUT_DIR)/ptx.tab.c -o $(OUTPUT_DIR)/ptx.tab.o
+	$(CPP) -MMD -MP -c $(CXX_OPT) -DYYDEBUG $(OUTPUT_DIR)/ptx.tab.c -o $(OUTPUT_DIR)/ptx.tab.o
 
 $(OUTPUT_DIR)/lex.ptx_.o: $(OUTPUT_DIR)/lex.ptx_.c 
-	$(CPP) -c $(CXX_OPT) $(OUTPUT_DIR)/lex.ptx_.c -o $(OUTPUT_DIR)/lex.ptx_.o
+	$(CPP) -MMD -MP -c $(CXX_OPT) $(OUTPUT_DIR)/lex.ptx_.c -o $(OUTPUT_DIR)/lex.ptx_.o
 
 $(OUTPUT_DIR)/ptxinfo.tab.o: $(OUTPUT_DIR)/ptxinfo.tab.c
-	$(CPP) -c $(CXX_OPT) -DYYDEBUG $(OUTPUT_DIR)/ptxinfo.tab.c -o $(OUTPUT_DIR)/ptxinfo.tab.o
+	$(CPP) -MMD -MP -c $(CXX_OPT) -DYYDEBUG $(OUTPUT_DIR)/ptxinfo.tab.c -o $(OUTPUT_DIR)/ptxinfo.tab.o
 
 $(OUTPUT_DIR)/lex.ptxinfo_.o: $(OUTPUT_DIR)/lex.ptxinfo_.c $(OUTPUT_DIR)/ptxinfo.tab.c
-	$(CPP) -c $(CXX_OPT) $(OUTPUT_DIR)/lex.ptxinfo_.c -o $(OUTPUT_DIR)/lex.ptxinfo_.o
+	$(CPP) -MMD -MP -c $(CXX_OPT) $(OUTPUT_DIR)/lex.ptxinfo_.c -o $(OUTPUT_DIR)/lex.ptxinfo_.o
 
 $(OUTPUT_DIR)/ptx.tab.c: ptx.y
 	bison --name-prefix=ptx_ -v -d ptx.y --file-prefix=$(OUTPUT_DIR)/ptx 2> /dev/null
@@ -113,9 +113,9 @@ clean:
 	rm -f $(OUTPUT_DIR)/Makefile.makedepend $(OUTPUT_DIR)/Makefile.makedepend.bak
 
 $(OUTPUT_DIR)/%.o: %.c
-	$(CPP) -c $(OPT) $< -o $(OUTPUT_DIR)/$*.o
+	$(CPP) -MMD -MP -c $(OPT) $< -o $(OUTPUT_DIR)/$*.o
 $(OUTPUT_DIR)/%.o: %.cc
-	$(CPP) -c $(CXX_OPT) $< -o $(OUTPUT_DIR)/$*.o
+	$(CPP) -MMD -MP -c $(CXX_OPT) $< -o $(OUTPUT_DIR)/$*.o
 
 $(OUTPUT_DIR)/instructions.h: instructions.cc
 	@touch $*.h
@@ -151,3 +151,9 @@ $(OUTPUT_DIR)/lex.ptx_.o: $(OUTPUT_DIR)/ptx.tab.c
 $(OUTPUT_DIR)/cuda_device_runtime.o: $(OUTPUT_DIR)/ptx.tab.c
 
 include $(OUTPUT_DIR)/Makefile.makedepend
+
+# yasai: -MMD -MP writes <object>.d with every header and .def file the object includes
+# (opcodes.def, the generated ptx.tab.h, instructions.h, ptx_parser_decode.def), so an
+# edit of one rebuilds every object that includes it; makedepend missed headers in other
+# directories.
+-include $(wildcard $(OUTPUT_DIR)/*.d $(OUTPUT_DIR)/decuda_pred_table/*.d)
