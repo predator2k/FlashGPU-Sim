@@ -2506,6 +2506,13 @@ setup_tensor_tma(memory_space *global_mem, uint64_t tensormap_addr,
   using namespace flash_gpgpu_sim;
   read_tensormap_descriptor(global_mem, thread->get_param_memory(),
                             tensormap_addr, inst_dim, out_tensormap);
+  // yasai: name the instruction and thread of an invalid tensor map before validate exits.
+  if (!out_tensormap.is_valid()) {
+    const ptx_instruction *pI = thread->get_inst(thread->get_pc());
+    fprintf(stderr, "TMA ERROR: tensor map 0x%llx read by CTA %u thread %u at %s\n",
+            (unsigned long long)tensormap_addr, thread->get_flat_ctaid(),
+            thread->get_flat_tid(), pI ? pI->to_string().c_str() : "?");
+  }
   validate_tensormap(tensormap_addr, out_tensormap, inst_dim);
 
   out_size_in_bytes = out_tensormap.get_tile_size_bytes();
