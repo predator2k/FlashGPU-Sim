@@ -32,6 +32,7 @@
 #include "../abstract_hardware_model.h"
 #include "ptx_ir.h"
 
+#include <initializer_list>
 #include <vector>
 
 class gpgpu_context;
@@ -174,6 +175,10 @@ class ptx_recognizer {
   void add_builtin_operand(int builtin, int dim_modifier);
   void add_memory_operand();
   void add_literal_int(long long value);
+  // yasai: marker name of an integer literal inside a tex-style vector operand.
+  char *tex_literal_name(long long value);
+  // yasai: pushes a vector operand whose names include tex_literal_name markers; false when none.
+  bool add_vector_with_literals(std::initializer_list<const char *> names);
   // yasai: a function name in a global initializer list (for example NCCL's ncclDevFuncTable);
   // the literal value is the function's handle from yasai_func::function_handle.
   void add_function_address_literal(const char *identifier);
