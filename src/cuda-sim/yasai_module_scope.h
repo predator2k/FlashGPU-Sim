@@ -34,8 +34,9 @@ namespace yasai_scope {
 /// keeps its lines, so line-keyed information (SASS guides, debug output) still applies. A path
 /// is scanned once per process; later calls return the same copy.
 /// @param path PTX file.
-/// @param unit Unit that owns the file's kernels: "" for a library file (the library key of the
-///        file name), the PTX path for a module loaded through the driver API.
+/// @param unit Unit that owns the file's kernels: "" for a file of a library or program (the
+///        file name without its index and architecture parts), library_unit() of the library
+///        when the caller knows it, the PTX path for a module loaded through the driver API.
 /// @return The file to parse.
 std::string scope_file(const std::string &path, const std::string &unit = "");
 

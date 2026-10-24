@@ -82,6 +82,20 @@ std::string library_key(const std::string &name) {
   return k;
 }
 
+/// Unit of a PTX file for kernel names: its library key without an architecture part, so all
+/// architecture variants of one binary are one unit ("libfoo.1.sm_120.ptx" and
+/// "libfoo.2.sm_120f.ptx" give "libfoo"; "app.sm_90a.ptx" and "app.sm_90.ptx" give "app").
+/// @param base File base name.
+/// @return The unit.
+std::string file_unit(const std::string &base) {
+  std::string k = library_key(base);
+  for (const char *arch : {".sm_", ".compute_"}) {
+    const size_t a = k.find(arch);
+    if (a != std::string::npos) k = k.substr(0, a);
+  }
+  return k;
+}
+
 /// Suffix that makes a module-local name unique to one file: "__ym" and the 32-bit FNV-1a hash
 /// of the file's base name in hex (deterministic, so ptxas results cached by content still hit).
 /// @param base File base name.
@@ -273,7 +287,7 @@ std::string scope_file(const std::string &path, const std::string &unit_in) {
   std::set<std::string> names = local_names(path, &r.defined, &entries);
   // A kernel name that another unit defined first is renamed in this file, so each unit keeps
   // its own kernel; files of one unit (one library's architecture variants) share their names.
-  const std::string unit = unit_in.empty() ? library_key(base_name(path)) : unit_in;
+  const std::string unit = unit_in.empty() ? file_unit(base_name(path)) : unit_in;
   std::set<std::string> dup_entries;
   for (const std::string &e : entries) {
     auto o = r.entry_unit.find(e);
