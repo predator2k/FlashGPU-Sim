@@ -42,6 +42,7 @@
 #include "cuda-sim.h"
 #include "ptx_ir.h"
 #include "ptx_parser.h"
+#include "../yasai_subprocess.h"
 
 /// extern prototypes
 
@@ -203,7 +204,7 @@ char *ptxinfo_data::gpgpu_ptx_sim_convert_ptx_and_sass_to_ptxplus(
   fflush(stdout);
   printf("GPGPU-Sim PTX: calling cuobjdump_to_ptxplus\ncommandline: %s\n",
          commandline);
-  result = system(commandline);
+  result = yasai_system(commandline);
   if (result) {
     fprintf(stderr, "GPGPU-Sim PTX: ERROR ** could not execute %s\n",
             commandline);
@@ -228,7 +229,7 @@ char *ptxinfo_data::gpgpu_ptx_sim_convert_ptx_and_sass_to_ptxplus(
 
     printf("GPGPU-Sim PTX: removing temporary files using \"%s\"\n",
            rm_commandline);
-    int rm_result = system(rm_commandline);
+    int rm_result = yasai_system(rm_commandline);
     if (rm_result != 0) {
       fprintf(stderr,
               "GPGPU-Sim PTX: ERROR ** while removing temporary files %d\n",
@@ -304,7 +305,7 @@ std::string prepare_sass_ptxline_guide(gpgpu_context *ctx, const char *source,
       quote_guide_argument(input) + " " + quote_guide_argument(prefix) +
       " --ptxas " + quote_guide_argument(std::string(cuda) + "/bin/ptxas") +
       " --nvdisasm " + quote_guide_argument(std::string(cuda) + "/bin/nvdisasm");
-  const int guide_status = system(command.c_str());
+  const int guide_status = yasai_system(command.c_str());
   if (guide_status != -1 && WIFEXITED(guide_status) &&
       WEXITSTATUS(guide_status) == 3) {
     printf("GPGPU-Sim PTX: no function-body instructions in %s; "
@@ -512,7 +513,7 @@ void fix_duplicate_errors(char fname2[1024]) {
   // change the name of the ptx file to _temp_ptx
   snprintf(commandline, 1024, "mv %s %s", fname2, tempfile);
   printf("Running: %s\n", commandline);
-  int result = system(commandline);
+  int result = yasai_system(commandline);
   if (result != 0) {
     fprintf(stderr,
             "GPGPU-Sim PTX: ERROR ** while changing filename from %s to %s",
@@ -606,7 +607,7 @@ void fix_duplicate_errors(char fname2[1024]) {
   fclose(ptxdest);
   snprintf(commandline, 1024, "rm -f %s", tempfile);
   printf("Running: %s\n", commandline);
-  result = system(commandline);
+  result = yasai_system(commandline);
   if (result != 0) {
     fprintf(stderr, "GPGPU-Sim PTX: ERROR ** while deleting %s", tempfile);
     exit(1);
@@ -666,7 +667,7 @@ void gpgpu_context::gpgpu_ptx_info_load_from_filename(const char *filename,
              ptxas_filename.c_str(), cache_dir, cache_dir, cache_dir);
     snprintf(buff, sizeof(buff), "%s", cmd);
   }
-  int result = system(buff);
+  int result = yasai_system(buff);
   if (result != 0) {
     if (!copy_ptxinfo_sidecar(filename, ptxas_filename)) {
       printf("GPGPU-Sim PTX: ERROR ** while loading PTX (b) %d\n", result);
@@ -704,7 +705,7 @@ void gpgpu_context::gpgpu_ptxinfo_load_from_string(const char *p_for_info,
     printf("GPGPU-Sim PTX: extracting embedded .ptx to temporary file \"%s\"\n",
            fname);
     snprintf(commandline, 4096, "cat %s > %s", ptx_file, fname);
-    if (system(commandline) != 0) {
+    if (yasai_system(commandline) != 0) {
       printf("ERROR: %s command failed\n", commandline);
       exit(0);
     }
@@ -720,7 +721,7 @@ void gpgpu_context::gpgpu_ptxinfo_load_from_string(const char *p_for_info,
              "'s/const\\[.\\]/const\\[0\\]/g' > %s",
              fname, fname2);
     printf("Running: %s\n", commandline2);
-    int result = system(commandline2);
+    int result = yasai_system(commandline2);
     if (result != 0) {
       printf("GPGPU-Sim PTX: ERROR ** while loading PTX (a) %d\n", result);
       printf(
@@ -757,7 +758,7 @@ void gpgpu_context::gpgpu_ptxinfo_load_from_string(const char *p_for_info,
              "/dev/null 2> %s",
              ptxas_clean_env_prefix(), extra_flags, fname2, tempfile_ptxinfo);
     printf("GPGPU-Sim PTX: generating ptxinfo using \"%s\"\n", commandline);
-    result = system(commandline);
+    result = yasai_system(commandline);
     if (result != 0) {
       if (copy_ptxinfo_sidecar(ptx_file, tempfile_ptxinfo)) {
         result = 0;
@@ -782,7 +783,7 @@ void gpgpu_context::gpgpu_ptxinfo_load_from_string(const char *p_for_info,
                  ptxas_clean_env_prefix(), extra_flags, fname2, tempfile_ptxinfo);
         printf("GPGPU-Sim PTX: regenerating ptxinfo using \"%s\"\n",
                commandline);
-        result = system(commandline);
+        result = yasai_system(commandline);
       }
       if (result != 0) {
         printf("GPGPU-Sim PTX: ERROR ** while loading PTX (b) %d\n", result);
@@ -816,7 +817,7 @@ void gpgpu_context::gpgpu_ptxinfo_load_from_string(const char *p_for_info,
              "'s/const\\[.\\]/const\\[0\\]/g' > %s",
              fname, fname2);
     printf("Running: %s\n", commandline2);
-    int result = system(commandline2);
+    int result = yasai_system(commandline2);
     if (result != 0) {
       printf("GPGPU-Sim PTX: ERROR ** while loading PTX (a) %d\n", result);
       printf(
@@ -845,7 +846,7 @@ void gpgpu_context::gpgpu_ptxinfo_load_from_string(const char *p_for_info,
         ptxas_clean_env_prefix(), extra_flags, fname2, tempfile_ptxinfo);
     printf("GPGPU-Sim PTX: generating ptxinfo using \"%s\"\n", commandline);
     fflush(stdout);
-    result = system(commandline);
+    result = yasai_system(commandline);
     if (result != 0) {
       if (!copy_ptxinfo_sidecar(fname2, tempfile_ptxinfo)) {
         printf("GPGPU-Sim PTX: ERROR ** while loading PTX (b) %d\n", result);
@@ -861,7 +862,7 @@ void gpgpu_context::gpgpu_ptxinfo_load_from_string(const char *p_for_info,
     char commandline3[4096];
     snprintf(final_tempfile_ptxinfo, 1024, "f_tempfile_ptx");
     snprintf(commandline3, 4096, "cat *info > %s", final_tempfile_ptxinfo);
-    if (system(commandline3) != 0) {
+    if (yasai_system(commandline3) != 0) {
       printf("ERROR: Either we dont have info files or cat is not working \n");
       printf("ERROR: %s command failed\n", commandline3);
       exit(1);
@@ -882,7 +883,7 @@ void gpgpu_context::gpgpu_ptxinfo_load_from_string(const char *p_for_info,
   fclose(ptxinfo_in);
 
   snprintf(commandline, sizeof(commandline), "rm -f *info");
-  if (system(commandline) != 0) {
+  if (yasai_system(commandline) != 0) {
     printf("GPGPU-Sim PTX: ERROR ** while removing temporary info files\n");
     exit(1);
   }
@@ -894,7 +895,7 @@ void gpgpu_context::gpgpu_ptxinfo_load_from_string(const char *p_for_info,
       snprintf(commandline, sizeof(commandline), "rm -f %s %s %s", fname, fname2,
                tempfile_ptxinfo);
     printf("GPGPU-Sim PTX: removing ptxinfo using \"%s\"\n", commandline);
-    if (system(commandline) != 0) {
+    if (yasai_system(commandline) != 0) {
       printf("GPGPU-Sim PTX: ERROR ** while removing temporary files\n");
       exit(1);
     }

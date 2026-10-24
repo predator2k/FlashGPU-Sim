@@ -31,6 +31,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "cuda-sim.h"
+#include "../yasai_subprocess.h"
 
 #include "instructions.h"
 #include "ptx_ir.h"
@@ -2530,7 +2531,7 @@ void function_info::ptx_jit_config(
   std::string filename_c(filename + "_c");
   snprintf(buff, 1024, "c++filt %s > %s", get_name().c_str(),
            filename_c.c_str());
-  assert(system(buff) != 0);
+  assert(yasai_system(buff) != 0);
   FILE *fp = fopen(filename_c.c_str(), "r");
   char *ptr = fgets(buff, 1024, fp);
   if (ptr == NULL) {
@@ -2651,7 +2652,7 @@ void function_info::ptx_jit_config(
   snprintf(buff, 1024,
            "grep -rn \".entry %s\" %s/*.ptx | cut -d \":\" -f 1-2 > %s",
            get_name().c_str(), wys_exec_path, ptx_config_fn.c_str());
-  if (system(buff) != 0) {
+  if (yasai_system(buff) != 0) {
     printf("WARNING: Failed to execute grep to find ptx source \n");
     printf("Problematic call: %s", buff);
     abort();
@@ -2666,7 +2667,7 @@ void function_info::ptx_jit_config(
            "grep -rn \".version\" %s | cut -d \":\" -f 1 | xargs -I \"{}\" awk "
            "\"NR>={}&&NR<={}+2\" %s > %s",
            ptx_source, ptx_source, ptx_config_fn.c_str());
-  if (system(buff) != 0) {
+  if (yasai_system(buff) != 0) {
     printf("WARNING: Failed to execute grep to find ptx header \n");
     printf("Problematic call: %s", buff);
     abort();

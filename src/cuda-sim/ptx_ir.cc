@@ -49,6 +49,7 @@ typedef void *yyscan_t;
 #include "../../libcuda/gpgpu_context.h"
 #include "../gpgpu-sim/flash/reg_alloc.h"
 #include "cuda-sim.h"
+#include "../yasai_subprocess.h"
 
 #define STR_SIZE 1024
 
@@ -2099,7 +2100,7 @@ unsigned function_info::print_insn(unsigned pc, FILE *fp) const {
   memset(command, 0, buffer_size);
   memset(buffer, 0, buffer_size);
   snprintf(command, buffer_size, "c++filt -p %s", m_name.c_str());
-  FILE *p = popen(command, "r");
+  FILE *p = yasai_popen(command, "r");
   buffer[0] = 0;
   if (fgets(buffer, buffer_size - 1, p) == NULL) {
     fprintf(stderr, "%s: <could not demangle>\n", m_name.c_str());

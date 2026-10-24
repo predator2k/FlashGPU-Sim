@@ -1,4 +1,5 @@
 #include "yasai_fakeenv_rec.h"
+#include "../src/yasai_subprocess.h"
 #include <dlfcn.h>
 // This file created from cuda_runtime_api.h distributed with CUDA 1.1
 // Changes Copyright 2009,  Tor M. Aamodt, Ali Bakhoda and George L. Yuan
@@ -546,7 +547,7 @@ static int get_app_cuda_version_internal(std::string app_binary) {
       " | grep libcudart_vanadis.a | sed  "
       "'s/.*libcudart_vanadis.a.\\(.*\\)/\\1/'; } | head -1 > " +
       fname;
-  int res = system(app_cuda_version_command.c_str());
+  int res = yasai_system(app_cuda_version_command.c_str());
   if (res == -1) {
     printf("Error - Cannot detect the app's CUDA version. Command: %s\n",
            app_cuda_version_command.c_str());
@@ -3571,23 +3572,65 @@ __host__ cudaError_t CUDARTAPI cudaGetLastError(void) {
   return error;
 }
 
+// yasai: names of the error codes the simulator returns or the libraries test for; other codes
+// print their number.
+static const char *yasai_error_name(cudaError_t error) {
+  switch (error) {
+#define YASAI_ERR(e) \
+  case e:            \
+    return #e;
+    YASAI_ERR(cudaSuccess)
+    YASAI_ERR(cudaErrorInvalidValue)
+    YASAI_ERR(cudaErrorMemoryAllocation)
+    YASAI_ERR(cudaErrorInitializationError)
+    YASAI_ERR(cudaErrorCudartUnloading)
+    YASAI_ERR(cudaErrorInvalidConfiguration)
+    YASAI_ERR(cudaErrorInvalidPitchValue)
+    YASAI_ERR(cudaErrorInvalidSymbol)
+    YASAI_ERR(cudaErrorInvalidDevicePointer)
+    YASAI_ERR(cudaErrorInvalidMemcpyDirection)
+    YASAI_ERR(cudaErrorInsufficientDriver)
+    YASAI_ERR(cudaErrorNoDevice)
+    YASAI_ERR(cudaErrorInvalidDevice)
+    YASAI_ERR(cudaErrorInvalidResourceHandle)
+    YASAI_ERR(cudaErrorNotReady)
+    YASAI_ERR(cudaErrorInvalidDeviceFunction)
+    YASAI_ERR(cudaErrorNotSupported)
+    YASAI_ERR(cudaErrorPeerAccessAlreadyEnabled)
+    YASAI_ERR(cudaErrorPeerAccessNotEnabled)
+    YASAI_ERR(cudaErrorHostMemoryAlreadyRegistered)
+    YASAI_ERR(cudaErrorHostMemoryNotRegistered)
+    YASAI_ERR(cudaErrorLaunchFailure)
+    YASAI_ERR(cudaErrorIllegalAddress)
+    YASAI_ERR(cudaErrorStreamCaptureUnsupported)
+    YASAI_ERR(cudaErrorUnknown)
+#undef YASAI_ERR
+    default:
+      return nullptr;
+  }
+}
+
 __host__ const char *cudaGetErrorName(cudaError_t error) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  cuda_not_implemented(__my_func__, __LINE__);
-  return NULL;
+  // yasai: implemented (PyTorch formats every CUDA error with it).
+  if (const char *n = yasai_error_name(error)) return n;
+  static thread_local char buf[64];
+  snprintf(buf, sizeof buf, "cudaError_%d", int(error));
+  return buf;
 }
 
 __host__ const char *CUDARTAPI cudaGetErrorString(cudaError_t error) {
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  if (g_last_cudaError == cudaSuccess) return "no error";
-  char buf[1024];
-  snprintf(buf, 1024, "<<GPGPU-Sim PTX: there was an error (code = %d)>>",
-           g_last_cudaError);
-  return strdup(buf);
+  // yasai: describes the error passed in (the code previously described g_last_cudaError).
+  if (error == cudaSuccess) return "no error";
+  static thread_local char buf[160];
+  const char *n = yasai_error_name(error);
+  snprintf(buf, sizeof buf, "GPGPU-Sim: %s (code %d)", n ? n : "error", int(error));
+  return buf;
 }
 
 // SST specific cuda apis
@@ -3947,7 +3990,7 @@ void cuda_runtime_api::extract_ptx_files_using_cuobjdump_internal(
     GPPRINTF_GPU(context->get_device()->get_gpgpu(), PTX_IR,
                  "PTX load: extract command=%s\n", command);
   }
-  if (system(command) != 0) {
+  if (yasai_system(command) != 0) {
     printf("WARNING: Failed to execute cuobjdump to get list of ptx files \n");
     exit(0);
   }
@@ -3967,7 +4010,7 @@ void cuda_runtime_api::extract_ptx_files_using_cuobjdump_internal(
                context->no_of_ptx);
         snprintf(command, sizeof(command),
                  "$CUDA_INSTALL_PATH/bin/cuobjdump -xptx all %s > /dev/null", b.c_str());
-        if (system(command) != 0) {
+        if (yasai_system(command) != 0) {
           printf("ERROR: command: %s failed \n", command);
           exit(0);
         }
@@ -4035,7 +4078,7 @@ void cuda_runtime_api::extract_code_using_cuobjdump_internal(
   // Running cuobjdump using dynamic link to current process
   snprintf(command, 1000, "md5sum %s ", app_binary.c_str());
   printf("Running md5sum using \"%s\"\n", command);
-  if (system(command)) {
+  if (yasai_system(command)) {
     std::cout << "Failed to execute: " << command << std::endl;
     exit(1);
   }
@@ -4065,7 +4108,7 @@ void cuda_runtime_api::extract_code_using_cuobjdump_internal(
                "$CUDA_INSTALL_PATH/bin/cuobjdump -ptx -elf -sass -all %s > %s",
                app_binary.c_str(), fname);
     bool parse_output = true;
-    result = system(command);
+    result = yasai_system(command);
     if (result) {
       if (context->get_device()
               ->get_gpgpu()
@@ -4114,7 +4157,7 @@ void cuda_runtime_api::extract_code_using_cuobjdump_internal(
       std::stringstream cmd;
       cmd << "ldd " << app_binary
           << " | grep $CUDA_INSTALL_PATH | awk \'{print $3}\' > _tempfile_.txt";
-      int result = system(cmd.str().c_str());
+      int result = yasai_system(cmd.str().c_str());
       if (result) {
         std::cout << "Failed to execute: " << cmd.str() << std::endl;
         exit(1);
@@ -4144,7 +4187,7 @@ void cuda_runtime_api::extract_code_using_cuobjdump_internal(
         cmd << libcodfn.str();
         std::cout << "Running cuobjdump on " << line << std::endl;
         std::cout << "Using command: " << cmd.str() << std::endl;
-        result = system(cmd.str().c_str());
+        result = yasai_system(cmd.str().c_str());
         if (result) {
           printf("ERROR: Failed to execute: %s\n", command);
           exit(1);
