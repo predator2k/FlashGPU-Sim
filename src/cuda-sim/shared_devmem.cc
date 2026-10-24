@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "host_window.h"
+#include "fio_window.h"
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000  // Linux 4.17 and later
@@ -257,6 +258,11 @@ bool place_locked(uint64_t va, size_t size, size_t offset, int fd, bool noreplac
     return false;
   }
   host_window::add(va, size, host_window::range_kind::device);
+  // yasai: with YASAI_FIO_UNORDERED_IMPORTS, every shared device range is also an unordered FIO
+  // window, so writes into a peer's buffer become visible out of order (the FIO fabric model).
+  // The negative control uses it to show NCCL's P2P path fails over such a window.
+  static const bool fio_unordered = getenv("YASAI_FIO_UNORDERED_IMPORTS") != nullptr;
+  if (fio_unordered) fio_window::add(va, size, getenv("YASAI_FIO_WINDOW_RECORD") != nullptr);
   return true;
 }
 
@@ -611,6 +617,7 @@ bool unmap(uint64_t va, size_t size) {
   phys *p = it->second.p;
   const size_t len = it->second.size;
   host_window::remove(va);
+  fio_window::remove(va);
   if (!p->multicast) {
     // Back to an inaccessible reservation.
     mmap(reinterpret_cast<void *>(va), len, PROT_NONE,
@@ -648,6 +655,7 @@ bool forget_alloc(uint64_t base) {
   if (phys *p = it->second.seg) {
     const size_t len = round_up(it->second.size, kPage);
     host_window::remove(base);
+    fio_window::remove(base);
     munmap(reinterpret_cast<void *>(base), len);
     release_locked(p);
   } else if (it->second.anon) {
