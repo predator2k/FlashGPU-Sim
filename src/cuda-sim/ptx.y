@@ -356,6 +356,7 @@ class ptx_recognizer;
 %token	TCGEN05_AFTER_THREAD_SYNC_OPTION;
 %token	TCGEN05_WAIT_LD_OPTION;
 %token	TCGEN05_WAIT_ST_OPTION;
+%token	TCGEN05_SP_OPTION;
 %type <int_value> function_decl_header
 %type <ptr_value> function_decl
 

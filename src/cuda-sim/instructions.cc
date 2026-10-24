@@ -3207,6 +3207,25 @@ ptx_reg_t d2x(ptx_reg_t x, unsigned from_width, unsigned to_width, int to_sign,
   return y;
 }
 
+// yasai: integer to f16 for cvt.{rn,rz,rm,rp}.f16.{s,u}{8,16,32,64} (CUTLASS's device reference
+// GEMM converts its integer accumulators this way). v is the integer as a double, exact up to
+// 2^53; larger magnitudes overflow f16 in every rounding mode.
+// @param v Integer value.
+// @param rounding_mode PTX rounding option (RN when none is given).
+// @return The f16 value.
+static half yasai_int_to_f16(double v, int rounding_mode) {
+  switch (rounding_mode) {
+    case RZ_OPTION:
+      return half_float::half_cast<half, std::round_toward_zero>(v);
+    case RM_OPTION:
+      return half_float::half_cast<half, std::round_toward_neg_infinity>(v);
+    case RP_OPTION:
+      return half_float::half_cast<half, std::round_toward_infinity>(v);
+    default:
+      return half_float::half_cast<half, std::round_to_nearest>(v);
+  }
+}
+
 ptx_reg_t s2f(ptx_reg_t x, unsigned from_width, unsigned to_width, int to_sign,
               int rounding_mode, int saturation_mode) {
   ptx_reg_t y;
@@ -3216,7 +3235,7 @@ ptx_reg_t s2f(ptx_reg_t x, unsigned from_width, unsigned to_width, int to_sign,
 
     switch (to_width) {
       case 16:
-        assert(0);
+        y.f16 = yasai_int_to_f16(double(y.s32), rounding_mode);
         break;
       case 32:
         switch (rounding_mode) {
@@ -3248,7 +3267,7 @@ ptx_reg_t s2f(ptx_reg_t x, unsigned from_width, unsigned to_width, int to_sign,
             // 0 in practice: PyTorch argmax(...).float() gave all zeros)
     switch (to_width) {
       case 16:
-        assert(0);
+        y.f16 = yasai_int_to_f16(double(y.s64), rounding_mode);
         break;
       case 32:
         switch (rounding_mode) {
@@ -3290,7 +3309,7 @@ ptx_reg_t u2f(ptx_reg_t x, unsigned from_width, unsigned to_width, int to_sign,
 
     switch (to_width) {
       case 16:
-        assert(0);
+        y.f16 = yasai_int_to_f16(double(y.u32), rounding_mode);
         break;
       case 32:
         switch (rounding_mode) {
@@ -3321,7 +3340,7 @@ ptx_reg_t u2f(ptx_reg_t x, unsigned from_width, unsigned to_width, int to_sign,
     y = x;  // yasai: as in s2f, the 64-bit source was never copied into y
     switch (to_width) {
       case 16:
-        assert(0);
+        y.f16 = yasai_int_to_f16(double(y.u64), rounding_mode);
         break;
       case 32:
         switch (rounding_mode) {
@@ -6366,8 +6385,12 @@ bool CmpOp(int type, ptx_reg_t a, ptx_reg_t b, unsigned cmpop) {
       }
       break;
     case F16_TYPE:
-      assert(0);
-      break;
+    case BF16_TYPE:
+      // yasai: setp.*.f16 / .bf16 (CUTLASS's SM90 reference checks) compare the values as f32,
+      // which is exact, with the same ordered and unordered operators.
+      a.f32 = packed_half_to_f32(a.u16, type == BF16_TYPE);
+      b.f32 = packed_half_to_f32(b.u16, type == BF16_TYPE);
+      [[fallthrough]];
     case F32_TYPE:
       switch (cmpop) {
         case EQ_OPTION:

@@ -24,7 +24,12 @@
 // * tcgen05.cp from a canonical K-major shared layout into TMEM, with
 // .warpx2/.warpx4 replication.
 // * tcgen05.commit: immediate arrive on the mbarrier (multicast to the CTAs of
-// ctaMask). Not covered: sparse (.sp) MMA.
+// ctaMask).
+// * tcgen05.mma.sp (and .ws.sp): structured-sparse A (1:2 tf32, 2:4 f16/f8f6f4/i8/mxf8f6f4,
+//   pairwise 4:8 mxf4/mxf4nvf4 of SparsityVersion v0) with the metadata matrix in TMEM, laid
+//   out as CUTLASS's tmem_e_frg / tmem_e_frg_ws (cute/atom/mma_traits_sm100_frag.hpp): M = 128
+//   per CTA (cta_group::1 and ::2), and the .ws M = 32/64/128 layouts. The sparsity selector
+//   (instruction descriptor bits 0-1) is a column offset for the 16- and 32-bit kinds.
 #include "../../../cuda-sim/ptx_ir.h"
 #include "../../../cuda-sim/ptx_sim.h"
 #include "../../../cuda-sim/yasai_func.h"
@@ -301,6 +306,50 @@ double scale_factor(tcgen05_tmem_manager_t &mgr, const tcgen05_tmem_scope_t &sc,
   return yasai_func::minifloat_decode(yasai_func::kE4M3, b & 0x7F);
 }
 
+// Metadata classes of tcgen05.mma.sp: the 16- and 32-bit kinds keep 16 bits per row and K half
+// in the "wide" layout, the 8- and 4-bit kinds 64 bits per row in the "narrow" layout.
+enum SparseClass { kSparseWide, kSparseNarrow };
+
+// Logical K positions of the K/2 stored elements of row m of a sparse A operand (PTX ISA
+// 9.7.18.10.9), read from the metadata matrix at meta_addr in TMEM.
+// group: chunk size of the sparsity pattern (2 for 1:2 tf32, 4 for 2:4, 8 for pairwise 4:8);
+// every chunk has one 4-bit metadata nibble. sel: sparsity selector (column offset).
+// Wide layout (CUTLASS tmem_e_frg, 16- and 32-bit kinds): rows m and m + 8 of a 16-row group
+// share a lane, in bits 0-15 and 16-31; K halves of 16 bits sit 8 lanes apart:
+//   lane = m % 8 + 16 * (m / 16) + 8 * (k / half), bit = 16 * ((m / 8) % 2) + (k % half) * 4 / group
+// Narrow layout (8- and 4-bit kinds): lane = m, bit = k * 4 / group over two columns.
+void sparse_positions(tcgen05_tmem_manager_t &mgr, const tcgen05_tmem_scope_t &sc,
+                      uint32_t meta_addr, unsigned sel, SparseClass cls, unsigned group,
+                      unsigned m, unsigned K, std::vector<unsigned> &pos) {
+  pos.assign(K / 2, 0);
+  const unsigned lane0 = (meta_addr >> 16) & 0x7Fu, col0 = (meta_addr & 0xFFFFu) + sel;
+  const unsigned half = 4 * group; // logical elements per 16 metadata bits
+  for (unsigned j = 0; j < K / group; ++j) {
+    const unsigned k = j * group;
+    unsigned lane, bit;
+    if (cls == kSparseWide) {
+      lane = m % 8 + 16 * (m / 16) + 8 * (k / half);
+      bit = 16 * ((m / 8) % 2) + (k % half) * 4 / group;
+    } else {
+      lane = m;
+      bit = 4 * j;
+    }
+    const uint32_t w = mgr.peek(sc, lane0 + lane, col0 + bit / 32);
+    const unsigned nib = (w >> (bit % 32)) & 0xF, i0 = nib & 3, i1 = (nib >> 2) & 3;
+    if (group == 2) {
+      pos[j] = 2 * j + i0 / 2; // 0b0100: element 0, 0b1110: element 1
+    } else if (group == 4) {
+      pos[2 * j] = 4 * j + i0;
+      pos[2 * j + 1] = 4 * j + i1;
+    } else {
+      for (unsigned h = 0; h < 2; ++h) {
+        pos[4 * j + h] = 8 * j + 2 * i0 + h;
+        pos[4 * j + 2 + h] = 8 * j + 2 * i1 + h;
+      }
+    }
+  }
+}
+
 } // namespace
 
 // tcgen05.mma{.ws}.cta_group::{1,2}.kind::* [d], a, b_desc, idesc{, [sfa],
@@ -311,6 +360,7 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
   const bool pair = has(pI, TCGEN05_CTA_GROUP_2_OPTION);
   const bool ws = has(pI, TCGEN05_WS_OPTION);
   const bool block_scale = has(pI, TCGEN05_BLOCK_SCALE_OPTION);
+  const bool sparse = has(pI, TCGEN05_SP_OPTION);
   enum { F16, TF32, F8F6F4, I8, MXF8F6F4, MXF4, MXF4NVF4 } kind = F16;
   if (has(pI, TCGEN05_KIND_TF32_OPTION))
     kind = TF32;
@@ -339,13 +389,15 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
   const uint32_t a_tmem_addr = a_tmem ? u32(1) : 0;
   const uint64_t a_desc_v = a_tmem ? 0 : u64(1);
   const uint64_t b_desc_v = u64(2);
-  const uint32_t idesc = u32(3);
+  const unsigned o = sparse ? 1 : 0; // [sp-meta-tmem] sits between b-desc and idesc
+  const uint32_t meta_addr = sparse ? u32(3) : 0;
+  const uint32_t idesc = u32(3 + o);
   uint32_t sfa_addr = 0, sfb_addr = 0;
-  unsigned next = 4;
+  unsigned next = 4 + o;
   if (block_scale) {
-    sfa_addr = u32(4);
-    sfb_addr = u32(5);
-    next = 6;
+    sfa_addr = u32(4 + o);
+    sfb_addr = u32(5 + o);
+    next = 6 + o;
   }
   while (next + 1 < nops && pI->operand_lookup(next).is_vector())
     next++; // disable-output mask
@@ -394,8 +446,8 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
   }
   const unsigned sfb_id = bs_kind ? (idesc >> 4) & 3 : 0;
   const unsigned sfa_id = bs_kind ? (idesc >> 29) & 3 : 0;
-  if ((idesc >> 2) & 1) {
-    fprintf(stderr, "yasai-umma: sparse tcgen05.mma is not implemented\n");
+  if (((idesc >> 2) & 1) && !sparse) {
+    fprintf(stderr, "yasai-umma: sparse instruction descriptor on a dense tcgen05.mma\n");
     abort();
   }
   auto fmt_of = [&](unsigned code) -> Fmt {
@@ -445,17 +497,30 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
     K = 32;
     break;
   }
-  unsigned nsf = 1; // scale factors per row per MMA
+  // Sparse A: K doubles (PTX ISA Table 48) and A holds K / 2 stored elements per row.
+  if (sparse)
+    K *= 2;
+  const unsigned Ka = sparse ? K / 2 : K;
+  const SparseClass sp_cls =
+      (kind == F16 || kind == TF32) ? kSparseWide : kSparseNarrow;
+  const unsigned sp_group =
+      kind == TF32 ? 2 : ((kind == MXF4 || kind == MXF4NVF4) ? 8 : 4);
+  const unsigned sp_sel = sp_cls == kSparseWide ? (idesc & 3) : 0;
+  // Scale factors per row per MMA. .scale_vec::NX names N directly; for sparse A every scale
+  // factor covers a block of stored (compressed) elements, so the counts follow Ka and each
+  // block spans twice as many logical K (CUTLASS: SFVecSize 64 for sparse mxf8f6f4 with K = 64,
+  // 16 scale bytes per TMEM lane for sparse nvf4 with K = 128).
+  unsigned nsf = 1;
   if (block_scale) {
     if (has(pI, TCGEN05_SCALE_VEC_4X_OPTION) || has(pI, TCGEN05_BLOCK16_OPTION))
-      nsf = K / 16;
+      nsf = Ka / 16;
     else if (has(pI, TCGEN05_SCALE_VEC_2X_OPTION) ||
              has(pI, TCGEN05_BLOCK32_OPTION))
-      nsf = K / 32;
+      nsf = Ka / 32;
     else if (has(pI, TCGEN05_SCALE_VEC_1X_OPTION))
       nsf = 1;
     else
-      nsf = (kind == MXF4NVF4) ? K / 16 : K / 32;
+      nsf = (kind == MXF4NVF4) ? Ka / 16 : Ka / 32;
     if (nsf == 0)
       nsf = 1;
   }
@@ -466,10 +531,10 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
     char key[256];
     snprintf(key, sizeof key,
              "kind=%d M=%u N=%u K=%u ws=%d pair=%d a_tmem=%d a_mn=%d b_mn=%d "
-             "c=%u bs=%d nsf=%u "
+             "c=%u bs=%d nsf=%u sp=%d "
              "a_swz=%u b_swz=%u a_lane=%u d_lane=%u d_col=%u",
              int(kind), M, N, K, int(ws), int(pair), int(a_tmem), int(a_mn),
-             int(b_mn), c_format, int(block_scale), nsf,
+             int(b_mn), c_format, int(block_scale), nsf, int(sparse),
              a_tmem ? 0u : unsigned(a_desc_v >> 61), unsigned(b_desc_v >> 61),
              a_tmem ? (a_tmem_addr >> 16) & 0xFFFF : 0u,
              (d_addr >> 16) & 0xFFFF, d_addr & 0xFFFF);
@@ -493,6 +558,18 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
     abort();
   }
   const SmemDesc ad = decode_desc(a_desc_v), bd = decode_desc(b_desc_v);
+  if (sparse && !ws && m_cta != 128) {
+    fprintf(stderr,
+            "yasai-umma: tcgen05.mma.sp metadata layout for %u rows per CTA is not "
+            "implemented\n",
+            m_cta);
+    abort();
+  }
+  if (sparse && (kind == MXF4 || kind == MXF4NVF4) && ((idesc >> 12) & 1)) {
+    fprintf(stderr, "yasai-umma: tcgen05.mma.sp SparsityVersion v1 is not implemented\n");
+    abort();
+  }
+  std::vector<unsigned> sp_pos;
 
   // B (N x K): columns [c * n_cta, (c + 1) * n_cta) live in CTA c of the pair.
   std::vector<double> B(size_t(N) * K);
@@ -512,9 +589,9 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
     // m_cta.
     const unsigned parts = (pair || ws) ? 128 / m_cta : 1;
     for (unsigned m = 0; m < m_cta; ++m) {
-      std::vector<std::vector<double>> a_part(parts, std::vector<double>(K));
+      std::vector<std::vector<double>> a_part(parts, std::vector<double>(Ka));
       for (unsigned p = 0; p < parts; ++p)
-        for (unsigned k = 0; k < K; ++k) {
+        for (unsigned k = 0; k < Ka; ++k) {
           if (!a_tmem &&
               p > 0) { // A in shared memory is the same for every part
             a_part[p][k] = a_part[0][k];
@@ -553,6 +630,15 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
           }
           a_part[p][k] = v * (a_neg ? -1 : 1);
         }
+      if (sparse) { // place the stored elements at their logical K positions
+        sparse_positions(mgr, sc, meta_addr, sp_sel, sp_cls, sp_group, m, K, sp_pos);
+        for (std::vector<double> &ap : a_part) {
+          std::vector<double> full(K, 0.0);
+          for (unsigned k = 0; k < Ka; ++k)
+            full[sp_pos[k]] = ap[k];
+          ap.swap(full);
+        }
+      }
       std::vector<double> sa(nsf, 1.0);
       if (block_scale)
         for (unsigned j = 0; j < nsf; ++j)
