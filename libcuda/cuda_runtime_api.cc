@@ -4538,8 +4538,12 @@ struct yasai_lazy_ptx_t {
   unsigned handle = 0;                          // fat binary handle the files belong to
   std::vector<std::string> files;               // PTX file paths
   std::vector<std::string> archs;               // "sm_XX" of each file (ptxas target)
-  std::vector<bool> loaded;                     // file parsed already
+  std::vector<bool> loaded;                     // file parsed already (whole-file mode)
   std::unordered_map<std::string, int> owner;   // kernel or variable name -> file index
+  // Per-kernel mode (YASAI_PTX_PER_KERNEL, default 1), per file:
+  std::vector<bool> vars_loaded;                // file-scope variables and directives parsed
+  std::vector<std::set<std::string>> funcs_loaded;  // entries and .func names parsed
+  std::vector<int> pieces;                      // number of pieces parsed so far
 };
 std::vector<yasai_lazy_ptx_t> g_yasai_lazy;     // every lazily registered fat binary
 
@@ -4594,11 +4598,296 @@ void yasai_lazy_load_file(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i) {
   ctx->gpgpu_ptx_info_load_from_filename(L.files[i].c_str(), L.archs[i].c_str());
 }
 
-// yasai_func::g_lazy_load_name: loads the file that defines name.
+// True when a launch parses only the kernel it needs (YASAI_PTX_PER_KERNEL unset or nonzero)
+// rather than the whole PTX file that holds it.
+bool yasai_per_kernel_enabled() {
+  const char *e = getenv("YASAI_PTX_PER_KERNEL");
+  return e == NULL || atoi(e) != 0;
+}
+
+// Kind of a top-level item of a PTX file (see yasai_ptx_split).
+enum yasai_ptx_item_kind_t {
+  YASAI_PTX_HEADER,     // .version, .target, .address_size or .file line: in every piece
+  YASAI_PTX_ENTRY,      // .entry definition with a body
+  YASAI_PTX_FUNC_DEF,   // .func definition with a body
+  YASAI_PTX_FUNC_DECL,  // .func prototype, including .extern .func
+  YASAI_PTX_DEBUG,      // .section of debug information: never parsed
+  YASAI_PTX_OTHER       // file-scope variable or other directive: in the first piece only
+};
+
+// One top-level item of a PTX file.
+struct yasai_ptx_item_t {
+  size_t begin = 0;                         // first byte of the item in the file text
+  size_t end = 0;                           // one past the last byte
+  yasai_ptx_item_kind_t kind = YASAI_PTX_OTHER;  // what the item is
+  std::string name;                         // entry or function name; empty otherwise
+};
+
+// Position of the first character at or after p that is neither white space nor inside a
+// comment.
+//   t: PTX text; p: start position
+size_t yasai_ptx_skip_space(const std::string &t, size_t p) {
+  const size_t n = t.size();
+  while (p < n) {
+    if (isspace((unsigned char)t[p])) {
+      ++p;
+    } else if (t.compare(p, 2, "//") == 0) {
+      p = t.find('\n', p);
+      if (p == std::string::npos) p = n;
+    } else if (t.compare(p, 2, "/*") == 0) {
+      p = t.find("*/", p + 2);
+      p = p == std::string::npos ? n : p + 2;
+    } else {
+      break;
+    }
+  }
+  return p;
+}
+
+// True when c can be part of a PTX identifier.
+//   c: character
+bool yasai_ptx_ident_char(char c) {
+  return isalnum((unsigned char)c) || c == '_' || c == '$';
+}
+
+// Identifier that starts at p (after white space), or "".
+//   t: PTX text; p: position to read from (advanced past the identifier)
+std::string yasai_ptx_read_ident(const std::string &t, size_t &p) {
+  p = yasai_ptx_skip_space(t, p);
+  const size_t b = p;
+  while (p < t.size() && yasai_ptx_ident_char(t[p])) ++p;
+  return t.substr(b, p - b);
+}
+
+// Splits PTX text into its top-level items, in file order. An item ends at a semicolon at
+// brace depth 0, or at the closing brace of a body that no semicolon follows (a function body;
+// a variable initializer "= { ... };" ends at its semicolon). Header directives, which carry no
+// semicolon, end at the end of their line.
+//   t: PTX text of one file
+std::vector<yasai_ptx_item_t> yasai_ptx_split(const std::string &t) {
+  std::vector<yasai_ptx_item_t> items;
+  const size_t n = t.size();
+  size_t i = 0;
+  while (true) {
+    i = yasai_ptx_skip_space(t, i);
+    if (i >= n) break;
+    yasai_ptx_item_t it;
+    it.begin = i;
+    if (t.compare(i, 8, ".version") == 0 || t.compare(i, 7, ".target") == 0 ||
+        t.compare(i, 13, ".address_size") == 0 || t.compare(i, 5, ".file") == 0) {
+      size_t e = t.find('\n', i);
+      if (e == std::string::npos) e = n;
+      it.end = e;
+      it.kind = YASAI_PTX_HEADER;
+      items.push_back(it);
+      i = e;
+      continue;
+    }
+    int depth = 0;
+    bool body = false;
+    size_t p = i;
+    while (p < n) {
+      const char c = t[p];
+      if (c == '/' && (t.compare(p, 2, "//") == 0 || t.compare(p, 2, "/*") == 0)) {
+        const size_t q = yasai_ptx_skip_space(t, p);
+        p = q > p ? q : p + 1;
+      } else if (c == '"') {
+        const size_t q = t.find('"', p + 1);
+        p = q == std::string::npos ? n : q + 1;
+      } else if (c == '{') {
+        ++depth;
+        body = true;
+        ++p;
+      } else if (c == '}') {
+        --depth;
+        ++p;
+        if (depth == 0) {
+          size_t q = p;
+          while (q < n && isspace((unsigned char)t[q])) ++q;
+          if (q < n && t[q] == ';') continue;  // initializer: the semicolon ends it
+          break;
+        }
+      } else if (c == ';' && depth == 0) {
+        ++p;
+        break;
+      } else {
+        ++p;
+      }
+    }
+    it.end = p;
+    // classify: skip linkage words, then look at the declaring directive
+    size_t q = it.begin;
+    std::string word;
+    while (true) {
+      q = yasai_ptx_skip_space(t, q);
+      size_t e = q;
+      if (e < n && t[e] == '.') ++e;
+      while (e < it.end && yasai_ptx_ident_char(t[e])) ++e;
+      word = t.substr(q, e - q);
+      if (word == ".visible" || word == ".weak" || word == ".extern" || word == ".common") {
+        q = e;
+        continue;
+      }
+      q = e;
+      break;
+    }
+    if (word == ".entry") {
+      it.name = yasai_ptx_read_ident(t, q);
+      it.kind = body ? YASAI_PTX_ENTRY : YASAI_PTX_OTHER;
+    } else if (word == ".func") {
+      q = yasai_ptx_skip_space(t, q);
+      if (q < n && t[q] == '(') {  // return parameter list
+        int d = 0;
+        for (; q < it.end; ++q) {
+          if (t[q] == '(') ++d;
+          if (t[q] == ')' && --d == 0) {
+            ++q;
+            break;
+          }
+        }
+      }
+      it.name = yasai_ptx_read_ident(t, q);
+      it.kind = body ? YASAI_PTX_FUNC_DEF : YASAI_PTX_FUNC_DECL;
+    } else if (word == ".section") {
+      size_t r = yasai_ptx_skip_space(t, q);
+      it.kind = t.compare(r, 6, ".debug") == 0 ? YASAI_PTX_DEBUG : YASAI_PTX_OTHER;
+    }
+    items.push_back(it);
+    i = p;
+  }
+  return items;
+}
+
+// Adds to out every identifier of t[b, e) that names a function of the file. Identifiers that
+// follow '%' (registers) or '.' (directive and opcode parts) are skipped.
+//   t: PTX text; b, e: byte range; funcs: function names of the file; out: names found
+void yasai_ptx_called(const std::string &t, size_t b, size_t e,
+                      const std::unordered_map<std::string, std::vector<int>> &funcs,
+                      std::vector<std::string> &out) {
+  size_t p = b;
+  while (p < e) {
+    if (!yasai_ptx_ident_char(t[p]) || isdigit((unsigned char)t[p])) {
+      ++p;
+      continue;
+    }
+    const char before = p > b ? t[p - 1] : ' ';
+    const size_t s = p;
+    while (p < e && yasai_ptx_ident_char(t[p])) ++p;
+    if (before == '%' || before == '.') continue;
+    std::string id = t.substr(s, p - s);
+    if (funcs.count(id)) out.push_back(std::move(id));
+  }
+}
+
+// Total bytes of PTX parsed by the per-kernel loader (printed with each piece).
+size_t g_yasai_piece_bytes = 0;
+
+// Per-kernel loading: parses from file i of L only what name needs. For a kernel that is the
+// .entry, the .func definitions it reaches (directly, or through the function pointers in the
+// file's variable initializers), and, in the file's first piece, the file-scope variables and
+// directives. Later pieces of the same file parse into the same global symbol table, so they
+// share the file's variables (one copy per file, as with whole-file parsing) and the functions
+// already parsed. For a variable, the first piece without an entry. ptxas runs on a
+// self-contained copy of the piece (all variables, every reached function, the entry), whose
+// resource usage is the kernel's. Returns true when something was parsed.
+//   ctx: simulator context; L: index of the fat binary; i: file index; name: kernel or variable
+bool yasai_lazy_load_piece(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i, const char *name) {
+  std::string target = name;
+  if (L.funcs_loaded[i].count(target)) return false;
+  std::ifstream in(L.files[i]);
+  std::stringstream ss;
+  ss << in.rdbuf();
+  const std::string t = ss.str();
+  const std::vector<yasai_ptx_item_t> items = yasai_ptx_split(t);
+  std::unordered_map<std::string, std::vector<int>> funcs;  // function name -> its items
+  int entry_item = -1;
+  for (int k = 0; k < (int)items.size(); ++k) {
+    if (items[k].kind == YASAI_PTX_FUNC_DEF || items[k].kind == YASAI_PTX_FUNC_DECL)
+      funcs[items[k].name].push_back(k);
+    if (items[k].kind == YASAI_PTX_ENTRY && items[k].name == target) entry_item = k;
+  }
+  if (entry_item < 0 && L.vars_loaded[i]) return false;  // a variable, already parsed
+  // functions reached from the entry and from the variable initializers
+  std::vector<std::string> work;
+  if (entry_item >= 0) yasai_ptx_called(t, items[entry_item].begin, items[entry_item].end, funcs, work);
+  for (const yasai_ptx_item_t &it : items)
+    if (it.kind == YASAI_PTX_OTHER) yasai_ptx_called(t, it.begin, it.end, funcs, work);
+  std::set<std::string> reached;
+  while (!work.empty()) {
+    std::string f = work.back();
+    work.pop_back();
+    if (!reached.insert(f).second) continue;
+    for (int k : funcs[f])
+      if (items[k].kind == YASAI_PTX_FUNC_DEF)
+        yasai_ptx_called(t, items[k].begin, items[k].end, funcs, work);
+  }
+  std::string parse_text, ptxas_text;
+  for (int k = 0; k < (int)items.size(); ++k) {
+    const yasai_ptx_item_t &it = items[k];
+    bool to_ptxas = false, to_parse = false;
+    switch (it.kind) {
+      case YASAI_PTX_HEADER:
+        to_ptxas = to_parse = true;
+        break;
+      case YASAI_PTX_DEBUG:
+        break;
+      case YASAI_PTX_OTHER:
+        to_ptxas = true;
+        to_parse = !L.vars_loaded[i];
+        break;
+      case YASAI_PTX_FUNC_DEF:
+      case YASAI_PTX_FUNC_DECL:
+        to_ptxas = reached.count(it.name) > 0;
+        to_parse = to_ptxas && !L.funcs_loaded[i].count(it.name);
+        break;
+      case YASAI_PTX_ENTRY:
+        to_ptxas = to_parse = (k == entry_item);
+        break;
+    }
+    if (to_ptxas) ptxas_text.append(t, it.begin, it.end - it.begin).push_back('\n');
+    if (to_parse) parse_text.append(t, it.begin, it.end - it.begin).push_back('\n');
+  }
+  const int piece = L.pieces[i]++;
+  const std::string parse_file = L.files[i] + ".k" + std::to_string(piece) + ".ptx";
+  {
+    std::ofstream out(parse_file);
+    out << parse_text;
+  }
+  g_yasai_piece_bytes += parse_text.size();
+  printf("GPGPU-Sim PTX: parsing %s of %s (piece %d: %zu of %zu bytes; %zu bytes parsed in "
+         "pieces so far)\n",
+         entry_item >= 0 ? target.c_str() : "the variables", L.files[i].c_str(), piece,
+         parse_text.size(), t.size(), g_yasai_piece_bytes);
+  CUctx_st *context = GPGPUSim_Context(ctx);
+  symbol_table *symtab = ctx->gpgpu_ptx_sim_load_ptx_from_filename(parse_file.c_str());
+  context->add_binary(symtab, L.handle);
+  ctx->api->load_static_globals(symtab, STATIC_ALLOC_LIMIT, context->get_device()->get_gpgpu());
+  ctx->api->load_constants(symtab, STATIC_ALLOC_LIMIT, context->get_device()->get_gpgpu());
+  L.vars_loaded[i] = true;
+  for (const std::string &f : reached) L.funcs_loaded[i].insert(f);
+  if (entry_item >= 0) {
+    L.funcs_loaded[i].insert(target);
+    const std::string ptxas_file = L.files[i] + ".k" + std::to_string(piece) + ".full.ptx";
+    {
+      std::ofstream out(ptxas_file);
+      out << ptxas_text;
+    }
+    ctx->gpgpu_ptx_info_load_from_filename(ptxas_file.c_str(), L.archs[i].c_str());
+  }
+  return true;
+}
+
+// yasai_func::g_lazy_load_name: loads the file that defines name (whole-file mode) or the part
+// of it that name needs (per-kernel mode).
 bool yasai_lazy_load_name(const char *name) {
   for (yasai_lazy_ptx_t &L : g_yasai_lazy) {
     auto it = L.owner.find(name);
-    if (it != L.owner.end() && !L.loaded[it->second]) {
+    if (it == L.owner.end()) continue;
+    if (yasai_per_kernel_enabled()) {
+      if (L.loaded[it->second]) return false;
+      return yasai_lazy_load_piece(GPGPU_Context(), L, it->second, name);
+    }
+    if (!L.loaded[it->second]) {
       yasai_lazy_load_file(GPGPU_Context(), L, it->second);
       return true;
     }
@@ -4784,6 +5073,9 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
       else if (sm_pos != std::string::npos) arch = f.substr(sm_pos, f.find('.', sm_pos) - sm_pos);
       L.archs.push_back(arch);
       L.loaded.push_back(false);
+      L.vars_loaded.push_back(false);
+      L.funcs_loaded.emplace_back();
+      L.pieces.push_back(0);
       std::ifstream in(f);
       std::string line;
       while (std::getline(in, line)) {
@@ -5539,9 +5831,13 @@ int cuda_runtime_api::load_static_globals(symbol_table *symtab,
   int ng_bytes = 0;
   symbol_table::iterator g = symtab->global_iterator_begin();
 
+  // yasai: every PTX file (and every per-kernel piece) parses into one global table, so each
+  // load visits the variables of all earlier loads too. A variable is initialized once, at the
+  // load that defines it; before, a later load reset variables that kernels had written.
+  static std::set<const symbol *> initialized;
   for (; g != symtab->global_iterator_end(); g++) {
     symbol *global = *g;
-    if (global->has_initializer()) {
+    if (global->has_initializer() && initialized.insert(global).second) {
       printf("GPGPU-Sim PTX:     initializing '%s' ... ",
              global->name().c_str());
       addr_t addr = global->get_address();
@@ -5583,9 +5879,11 @@ int cuda_runtime_api::load_constants(symbol_table *symtab, addr_t min_gaddr,
   int nc_bytes = 0;
   symbol_table::iterator g = symtab->const_iterator_begin();
 
+  // yasai: initialized once, as in load_static_globals.
+  static std::set<const symbol *> initialized;
   for (; g != symtab->const_iterator_end(); g++) {
     symbol *constant = *g;
-    if (constant->is_const() && constant->has_initializer()) {
+    if (constant->is_const() && constant->has_initializer() && initialized.insert(constant).second) {
       // get the constant element data size
       int basic_type;
       size_t num_bits;
