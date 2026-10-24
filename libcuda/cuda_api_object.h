@@ -166,6 +166,10 @@ struct CUctx_st {
         if (s != NULL && s->get_pc() != NULL) {
           i->second = s->get_pc();
           m_yasai_pending_kernel.erase(p);
+        } else if (m_yasai_reported_missing.insert(p->second).second) {
+          // yasai: name the kernel once, so a cudaErrorInvalidDeviceFunction can be traced.
+          printf("GPGPU-Sim PTX: no PTX loaded for kernel '%s' (host function %p)\n",
+                 p->second.c_str(), hostFun);
         }  // else NULL: callers handle kernels without PTX (NCCL queries its symmetric-memory
            // kernels, which have no PTX for this architecture)
       }
@@ -191,6 +195,8 @@ struct CUctx_st {
   std::vector<symbol_table *> m_all_code;  // yasai: every module table, in load order
   // yasai: host stub -> device kernel name of kernels whose PTX was not loaded at registration.
   std::map<const void *, std::string> m_yasai_pending_kernel;
+  // yasai: kernel names already reported as having no PTX (each is printed once).
+  std::set<std::string> m_yasai_reported_missing;
   std::map<const void *, function_info *>
       m_kernel_lookup;  // unique id (CUDA app function address) => kernel entry
                         // point
