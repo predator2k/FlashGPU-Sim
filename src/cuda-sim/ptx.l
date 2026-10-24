@@ -114,6 +114,8 @@ wmma	TC; yylval->int_value = MMA_OP; return OPCODE;
 wmma\.load	TC; yylval->int_value = MMA_LD_OP; return OPCODE;
 wmma\.store 	TC; yylval->int_value = MMA_ST_OP; return OPCODE;
 
+mma\.sp::ordered_metadata\.sync\.aligned	TC; yylval->int_value = TENSOR_MMA_OP; return OPCODE; /* yasai: sparse, see mma_sparse.cc */
+mma\.sp\.sync\.aligned	TC; yylval->int_value = TENSOR_MMA_OP; return OPCODE; /* yasai: sparse */
 mma\.sync\.aligned	TC; yylval->int_value = TENSOR_MMA_OP; return OPCODE;
 mma\.sync	TC; yylval->int_value = TENSOR_MMA_OP; return OPCODE;
 wgmma\.mma_async\.sp	TC; yylval->int_value = WGMMA_MMA_ASYNC_SP_OP; return OPCODE;
