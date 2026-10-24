@@ -168,13 +168,22 @@ std::string decl_name(const std::string &line, bool *linked, bool *defines) {
 /// Module-local names that a PTX file declares (file-scope lines at brace depth 0).
 /// @param path PTX file.
 /// @param defined Receives the names the file defines with linkage (.visible, .weak, .common).
+/// @param hash Receives the 64-bit FNV-1a hash of the file's lines.
 /// @return The names (empty when the file cannot be read).
-std::set<std::string> local_names(const std::string &path, std::set<std::string> *defined) {
+std::set<std::string> local_names(const std::string &path, std::set<std::string> *defined,
+                                  uint64_t *hash) {
   std::set<std::string> names;
   std::ifstream in(path);
   std::string line;
   int depth = 0;
+  uint64_t hv = 1469598103934665603ull;
   while (std::getline(in, line)) {
+    for (char c : line) {
+      hv ^= uint8_t(c);
+      hv *= 1099511628211ull;
+    }
+    hv ^= uint8_t('\n');
+    hv *= 1099511628211ull;
     if (depth == 0) {
       bool linked = false, defines = false;
       const std::string n = decl_name(line, &linked, &defines);
@@ -184,7 +193,15 @@ std::set<std::string> local_names(const std::string &path, std::set<std::string>
     depth += brace_delta(line);
     if (depth < 0) depth = 0;
   }
+  *hash = hv;
   return names;
+}
+
+/// Creates directory dir and its parents (like mkdir -p); existing directories are fine.
+/// @param dir Directory.
+void make_dirs(const std::string &dir) {
+  for (size_t i = 1; i <= dir.size(); ++i)
+    if (i == dir.size() || dir[i] == '/') mkdir(dir.substr(0, i).c_str(), 0755);
 }
 
 /// Appends suffix to every identifier of line that is in names. Identifiers after '%'
@@ -241,7 +258,8 @@ std::string scope_file(const std::string &path) {
   std::lock_guard<std::mutex> lock(r.mu);
   auto it = r.scoped_path.find(path);
   if (it != r.scoped_path.end()) return it->second;
-  const std::set<std::string> names = local_names(path, &r.defined);
+  uint64_t content_hash = 0;
+  const std::set<std::string> names = local_names(path, &r.defined, &content_hash);
   if (names.empty()) {
     r.scoped_path[path] = path;
     return path;
@@ -259,12 +277,21 @@ std::string scope_file(const std::string &path) {
   }
   r.base_owner[base] = path;
   const std::string suffix = module_suffix(base);
-  mkdir(kScopeDir, 0755);
-  const std::string out_path = std::string(kScopeDir) + "/" + base;
-  // Written under a per-process name and renamed, so processes that share a working directory
-  // (the same file, the same content) never read a partial copy.
+  // The copies go to YASAI_MODULE_SCOPE_DIR when it is set (a cache shared by runs: a copy is
+  // named by the hash of its source and its base name, so the same input is written once),
+  // otherwise to yasai_module_scope/ in the working directory.
+  const char *dir_env = getenv("YASAI_MODULE_SCOPE_DIR");
+  const std::string dir = (dir_env && *dir_env) ? std::string(dir_env) : std::string(kScopeDir);
+  make_dirs(dir);
+  char hx[24];
+  snprintf(hx, sizeof hx, "%016llx-", (unsigned long long)content_hash);
+  const std::string out_path = dir + "/" + hx + base;
+  struct stat st;
+  const bool cached = stat(out_path.c_str(), &st) == 0;
+  // Written under a per-process name and renamed, so processes that share the directory (the
+  // same file, the same content) never read a partial copy.
   const std::string tmp = out_path + ".tmp" + std::to_string(getpid());
-  {
+  if (!cached) {
     std::ifstream in(path);
     std::ofstream out(tmp);
     std::string line;
@@ -280,7 +307,7 @@ std::string scope_file(const std::string &path) {
       abort();
     }
   }
-  if (rename(tmp.c_str(), out_path.c_str()) != 0) {
+  if (!cached && rename(tmp.c_str(), out_path.c_str()) != 0) {
     fprintf(stderr, "yasai-scope: cannot rename %s to %s\n", tmp.c_str(), out_path.c_str());
     abort();
   }
