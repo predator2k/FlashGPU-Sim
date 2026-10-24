@@ -618,12 +618,14 @@ void function_info::alloc_dyn_shared_mem(int shared_mem_size) {
     }
     addr_t addr = symtab->get_shared_next();
     // yasai: the base is 1024-byte aligned, or more when an extern array declares a larger
-    // .align. An RTX 5090 places the dynamic region of a kernel with 12 bytes of static shared
-    // memory and an extern array declared .align 16 at 0x800, and code relies on that: CUTLASS
-    // casts an `extern __shared__ char[]` (PTX .align 16) to a SharedStorage declared
-    // alignas(1024), and the compiler folds address arithmetic on the declared alignment.
-    // The base used to be 128-byte aligned (an extern __align__(1024) array after static
-    // variables started at 0x80).
+    // .align. The hardware honours the declared alignment of the kernel's array (an RTX 5090
+    // puts arrays declared 16, 128 and 1024 after 12 bytes of static shared memory at 0x410,
+    // 0x480 and 0x800), but the PTX does not always carry it: nvcc emits one module-level
+    // .extern .shared per array name with the alignment of its first declaration, so kernels
+    // that declare one name with different alignments (template instances) all read .align 16
+    // in the PTX while their cubins keep their own alignment. A 1024-byte base satisfies every
+    // declaration. The base used to be 128-byte aligned (an extern __align__(1024) array after
+    // static variables started at 0x80).
     unsigned alignto = 1024;
     if (m_yasai_dyn_smem_align > alignto) alignto = m_yasai_dyn_smem_align;
     addr_t addr_pad = alignto ? ((alignto - (addr % alignto)) % alignto) : 0;
