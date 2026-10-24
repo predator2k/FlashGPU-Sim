@@ -925,6 +925,8 @@ wmma_spec: WMMA_DIRECTIVE LAYOUT CONFIGURATION{recognizer->add_space_spec(global
 	;
 
 mma_spec: CONFIGURATION LAYOUT LAYOUT scalar_type scalar_type scalar_type scalar_type{recognizer->add_mma_option($1);recognizer->add_mma_option($2);recognizer->add_mma_option($3);}
+	/* yasai: .satfinite between the layouts and the types (integer mma.sync, ThunderKittens) */
+	| CONFIGURATION LAYOUT LAYOUT SATFINITE_OPTION scalar_type scalar_type scalar_type scalar_type{recognizer->add_mma_option($1);recognizer->add_mma_option($2);recognizer->add_mma_option($3);recognizer->add_option(SATFINITE_OPTION);}
 	;
 
 vp_spec: WMMA_DIRECTIVE LAYOUT CONFIGURATION{recognizer->add_space_spec(global_space,0);recognizer->add_ptr_spec(global_space);recognizer->add_wmma_option($1);recognizer->add_wmma_option($2);recognizer->add_wmma_option($3);}
