@@ -306,6 +306,23 @@ std::string ptx_for_cubin(const unsigned char *p, size_t size, std::string *how)
 
 }  // namespace
 
+std::string piece_path(const std::string &source, int piece, const std::string &suffix) {
+  std::lock_guard<std::mutex> lock(jit_mutex());
+  // The process id is part of the name: processes forked after loading (zygote ranks) inherit
+  // the parent's work directory.
+  const std::string dir = work_dir() + "/pieces";
+  static std::string made;
+  if (made != dir) {
+    yasai_system(("mkdir -p '" + dir + "'").c_str());
+    made = dir;
+  }
+  const size_t slash = source.rfind('/');
+  const std::string base = slash == std::string::npos ? source : source.substr(slash + 1);
+  return dir + "/" + std::to_string(getpid()) + "-" +
+         hash_hex((const unsigned char *)source.data(), source.size()) + "-" + base + ".k" +
+         std::to_string(piece) + suffix;
+}
+
 std::string arch_of_ptx_file(const std::string &ptx_file) {
   const size_t slash = ptx_file.rfind('/');
   const std::string base = slash == std::string::npos ? ptx_file : ptx_file.substr(slash + 1);

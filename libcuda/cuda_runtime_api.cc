@@ -2608,6 +2608,13 @@ __host__ cudaError_t CUDARTAPI cudaLaunchKernelInternal(
 #if CUDART_VERSION < 10000
   cudaConfigureCallInternal(gridDim, blockDim, sharedMem, stream, ctx);
 #endif
+  // yasai: a kernel without PTX (get_kernel named it once) is an invalid device function, as
+  // on a GPU without code for it; the launch used to dereference the null entry. The launch
+  // configuration pushed for this call is dropped so the next launch finds its own.
+  if (entry == NULL) {
+    if (!ctx->api->g_cuda_launch_stack.empty()) ctx->api->g_cuda_launch_stack.pop_back();
+    return g_last_cudaError = cudaErrorInvalidDeviceFunction;
+  }
   for (unsigned i = 0; i < entry->num_args(); i++) {
     std::pair<size_t, unsigned> p = entry->get_param_config(i);
     cudaSetupArgumentInternal(args[i], p.first, p.second);
@@ -4990,7 +4997,7 @@ bool yasai_lazy_load_piece_lazyfunc(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int
     if (!ptxas_part.empty()) ptxas_text.append(ptxas_part).push_back('\n');
   }
   const int piece = L.pieces[i]++;
-  const std::string parse_file = L.files[i] + ".k" + std::to_string(piece) + ".ptx";
+  const std::string parse_file = yasai_jit::piece_path(L.files[i], piece, ".ptx");
   {
     std::ofstream out(parse_file);
     out << parse_text;
@@ -5009,7 +5016,7 @@ bool yasai_lazy_load_piece_lazyfunc(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int
   L.vars_loaded[i] = true;
   if (entry_item >= 0 || func_item >= 0) L.funcs_loaded[i].insert(target);
   if (entry_item >= 0) {
-    const std::string ptxas_file = L.files[i] + ".k" + std::to_string(piece) + ".full.ptx";
+    const std::string ptxas_file = yasai_jit::piece_path(L.files[i], piece, ".full.ptx");
     {
       std::ofstream out(ptxas_file);
       out << ptxas_text;
@@ -5086,7 +5093,7 @@ bool yasai_lazy_load_piece(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i, const
     if (to_parse) parse_text.append(t, it.begin, it.end - it.begin).push_back('\n');
   }
   const int piece = L.pieces[i]++;
-  const std::string parse_file = L.files[i] + ".k" + std::to_string(piece) + ".ptx";
+  const std::string parse_file = yasai_jit::piece_path(L.files[i], piece, ".ptx");
   {
     std::ofstream out(parse_file);
     out << parse_text;
@@ -5105,7 +5112,7 @@ bool yasai_lazy_load_piece(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i, const
   for (const std::string &f : reached) L.funcs_loaded[i].insert(f);
   if (entry_item >= 0) {
     L.funcs_loaded[i].insert(target);
-    const std::string ptxas_file = L.files[i] + ".k" + std::to_string(piece) + ".full.ptx";
+    const std::string ptxas_file = yasai_jit::piece_path(L.files[i], piece, ".full.ptx");
     {
       std::ofstream out(ptxas_file);
       out << ptxas_text;
