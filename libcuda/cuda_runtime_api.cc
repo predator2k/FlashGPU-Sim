@@ -790,12 +790,24 @@ static bool yasai_ordinal_valid(int device, unsigned num_devices) {
   return device <= int(num_devices);
 }
 
+/// yasai: whether a context is current in the process. The driver has none until the runtime
+/// creates the primary context (cudaSetDevice, the first allocation or launch) or a driver call
+/// makes one current (cuCtxSetCurrent, cuDevicePrimaryCtxRetain, cuCtxCreate); until then
+/// cuCtxGetDevice fails with CUDA_ERROR_INVALID_CONTEXT, and NVSHMEM's nvshmem_init defers its
+/// device selection to the first call after the application's cudaSetDevice.
+/// @return The flag.
+static bool &yasai_ctx_current() {
+  static bool current = false;
+  return current;
+}
+
 /// Ordinal of the process's first allocation or kernel launch (-1 before it).
 static int g_yasai_used_ordinal = -1;
 
 /// Records the ordinal of the first allocation or kernel launch (YASAI_NVML_DEVICES only).
 /// @param ordinal Current ordinal.
 static void yasai_ordinal_note_use(int ordinal) {
+  yasai_ctx_current() = true;
   if (yasai_ordinal_count() > 0 && g_yasai_used_ordinal < 0) g_yasai_used_ordinal = ordinal;
 }
 
@@ -832,6 +844,7 @@ cudaError_t cudaSetDeviceInternal(int device, gpgpu_context *gpgpu_ctx = NULL) {
   if (yasai_ordinal_valid(device, ctx->GPGPUSim_Init()->num_devices())) {
     if (yasai_ordinal_count() > 0) yasai_ordinal_check_switch(device);
     ctx->api->g_active_device = device;
+    yasai_ctx_current() = true;  // cudaSetDevice initializes the primary context (CUDA 12+)
     return g_last_cudaError = cudaSuccess;
   } else {
     return g_last_cudaError = cudaErrorInvalidDevice;
@@ -2731,8 +2744,9 @@ cudaDeviceGetAttributeInternal(int *value, enum cudaDeviceAttr attr, int device,
       case 109:  // cudaDevAttrMaxAccessPolicyWindowSize
         *value = 0;
         break;
-      case 110:  // Unassigned
-        *value = 0;
+      case 110:  // yasai: CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, as on
+                 // H100/B200; NVSHMEM uses cuMem VMM for its symmetric heap only with it
+        *value = 1;
         break;
       case 111:  // cudaDevAttrReservedSharedMemoryPerBlock
         *value = 0;
@@ -7180,14 +7194,10 @@ CUresult CUDAAPI cuDeviceComputeCapability(int *major, int *minor,
 
 #if CUDART_VERSION >= 7000
 
-// yasai: the primary context is the one context of the simulated device (as cuCtxGetCurrent).
-//   pctx: receives the context; dev: device
+// yasai: the one context of the simulated device (see cuCtxGetCurrent).
 CUresult CUDAAPI cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
   (void)dev;
-  if (!pctx) return CUDA_ERROR_INVALID_VALUE;
+  if (pctx == NULL) return CUDA_ERROR_INVALID_VALUE;
   *pctx = (CUcontext)GPGPUSim_Context(GPGPU_Context());
   return CUDA_SUCCESS;
 }
@@ -7255,12 +7265,14 @@ CUresult CUDAAPI cuDevicePrimaryCtxReset(CUdevice dev) {
 #endif /* CUDART_VERSION >= 7000 */
 
 #if CUDART_VERSION >= 3020
+// yasai: the one context of the simulated device, made current (see yasai_ctx_current).
 CUresult CUDAAPI cuCtxCreate(CUcontext *pctx, unsigned int flags,
                              CUdevice dev) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  (void)flags;
+  (void)dev;
+  if (pctx == NULL) return CUDA_ERROR_INVALID_VALUE;
+  *pctx = (CUcontext)GPGPUSim_Context(GPGPU_Context());
+  yasai_ctx_current() = true;
   return CUDA_SUCCESS;
 }
 
@@ -7307,11 +7319,9 @@ CUresult CUDAAPI cuCtxPopCurrent(CUcontext *pctx) {
   return CUDA_SUCCESS;
 }
 
+// yasai: a non-NULL context is the simulated device's one context (see yasai_ctx_current).
 CUresult CUDAAPI cuCtxSetCurrent(CUcontext ctx) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  yasai_ctx_current() = ctx != NULL;
   return CUDA_SUCCESS;
 }
 
@@ -7326,9 +7336,11 @@ CUresult CUDAAPI cuCtxGetCurrent(CUcontext *pctx) {
 }
 #endif /* CUDART_VERSION >= 4000 */
 
-// yasai: the device of the current context is the current ordinal (cudaGetDevice).
+// yasai: the device of the current context is the current ordinal (cudaGetDevice); without a
+// current context (yasai_ctx_current) the driver reports CUDA_ERROR_INVALID_CONTEXT.
 CUresult CUDAAPI cuCtxGetDevice(CUdevice *device) {
   if (device == NULL) return CUDA_ERROR_INVALID_VALUE;
+  if (!yasai_ctx_current()) return CUDA_ERROR_INVALID_CONTEXT;
   int d = 0;
   cudaGetDevice(&d);
   *device = d;
@@ -7358,12 +7370,11 @@ extern "C" CUresult CUDAAPI cuCtxSetFlags(unsigned int flags) {
 }
 #endif /* CUDART_VERSION >= 7000 */
 
+// yasai: waits for the device (cudaDeviceSynchronize); without a current context the driver
+// reports CUDA_ERROR_INVALID_CONTEXT.
 CUresult CUDAAPI cuCtxSynchronize(void) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
-  }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
-  return CUDA_SUCCESS;
+  if (!yasai_ctx_current()) return CUDA_ERROR_INVALID_CONTEXT;
+  return cudaDeviceSynchronize() == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_UNKNOWN;
 }
 
 CUresult CUDAAPI cuCtxSetLimit(CUlimit limit, size_t value) {
@@ -9231,15 +9242,41 @@ CUresult CUDAAPI cuDeviceCanAccessPeer(int *canAccessPeer, CUdevice dev,
              : CUDA_ERROR_INVALID_VALUE;
 }
 
+// yasai: P2P attributes between two ordinals of the node: access, native atomics and CUDA-array
+// access follow cudaDeviceCanAccessPeer (YASAI_NVML_DEVICES, YASAI_NVML_P2P), the performance
+// rank is 0 (one NVLink class), other attributes are 0.
+//   value: result; attrib: CU_DEVICE_P2P_ATTRIBUTE_*; srcDevice, dstDevice: ordinals
 CUresult CUDAAPI cuDeviceGetP2PAttribute(int *value,
                                          CUdevice_P2PAttribute attrib,
                                          CUdevice srcDevice,
                                          CUdevice dstDevice) {
-  if (g_debug_execution >= 3) {
-    announce_call(__my_func__);
+  if (value == NULL) return CUDA_ERROR_INVALID_VALUE;
+  int access = 0;
+  cudaDeviceCanAccessPeer(&access, int(srcDevice), int(dstDevice));
+  switch ((int)attrib) {
+    case 1:  // PERFORMANCE_RANK
+      *value = 0;
+      break;
+    case 2:  // ACCESS_SUPPORTED
+    case 3:  // NATIVE_ATOMIC_SUPPORTED
+    case 4:  // CUDA_ARRAY_ACCESS_SUPPORTED (ACCESS_ACCESS_SUPPORTED)
+      *value = access;
+      break;
+    default:
+      *value = 0;
+      break;
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
   return CUDA_SUCCESS;
+}
+
+// yasai: the runtime form of cuDeviceGetP2PAttribute (the attribute codes are the same).
+extern "C" __host__ cudaError_t CUDARTAPI cudaDeviceGetP2PAttribute(int *value,
+                                                                   enum cudaDeviceP2PAttr attr,
+                                                                   int srcDevice, int dstDevice) {
+  return cuDeviceGetP2PAttribute(value, (CUdevice_P2PAttribute)attr, srcDevice, dstDevice) ==
+                 CUDA_SUCCESS
+             ? (g_last_cudaError = cudaSuccess)
+             : (g_last_cudaError = cudaErrorInvalidValue);
 }
 
 CUresult CUDAAPI cuCtxEnablePeerAccess(CUcontext peerContext,
