@@ -507,6 +507,16 @@ std::string library_entry_name(const std::string &name, const std::string &libra
 
 std::string library_unit(const std::string &library) { return library_key(base_name(library)); }
 
+std::string unit_entry_name(const std::string &name, const std::string &unit) {
+  Registry &r = registry();
+  std::lock_guard<std::mutex> lock(r.mu);
+  auto it = r.entry_renamed.find(name);
+  if (it == r.entry_renamed.end() || unit.empty()) return name;
+  for (const auto &cand : it->second)
+    if (cand.first == unit) return cand.second;
+  return name;
+}
+
 std::string source_name(const std::string &name) {
   Registry &r = registry();
   std::lock_guard<std::mutex> lock(r.mu);

@@ -1,6 +1,8 @@
 // yasai: PTX for modules that a process hands to the driver at run time (see yasai_jit_image.h).
 #include "yasai_jit_image.h"
 
+#include "yasai_fatbin_units.h"
+
 #include <dirent.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -326,6 +328,27 @@ std::vector<std::string> ptx_files_of_library(const std::string &path, unsigned 
   const std::string dir = work_dir() + "/lib-" +
                           hash_hex((const unsigned char *)path.data(), path.size());
   std::vector<std::string> files = extract_ptx(path, dir);
+  // yasai: files are named after their source files, so translation units compiled from
+  // sources of one name overwrite each other; settle_listing extracts those again from their
+  // own fat binaries and records every file's fat binary (yasai_fatbin_units.h).
+  {
+    const std::string list = dir + "/yasai_lptx.txt";
+    const std::string cmd = "$CUDA_INSTALL_PATH/bin/cuobjdump -lptx '" + path +
+                            "' 2>/dev/null | cut -d ':' -f 2 | awk '{$1=$1}1' > '" + list + "'";
+    yasai_system(cmd.c_str());
+    std::vector<std::vector<std::string>> names(1);
+    std::ifstream in(list);
+    for (std::string l; std::getline(in, l);)
+      if (!l.empty()) names[0].push_back(l);
+    if (!names[0].empty()) {
+      const std::vector<std::vector<std::string>> settled =
+          yasai_fatbin::settle_listing({path}, names, dir, yasai_system);
+      std::set<std::string> seen;
+      files.clear();
+      for (const std::string &n : settled[0])
+        if (seen.insert(n).second) files.push_back(dir + "/" + n);
+    }
+  }
   // rank: (0, -arch, plain) for architectures within the capability, (1, arch, plain) above it
   auto rank = [max_capability](const std::string &f) {
     const std::string a = arch_of_ptx_file(f);

@@ -169,6 +169,7 @@ typedef enum CUoutput_mode_enum {
 #include "../src/cuda-sim/host_window.h"
 #include "../src/cuda-sim/shared_devmem.h"
 #include "../src/cuda-sim/yasai_module_scope.h"
+#include "yasai_fatbin_units.h"
 #include "yasai_vmm.h"
 #include "../src/cuda-sim/ptx_ir.h"
 #include "../src/cuda-sim/ptx_loader.h"
@@ -1181,6 +1182,13 @@ static std::map<unsigned, std::string> &yasai_handle_library() {
 }
 
 // Internal implementation for cudaRegisterFatBiaryInternal
+// yasai: fat binary wrapper of each __cudaRegisterFatBinary handle, so a function registration
+// finds the translation unit of its fat binary (yasai_fatbin_units.h).
+static std::map<unsigned, const void *> &yasai_handle_fatbin() {
+  static std::map<unsigned, const void *> m;
+  return m;
+}
+
 void **cudaRegisterFatBiaryInternal_impl(
     void *fatCubin, gpgpu_context *gpgpu_ctx, std::string &app_binary_path,
     int app_cuda_version,
@@ -1261,6 +1269,7 @@ void **cudaRegisterFatBiaryInternal_impl(
     // This allows us to work around the fact that cuobjdump only outputs the
     // file name associated with each section.
     unsigned long long fat_cubin_handle = get_next_fat_bin_handle();
+    yasai_handle_fatbin()[unsigned(fat_cubin_handle)] = fatCubin;  // yasai
     printf(
         "GPGPU-Sim PTX: __cudaRegisterFatBinary, fat_cubin_handle = %llu, "
         "filename=%s\n",
@@ -1407,9 +1416,10 @@ void cudaRegisterFunctionInternal(void **fatCubinHandle, const char *hostFun,
       deviceFun, hostFun, fat_cubin_handle);
   if (context->get_device()->get_gpgpu()->get_config().use_cuobjdump())
     ctx->cuobjdumpParseBinary(fat_cubin_handle);
-  // yasai: a kernel that the registering library shares by name with another library was
-  // renamed in this library's PTX (yasai_module_scope.h); the host stub is tied to this fat
-  // binary, so it resolves to the library's own kernel.
+  // yasai: a kernel that the registering library or translation unit shares by name with
+  // another one was renamed in its PTX (yasai_module_scope.h); the host stub is tied to this fat
+  // binary, so it resolves to its own translation unit's kernel, or to its library's when the
+  // fat binary cannot be located.
   std::string reg_library;
   const auto late = yasai_handle_library().find(fat_cubin_handle);
   if (late != yasai_handle_library().end()) {
@@ -1418,7 +1428,12 @@ void cudaRegisterFunctionInternal(void **fatCubinHandle, const char *hostFun,
     const auto reg_lib = ctx->api->fatbinmap.find(int(fat_cubin_handle));
     if (reg_lib != ctx->api->fatbinmap.end()) reg_library = reg_lib->second;
   }
-  const std::string reg_name = yasai_scope::library_entry_name(deviceFun, reg_library);
+  std::string reg_name = deviceFun;
+  const auto fb = yasai_handle_fatbin().find(fat_cubin_handle);
+  const std::string reg_unit =
+      fb == yasai_handle_fatbin().end() ? std::string() : yasai_fatbin::unit_of_fatbin(fb->second);
+  if (!reg_unit.empty()) reg_name = yasai_scope::unit_entry_name(deviceFun, reg_unit);
+  if (reg_name == deviceFun) reg_name = yasai_scope::library_entry_name(deviceFun, reg_library);
   context->register_function(fat_cubin_handle, hostFun, reg_name.c_str());
 }
 
@@ -4700,6 +4715,31 @@ void cuda_runtime_api::extract_ptx_files_using_cuobjdump_internal(
           exit(0);
         }
       }
+      // yasai: files are named after their source files, so translation units compiled from
+      // sources of one name overwrite each other; those are extracted again from their own fat
+      // binaries under numbered names, and every file is recorded with its fat binary
+      // (yasai_fatbin_units.h). The list file then names the settled files.
+      std::vector<std::vector<std::string>> names(binaries.size());
+      for (size_t k = 0; k < binaries.size(); ++k) {
+        char one_list[1024];
+        snprintf(one_list, sizeof one_list, "_cuobjdump_list_one_XXXXXX");
+        const int fd1 = mkstemp(one_list);
+        if (fd1 >= 0) close(fd1);
+        snprintf(command, sizeof(command),
+                 "$CUDA_INSTALL_PATH/bin/cuobjdump -lptx %s | cut -d \":\" -f 2 | "
+                 "awk '{$1=$1}1' > %s",
+                 binaries[k].c_str(), one_list);
+        yasai_system(command);
+        std::ifstream one(one_list);
+        for (std::string l; std::getline(one, l);)
+          if (!l.empty()) names[k].push_back(l);
+        unlink(one_list);
+      }
+      const std::vector<std::vector<std::string>> settled =
+          yasai_fatbin::settle_listing(binaries, names, ".", yasai_system);
+      std::ofstream relist(ptx_list_file_name, std::ios::trunc);
+      for (const auto &v : settled)
+        for (const std::string &n : v) relist << n << "\n";
     }
   }
 
@@ -5818,10 +5858,13 @@ static void yasai_register_library_ptx(gpgpu_context *ctx, unsigned handle, void
   for (const std::string &orig : files) {
     const int idx = int(L.files.size());
     // module-local symbols scoped to the module (yasai_module_scope.h); the index below reads
-    // the renamed copy, as every later parse does. The files are named after the library's
-    // source files, so the library itself is their unit (kernels it shares by name with
-    // another library are renamed in it).
-    const std::string f = yasai_scope::scope_file(orig, yasai_scope::library_unit(path));
+    // the renamed copy, as every later parse does. The unit of a file is its translation unit
+    // in the library (yasai_fatbin_units.h), or the library when the file carries no number
+    // (the files are named after the library's source files): kernels shared by name with
+    // another library or another translation unit are renamed in it.
+    std::string unit = yasai_fatbin::unit_of_ptx_file(orig, path);
+    if (unit.empty()) unit = yasai_scope::library_unit(path);
+    const std::string f = yasai_scope::scope_file(orig, unit);
     L.files.push_back(f);
     L.archs.push_back(yasai_jit::arch_of_ptx_file(orig));
     L.loaded.push_back(false);
@@ -6047,8 +6090,20 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
   // scoped to their module (yasai_module_scope.h): each selected file with such symbols is
   // replaced by a renamed copy, which every later step (lazy index, per-kernel pieces, lazy
   // function bodies, ptxas) reads.
+  // yasai: the files of a PYTORCH_BIN library or of the program belong to one translation unit
+  // each (yasai_fatbin_units.h), so two units of one library that define the same kernel keep
+  // their own bodies; architecture variants of one unit share their names.
+  if (const char *pb = getenv("PYTORCH_BIN")) {
+    std::string list(pb);
+    size_t start = 0;
+    while (start <= list.size()) {
+      const size_t end = std::min(list.find(':', start), list.size());
+      if (end > start) yasai_fatbin::note_elf(list.substr(start, end - start));
+      start = end + 1;
+    }
+  }
   for (auto &f : selected_files) {
-    const std::string scoped = yasai_scope::scope_file(f);
+    const std::string scoped = yasai_scope::scope_file(f, yasai_fatbin::unit_of_ptx_file(f));
     if (scoped == f) continue;
     auto ov = yasai_override_arch().find(f);
     if (ov != yasai_override_arch().end()) {
