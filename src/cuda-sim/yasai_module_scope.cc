@@ -121,6 +121,9 @@ std::string decl_name(const std::string &line, bool *linked, bool *defines) {
   *defines = false;
   size_t p = line.find_first_not_of(" \t");
   if (p == std::string::npos || line[p] != '.') return "";
+  // An .entry or .func parameter line sits at depth 0 too (".param .u64 .ptr .global .align 1
+  // k_param_0,"); its .global is the pointer's state space, not a declaration.
+  if (line.compare(p, 6, ".param") == 0 || line.compare(p, 4, ".reg") == 0) return "";
   bool linkage = false, var = false, func = false;
   // Directive words (".global", ".align 8", ".b8", ...) up to the name or the .func keyword.
   while (p < line.size() && line[p] == '.') {
