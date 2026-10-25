@@ -3861,6 +3861,16 @@ bool yasai_func_run::step() {
   // prints where each warp is (a spin on a barrier that never completes).
   static const unsigned long hang_rounds =
       getenv("YASAI_HANG_ROUNDS") ? strtoul(getenv("YASAI_HANG_ROUNDS"), NULL, 10) : 0;
+  // yasai: under CTA sampling the skipped CTAs never run, so a kernel whose CTAs wait for each
+  // other (cross-CTA flags, multi-CTA top-k, split-K semaphores) spins forever. A CTA group of a
+  // sampled kernel that is still live after YASAI_CTA_SAMPLE_HANG_ROUNDS rounds (default
+  // 20,000,000; 0 disables) stops the process with the kernel's name. The largest GEMM and
+  // attention CTAs of the coverage runs take a few hundred thousand rounds.
+  static const unsigned long sample_hang_rounds =
+      getenv("YASAI_CTA_SAMPLE_HANG_ROUNDS")
+          ? strtoul(getenv("YASAI_CTA_SAMPLE_HANG_ROUNDS"), NULL, 10)
+          : 20000000ul;
+  const bool sampled = yasai_func::cta_sampled();
   bool any = false;
   for (unsigned gi = 0; gi < m_groups.size(); gi++) {
     group *&g = m_groups[gi];
@@ -3875,9 +3885,20 @@ bool yasai_func_run::step() {
     yasai_func::set_current_rank(0);
     if (live) {
       any = true;
-      if (hang_rounds != 0 && ++g->rounds == hang_rounds) {
+      ++g->rounds;
+      if (hang_rounds != 0 && g->rounds == hang_rounds) {
         fprintf(stderr, "yasai: kernel %s: CTA group still live after %lu rounds\n",
                 m_name.c_str(), hang_rounds);
+        for (functionalCoreSim *core : g->cores) core->yasai_dump_warps(stderr);
+        abort();
+      }
+      if (sampled && sample_hang_rounds != 0 && g->rounds == sample_hang_rounds) {
+        fprintf(stderr,
+                "yasai: sampled kernel appears to need all CTAs: %s (a CTA group is still live "
+                "after %lu rounds; name it in YASAI_CTA_SAMPLE_EXCLUDE_REGEX)\n",
+                m_name.c_str(), sample_hang_rounds);
+        printf("yasai: sampled kernel appears to need all CTAs: %s\n", m_name.c_str());
+        fflush(stdout);
         for (functionalCoreSim *core : g->cores) core->yasai_dump_warps(stderr);
         abort();
       }

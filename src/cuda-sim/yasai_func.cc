@@ -437,6 +437,8 @@ bool skip_fp_value(const ptx_instruction *pI, unsigned lane_id) {
 
 bool launch_only() { return g_launch_only; }
 
+bool cta_sampled() { return !g_launch_only && (config().cta_sample || g_sample_kernel); }
+
 bool cta_is_representative(Dim3 g, unsigned cta_linear_id) {
   if (g_launch_only) return false;
   if (!config().cta_sample && !g_sample_kernel) return true;

@@ -165,6 +165,10 @@ bool cta_is_representative(Dim3 grid, unsigned cta_linear_id);
 // True when the current kernel (kernel_begin) matches YASAI_LAUNCH_ONLY_REGEX: no CTA runs.
 bool launch_only();
 
+// True when the current kernel runs only its representative CTAs (YASAI_CTA_SAMPLE, or a match
+// of YASAI_CTA_SAMPLE_REGEX that YASAI_CTA_SAMPLE_EXCLUDE_REGEX does not name).
+bool cta_sampled();
+
 // Functional mbarrier model. FlashGPU-Sim keeps mbarrier state only in the timing model
 // (barrier_set_t), so in PTX_SIM_MODE_FUNC=1 an mbarrier.try_wait never succeeds and every kernel
 // that waits on an mbarrier (TMA pipelines, warp-specialized SM90/SM100 kernels) spins forever.
