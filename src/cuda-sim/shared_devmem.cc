@@ -88,6 +88,7 @@ struct phys {
   bool anon;               ///< cuMemCreate allocation without a segment yet: at most one
                            ///< whole-object mapping of private anonymous memory (anon_va)
   uint64_t anon_va;        ///< address of that mapping, or 0 while it is not mapped
+  bool imported;           ///< yasai: opened from another process's descriptor (import_fd)
 };
 
 namespace {
@@ -200,6 +201,7 @@ phys *wrap_locked(int fd, size_t size) {
   p->refs.store(1);
   p->anon = false;
   p->anon_va = 0;
+  p->imported = false;
   st().live.insert(p);
   return p;
 }
@@ -251,8 +253,10 @@ long pinned_kb() {
 /// @param offset Object offset.
 /// @param fd Segment descriptor.
 /// @param noreplace Whether the address must not be mapped yet (no reservation).
+/// @param remote Whether the range is another process's memory (an imported handle or an opened
+///        IPC segment), which YASAI_FIO_UNORDERED_IMPORTS makes an unordered FIO window.
 /// @return True on success.
-bool place_locked(uint64_t va, size_t size, size_t offset, int fd, bool noreplace) {
+bool place_locked(uint64_t va, size_t size, size_t offset, int fd, bool noreplace, bool remote) {
   int flags = MAP_SHARED | (noreplace ? MAP_FIXED_NOREPLACE : MAP_FIXED);
   void *r = mmap(reinterpret_cast<void *>(va), size, PROT_READ | PROT_WRITE, flags, fd,
                  off_t(offset));
@@ -263,11 +267,15 @@ bool place_locked(uint64_t va, size_t size, size_t offset, int fd, bool noreplac
     return false;
   }
   host_window::add(va, size, host_window::range_kind::device);
-  // yasai: with YASAI_FIO_UNORDERED_IMPORTS, every shared device range is also an unordered FIO
-  // window, so writes into a peer's buffer become visible out of order (the FIO fabric model).
-  // The negative control uses it to show NCCL's P2P path fails over such a window.
-  static const bool fio_unordered = getenv("YASAI_FIO_UNORDERED_IMPORTS") != nullptr;
-  if (fio_unordered) fio_window::add(va, size, getenv("YASAI_FIO_WINDOW_RECORD") != nullptr);
+  // yasai: with YASAI_FIO_UNORDERED_IMPORTS, a range of another process's memory (an opened
+  // legacy IPC handle, or a cuMemMap of an imported handle) is also an unordered FIO window, so
+  // writes into a peer's buffer become visible out of order (the FIO fabric model); the
+  // process's own memory stays ordinary local memory. YASAI_FIO_UNORDERED_IMPORTS=all marks
+  // every shared range, own allocations included (the behaviour before 2026-10-24 evening).
+  static const char *fio_mode = getenv("YASAI_FIO_UNORDERED_IMPORTS");
+  static const bool fio_all = fio_mode && strcmp(fio_mode, "all") == 0;
+  if (fio_mode && fio_mode[0] && (remote || fio_all))
+    fio_window::add(va, size, getenv("YASAI_FIO_WINDOW_RECORD") != nullptr);
   return true;
 }
 
@@ -410,7 +418,7 @@ bool convert_anon_locked(uint64_t b, allocation &a) {
   }
   copy_nonzero(static_cast<char *>(tmp), reinterpret_cast<const char *>(b), len);
   munmap(tmp, len);
-  if (!place_locked(b, len, 0, fd, false)) {
+  if (!place_locked(b, len, 0, fd, false, false)) {
     close(fd);
     return false;
   }
@@ -579,7 +587,7 @@ bool alloc_device(uint64_t va, size_t size) {
   int fd = new_memfd(len);
   if (fd < 0) return false;
   std::lock_guard<std::mutex> lock(st().mu);
-  if (!place_locked(va, len, 0, fd, true)) {
+  if (!place_locked(va, len, 0, fd, true, false)) {
     close(fd);
     return false;
   }
@@ -625,6 +633,7 @@ phys *import_fd(int fd) {
   }
   std::lock_guard<std::mutex> lock(st().mu);
   phys *p = wrap_locked(d, size_t(sb.st_size));
+  p->imported = true;
   if (h) {
     p->multicast = true;
     p->hdr = h;
@@ -691,7 +700,7 @@ bool map(uint64_t va, size_t size, size_t offset, phys *p) {
     }
     host_window::add(va, size, host_window::range_kind::device);
     p->anon_va = va;
-  } else if (!convert_phys_locked(p) || !place_locked(va, size, offset, p->fd, false)) {
+  } else if (!convert_phys_locked(p) || !place_locked(va, size, offset, p->fd, false, p->imported)) {
     return false;
   }
   p->refs.fetch_add(1);
@@ -833,7 +842,7 @@ bool ipc_export(uint64_t addr, const read_fn &read_old, std::string *ref, uint64
       copy_nonzero(static_cast<char *>(tmp) + off, buf.data(), n);
     }
     munmap(tmp, len);
-    if (!place_locked(b, len, 0, fd, true)) {
+    if (!place_locked(b, len, 0, fd, true, false)) {
       close(fd);
       return false;
     }
@@ -890,7 +899,7 @@ bool ipc_open(const char *ref, size_t size, uint64_t va) {
   }
   std::lock_guard<std::mutex> lock(st().mu);
   const size_t len = round_up(size, kPage);
-  if (!place_locked(va, len, 0, fd, true)) {
+  if (!place_locked(va, len, 0, fd, true, true)) {
     close(fd);
     return false;
   }
