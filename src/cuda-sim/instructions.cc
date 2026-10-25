@@ -1072,21 +1072,27 @@ void ptx_thread_info::set_wmma_vector_operand_values(
 #define MY_EXCH(a, b) b
 
 // yasai: abs and neg of the 16-bit float types (.f16, .bf16, .f16x2, .bf16x2): the sign bit of
-// each half is cleared (abs) or flipped (neg), which is also what the hardware returns for NaN
-// inputs (the PTX ISA leaves the NaN result unspecified). .ftz is not modeled, as for the other
-// instructions. DeepGEMM's sm100_mega_mhc uses abs.bf16x2. Returns false for other types.
+// each half is cleared (abs) or flipped (neg); a NaN half gives the canonical NaN 0x7FFF, as an
+// RTX 5090 returns (the PTX ISA leaves the NaN result unspecified). .ftz is not modeled, as for
+// the other instructions. DeepGEMM's sm100_mega_mhc uses abs.bf16x2. Returns false for other
+// types.
 static bool yasai_half_sign_op(const ptx_instruction *pI, ptx_thread_info *thread, bool is_abs) {
   const unsigned t = pI->get_type();
   const bool scalar = t == F16_TYPE || t == BF16_TYPE;
   if (!scalar && t != F16X2_TYPE) return false;
+  const bool bf16 = t == BF16_TYPE || pI->is_bf16x2();
   const operand_info &dst = pI->dst();
   const unsigned io_type = scalar ? B16_TYPE : B32_TYPE;
   const uint32_t a = thread->get_operand_value(pI->src1(), dst, io_type, thread, 1).u32;
-  const uint32_t sign = scalar ? 0x8000u : 0x80008000u;
+  const uint16_t exp_mask = bf16 ? 0x7F80u : 0x7C00u, man_mask = bf16 ? 0x007Fu : 0x03FFu;
   ptx_reg_t d;
   d.u64 = 0;
-  d.u32 = is_abs ? (a & ~sign) : (a ^ sign);
-  if (scalar) d.u32 &= 0xFFFFu;
+  for (int h = 0; h < (scalar ? 1 : 2); ++h) {
+    const uint16_t x = uint16_t(a >> (16 * h));
+    const bool nan = (x & exp_mask) == exp_mask && (x & man_mask) != 0;
+    const uint16_t r = nan ? 0x7FFFu : uint16_t(is_abs ? (x & 0x7FFFu) : (x ^ 0x8000u));
+    d.u32 |= uint32_t(r) << (16 * h);
+  }
   thread->set_operand_value(dst, d, io_type, thread, pI);
   return true;
 }
