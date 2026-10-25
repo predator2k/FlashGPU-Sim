@@ -927,6 +927,24 @@ wmma_spec: WMMA_DIRECTIVE LAYOUT CONFIGURATION{recognizer->add_space_spec(global
 mma_spec: CONFIGURATION LAYOUT LAYOUT scalar_type scalar_type scalar_type scalar_type{recognizer->add_mma_option($1);recognizer->add_mma_option($2);recognizer->add_mma_option($3);}
 	/* yasai: .satfinite between the layouts and the types (integer mma.sync, ThunderKittens) */
 	| CONFIGURATION LAYOUT LAYOUT SATFINITE_OPTION scalar_type scalar_type scalar_type scalar_type{recognizer->add_mma_option($1);recognizer->add_mma_option($2);recognizer->add_mma_option($3);recognizer->add_option(SATFINITE_OPTION);}
+	/* yasai: .kind, .block_scale and .scale_vec between the layouts and the types (TileLang's
+	   SM120 NVFP4 GEMM writes mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale...) */
+	| CONFIGURATION LAYOUT LAYOUT mma_mid_option_list scalar_type scalar_type scalar_type scalar_type{recognizer->add_mma_option($1);recognizer->add_mma_option($2);recognizer->add_mma_option($3);}
+	;
+
+/* yasai: options of the block-scaled mma.sync that may stand after the layouts. */
+mma_mid_option_list: mma_mid_option
+	| mma_mid_option mma_mid_option_list
+	;
+
+mma_mid_option: TCGEN05_KIND_F8F6F4_OPTION { recognizer->add_option(TCGEN05_KIND_F8F6F4_OPTION); }
+	| TCGEN05_KIND_MXF8F6F4_OPTION { recognizer->add_option(TCGEN05_KIND_MXF8F6F4_OPTION); }
+	| TCGEN05_KIND_MXF4_OPTION { recognizer->add_option(TCGEN05_KIND_MXF4_OPTION); }
+	| TCGEN05_KIND_MXF4NVF4_OPTION { recognizer->add_option(TCGEN05_KIND_MXF4NVF4_OPTION); }
+	| TCGEN05_BLOCK_SCALE_OPTION { recognizer->add_option(TCGEN05_BLOCK_SCALE_OPTION); }
+	| TCGEN05_SCALE_VEC_1X_OPTION { recognizer->add_option(TCGEN05_SCALE_VEC_1X_OPTION); }
+	| TCGEN05_SCALE_VEC_2X_OPTION { recognizer->add_option(TCGEN05_SCALE_VEC_2X_OPTION); }
+	| TCGEN05_SCALE_VEC_4X_OPTION { recognizer->add_option(TCGEN05_SCALE_VEC_4X_OPTION); }
 	;
 
 vp_spec: WMMA_DIRECTIVE LAYOUT CONFIGURATION{recognizer->add_space_spec(global_space,0);recognizer->add_ptr_spec(global_space);recognizer->add_wmma_option($1);recognizer->add_wmma_option($2);recognizer->add_wmma_option($3);}
