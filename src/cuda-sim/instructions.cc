@@ -456,7 +456,8 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
         // Check if this is a 64-bit special register (e.g., %clock64).
         int builtin_id = op.get_int();
         if ((builtin_id & 0xFFFF) == CLOCK64_REG ||
-            (builtin_id & 0xFFFF) == GLOBALTIMER_REG) {
+            (builtin_id & 0xFFFF) == GLOBALTIMER_REG ||
+            (builtin_id & 0xFFFF) == GRIDID_REG) {
           result.u64 = get_builtin_u64(builtin_id, op.get_addr_offset());
         } else {
           result.u32 = get_builtin(builtin_id, op.get_addr_offset());

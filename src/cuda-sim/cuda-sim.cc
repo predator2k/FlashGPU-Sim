@@ -3665,9 +3665,17 @@ int yasai_env_int(const char *name, int dflt) {
 
 }  // namespace
 
+// yasai: tensor memory is kept per hardware CTA slot (TMEM scope (0, slot)) and cleared when the
+// slot's CTA retires, so a kernel that allocates TMEM without clusters runs interleaved like any
+// other kernel: DeepGEMM's persistent mega_mhc CTAs wait for each other's split arrivals and hung
+// when they ran one at a time. Cluster launches stay exclusive unless cooperative, and
+// cooperative cluster launches that allocate TMEM stay exclusive, because the CTA pair of
+// cta_group::2 addresses its peer's TMEM by slot (slot & ~1, slot | 1), which holds only when
+// one cluster's CTAs take consecutive fresh slots.
 bool yasai_func_run::is_exclusive(kernel_info_t &kernel) {
+  if (kernel.cluster_size() <= 1) return false;
   if (kernel.yasai_cooperative()) return kernel.entry()->yasai_uses_tmem();
-  return kernel.cluster_size() > 1 || kernel.entry()->yasai_uses_tmem();
+  return true;
 }
 
 yasai_func_run::yasai_func_run(cuda_sim *sim, kernel_info_t &kernel, bool openCL)
@@ -3846,8 +3854,13 @@ bool yasai_func_run::refill(group &g, unsigned pos) {
 }
 
 void yasai_func_run::retire(group &g) {
+  flash_gpgpu_sim::tcgen05_tmem_manager_t &tmem =
+      m_sim->gpgpu_ctx->the_gpgpusim->g_the_gpu->get_tcgen05_tmem_manager();
   for (functionalCoreSim *core : g.cores) {
     yasai_func::mbar_reset_cta(core->yasai_cta_key());
+    // The retired CTA's tensor memory (scope: SM 0, which functional threads report, and the
+    // CTA's hardware slot), so the next CTA in the slot allocates from an empty TMEM.
+    if (m_uses_tmem) tmem.clear_cta(0, core->yasai_hw_cta());
     delete core;
   }
   g.cores.clear();

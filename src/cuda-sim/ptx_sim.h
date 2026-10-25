@@ -513,6 +513,8 @@ class ptx_thread_info {
 
   unsigned get_builtin(int builtin_id, unsigned dim_mod);
   unsigned long long get_builtin_u64(int builtin_id, unsigned dim_mod);
+  // yasai: value of %gridid for this thread's launch (one more than its kernel uid).
+  unsigned long long yasai_gridid() const;
 
   void set_done();
   bool is_done() const { return m_thread_done; }

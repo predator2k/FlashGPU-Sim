@@ -201,6 +201,8 @@ unsigned long long ptx_thread_info::get_builtin_u64(int builtin_id,
                                                     unsigned dim_mod) {
   assert(m_valid);
   switch ((builtin_id & 0xFFFF)) {
+    case GRIDID_REG:
+      return yasai_gridid();
     case CLOCK64_REG:
       // Return full 64-bit cycle counter for %clock64 special register
       return m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle;
@@ -217,6 +219,15 @@ unsigned long long ptx_thread_info::get_builtin_u64(int builtin_id,
       // For other builtins, return 32-bit value zero-extended to 64-bit
       return (unsigned long long)get_builtin(builtin_id, dim_mod);
   }
+}
+
+// yasai: %gridid is the PTX ISA's temporal grid identifier, a 64-bit value that differs between
+// launches. It was always 0, and DeepGEMM's persistent kernels (mega_mhc, mega_moe) tag their
+// global split barriers with it, so a barrier left complete by the previous launch looked
+// complete to the next one. The value is one more than the launch's kernel uid, which is unique
+// in the process.
+unsigned long long ptx_thread_info::yasai_gridid() const {
+  return 1ull + m_kernel.get_uid();
 }
 
 unsigned ptx_thread_info::get_builtin(int builtin_id, unsigned dim_mod) {
@@ -279,7 +290,7 @@ unsigned ptx_thread_info::get_builtin(int builtin_id, unsigned dim_mod) {
       }
     }
     case GRIDID_REG:
-      return m_gridid;
+      return (unsigned)yasai_gridid();
     case LANEID_REG:
       return get_hw_tid() % m_core->get_warp_size();
     // yasai: lane masks relative to %laneid (they returned 0 with a warning).

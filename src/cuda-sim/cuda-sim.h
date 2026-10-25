@@ -108,6 +108,9 @@ class functionalCoreSim : public core_t {
   // yasai: the CTA's own shared memory (before joining a cluster) and the uid of its CTA.
   memory_space *yasai_shared_memory() const;
   uint64_t yasai_cta_key() const;
+  // yasai: the hardware CTA slot the core holds (yasai_acquire_cta_slot), which is the cta_id of
+  // its TMEM scope.
+  unsigned yasai_hw_cta() const { return m_yasai_hw_cta; }
   virtual void warp_exit(unsigned warp_id);
   virtual bool warp_waiting_at_barrier(unsigned warp_id) const {
     return (m_warpAtBarrier[warp_id] || !(m_liveThreadCount[warp_id] > 0));
@@ -171,8 +174,11 @@ class cuda_sim;
  *     device properties the application sees, not from the functional cores; divided by
  *     the cluster size) when CTA interleaving is on: YASAI_CTA_INTERLEAVE=1;
  *   * one otherwise (CTA-at-a-time, the former order).
- * A kernel that allocates tensor memory, or launches with clusters (except cooperatively), is
- * exclusive: it runs with one group and no other kernel runs beside it. Checkpointing
+ * A kernel that launches with clusters, except cooperatively without tensor memory, is
+ * exclusive: it runs with one group and no other kernel runs beside it. Tensor memory is kept
+ * per CTA slot, so a TMEM kernel without clusters interleaves like any other kernel; each CTA
+ * has its own 512 columns (on hardware the CTAs of one SM share them, and tcgen05.alloc waits
+ * while they are taken). Checkpointing
  * (checkpoint_option) uses the former loop, run to completion by the constructor.
  * Each active CTA's core holds its own hardware CTA slot from the pool
  * (yasai_acquire_cta_slot: shared memory, CTA, warp, mbarrier, tcgen05 and local memory state),
