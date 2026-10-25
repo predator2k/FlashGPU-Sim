@@ -4343,7 +4343,7 @@ void isspacep_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   }
 
   ptx_reg_t p;
-  p.pred = t ? 1 : 0;
+  p.pred = t ? 0 : 1;  // yasai: predicates are stored inverted (zero flag): 0 means true
 
   thread->set_reg(dst.get_symbol(), p);
 }
