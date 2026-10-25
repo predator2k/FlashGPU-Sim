@@ -1071,7 +1071,28 @@ void ptx_thread_info::set_wmma_vector_operand_values(
 
 #define MY_EXCH(a, b) b
 
+// yasai: abs and neg of the 16-bit float types (.f16, .bf16, .f16x2, .bf16x2): the sign bit of
+// each half is cleared (abs) or flipped (neg), which is also what the hardware returns for NaN
+// inputs (the PTX ISA leaves the NaN result unspecified). .ftz is not modeled, as for the other
+// instructions. DeepGEMM's sm100_mega_mhc uses abs.bf16x2. Returns false for other types.
+static bool yasai_half_sign_op(const ptx_instruction *pI, ptx_thread_info *thread, bool is_abs) {
+  const unsigned t = pI->get_type();
+  const bool scalar = t == F16_TYPE || t == BF16_TYPE;
+  if (!scalar && t != F16X2_TYPE) return false;
+  const operand_info &dst = pI->dst();
+  const unsigned io_type = scalar ? B16_TYPE : B32_TYPE;
+  const uint32_t a = thread->get_operand_value(pI->src1(), dst, io_type, thread, 1).u32;
+  const uint32_t sign = scalar ? 0x8000u : 0x80008000u;
+  ptx_reg_t d;
+  d.u64 = 0;
+  d.u32 = is_abs ? (a & ~sign) : (a ^ sign);
+  if (scalar) d.u32 &= 0xFFFFu;
+  thread->set_operand_value(dst, d, io_type, thread, pI);
+  return true;
+}
+
 void abs_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  if (yasai_half_sign_op(pI, thread, true)) return;
   ptx_reg_t a, d;
   const operand_info &dst = pI->dst();
   const operand_info &src1 = pI->src1();
@@ -5730,6 +5751,7 @@ void mul_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 }
 
 void neg_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  if (yasai_half_sign_op(pI, thread, false)) return;
   ptx_reg_t src1_data, src2_data, data;
 
   const operand_info &dst = pI->dst();
