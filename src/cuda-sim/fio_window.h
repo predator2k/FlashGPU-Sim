@@ -19,7 +19,10 @@
 // (no kernel running, for example after a kernel end or during a host sync), the drainer advances
 // the clock to the next deadline itself, one deadline at a time (YASAI_FIO_WINDOW_IDLE_STEP_US
 // apart), instead of flushing everything at once; a consumer in another process can still see a
-// flag before the data across a kernel boundary.
+// flag before the data across a kernel boundary. The drainer also takes one such step when kernels
+// run but the clock has not moved for YASAI_FIO_WINDOW_STALL_US (default 2000 us of wall time):
+// a consumer that spins on its own memory for a flag that a peer writes through a window touches
+// no window, so the clock would otherwise stand still and the write would never land.
 //
 // fence.*.sys and the completion MMIO block the issuing thread until all of its earlier stores are
 // visible: they advance the clock to the last pending deadline and deliver every piece in deadline

@@ -57,6 +57,12 @@ struct Config {
   uint64_t seed;         ///< RNG seed (YASAI_FIO_WINDOW_SEED, default 1)
   uint64_t poll_us;      ///< drainer poll interval in microseconds (YASAI_FIO_WINDOW_POLL_US, default 20)
   uint64_t idle_step_us; ///< pause between idle clock steps (YASAI_FIO_WINDOW_IDLE_STEP_US, default 20)
+  /// Wall time without any clock tick after which a busy process takes one clock step itself
+  /// (YASAI_FIO_WINDOW_STALL_US, default 2000; 0 disables). A consumer that polls its own memory
+  /// for a flag a peer writes through a window does not touch a window, so without this the clock
+  /// stands still while kernels spin and a pending write never lands, against the eventual
+  /// delivery the model promises.
+  uint64_t stall_us;
   uint64_t max_pending_bytes;  ///< cap on pending memory (YASAI_FIO_WINDOW_MAX_PENDING_MB, default 256)
   bool cap_fatal;        ///< abort instead of delivering early at the cap (YASAI_FIO_WINDOW_CAP_FATAL=1)
   /// Keep the write order per byte (YASAI_FIO_WINDOW_SAME_ADDR_ORDER=1). Default 0, the FIO base
@@ -94,6 +100,7 @@ Config &config() {
     cfg->seed = env_u64("YASAI_FIO_WINDOW_SEED", 1);
     cfg->poll_us = std::max<uint64_t>(1, env_u64("YASAI_FIO_WINDOW_POLL_US", 20));
     cfg->idle_step_us = env_u64("YASAI_FIO_WINDOW_IDLE_STEP_US", 20);
+    cfg->stall_us = env_u64("YASAI_FIO_WINDOW_STALL_US", 2000);
     cfg->max_pending_bytes = std::max<uint64_t>(1, env_u64("YASAI_FIO_WINDOW_MAX_PENDING_MB", 256)) << 20;
     cfg->cap_fatal = env_u64("YASAI_FIO_WINDOW_CAP_FATAL", 0) != 0;
     cfg->same_addr_order = env_u64("YASAI_FIO_WINDOW_SAME_ADDR_ORDER", 0) != 0;
@@ -237,6 +244,8 @@ FILE *g_record = nullptr;
 /// the largest pending memory.
 uint64_t g_stat_stores = 0, g_stat_pieces = 0, g_stat_flushed = 0, g_stat_fences = 0;
 uint64_t g_stat_idle_steps = 0, g_stat_cap_forced = 0, g_stat_peak_bytes = 0;
+/// Clock steps taken while kernels ran but the clock stood still (Config::stall_us).
+uint64_t g_stat_stall_steps = 0;
 
 /// Writes one transport record line when recording is on.
 void record(const char *kind, uint64_t addr, size_t bytes) {
@@ -286,11 +295,12 @@ void deliver_all_locked() {
 void print_stats() {
   Config &c = config();
   fprintf(stderr, "yasai fio_window stats: stores=%llu pieces=%llu flushed=%llu fences=%llu "
-          "idle_steps=%llu cap_forced=%llu peak_pending_mb=%.1f tear=%llu delay=%llu dist=%s "
+          "idle_steps=%llu stall_steps=%llu cap_forced=%llu peak_pending_mb=%.1f tear=%llu delay=%llu dist=%s "
           "alpha=%.2f seed=%llu flush=%s clock=%s same_addr_order=%d\n",
           (unsigned long long)g_stat_stores, (unsigned long long)g_stat_pieces,
           (unsigned long long)g_stat_flushed, (unsigned long long)g_stat_fences,
-          (unsigned long long)g_stat_idle_steps, (unsigned long long)g_stat_cap_forced,
+          (unsigned long long)g_stat_idle_steps, (unsigned long long)g_stat_stall_steps,
+          (unsigned long long)g_stat_cap_forced,
           g_stat_peak_bytes / 1048576.0, (unsigned long long)c.tear_unit,
           (unsigned long long)c.delay_max, c.dist == delay_dist::pareto ? "pareto" : "uniform",
           c.alpha, (unsigned long long)c.seed, c.strict ? "strict" : "kernel_end",
@@ -318,10 +328,13 @@ void at_exit() {
 }
 
 /// Drainer thread: delivers pieces whose deadline the shared clock has passed; when no kernel of
-/// this process runs, advances the clock to the next deadline itself, one deadline at a time.
+/// this process runs, or kernels run but the clock has not moved for Config::stall_us, advances
+/// the clock to the next deadline itself, one deadline at a time.
 void drainer() {
   Config &cfg = config();
   std::unique_lock<std::mutex> lock(mu());
+  uint64_t seen_clock = ~0ull;
+  auto seen_at = std::chrono::steady_clock::now();
   for (;;) {
     // Nothing pending: sleep until a store or the exit handler wakes the thread. Otherwise poll
     // the clock (busy GPU) or take the next idle step (idle GPU).
@@ -336,10 +349,19 @@ void drainer() {
     PendingSet &p = pending();
     if (p.by_time.empty()) continue;
     drain_locked(clock_now());
-    if (g_running_kernels == 0 && !p.by_time.empty()) {
+    const auto wall = std::chrono::steady_clock::now();
+    if (clock_now() != seen_clock) seen_clock = clock_now(), seen_at = wall;
+    const bool idle = g_running_kernels == 0;
+    const bool stalled = !idle && cfg.stall_us != 0 &&
+                         wall - seen_at >= std::chrono::microseconds(cfg.stall_us);
+    if ((idle || stalled) && !p.by_time.empty()) {
       clock_advance_to((*p.by_time.begin())->deadline);
       drain_locked(clock_now());
-      g_stat_idle_steps++;
+      if (idle)
+        g_stat_idle_steps++;
+      else
+        g_stat_stall_steps++;
+      seen_clock = clock_now(), seen_at = wall;
     }
   }
 }
