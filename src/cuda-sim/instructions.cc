@@ -4319,13 +4319,25 @@ void isspacep_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   unsigned smid = thread->get_hw_sid();
   unsigned hwtid = thread->get_hw_tid();
 
+  // yasai: the cases fell through to abort(), so every isspacep stopped the simulator (NVSHMEM's
+  // barrier, broadcast and other collectives use isspacep.shared). Generic addresses of the const
+  // and param spaces are not modeled; isspacep.const and .param answer false.
   switch (space.get_type()) {
     case shared_space:
       t = isspace_shared(smid, addr);
+      break;
     case local_space:
       t = isspace_local(smid, hwtid, addr);
+      break;
     case global_space:
-      t = isspace_global(addr);
+      t = isspace_global(addr) && !isspace_shared(smid, addr) && !isspace_local(smid, hwtid, addr);
+      break;
+    case const_space:
+    case param_space_kernel:
+    case param_space_local:
+    case param_space_unclassified:
+      t = false;
+      break;
     default:
       abort();
   }
