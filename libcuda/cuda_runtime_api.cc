@@ -3910,12 +3910,16 @@ __host__ cudaError_t CUDARTAPI cudaMemset(void *mem, int c, size_t count) {
 // memset operation is done but i think its not async?
 __host__ cudaError_t CUDARTAPI cudaMemsetAsync(void *mem, int c, size_t count,
                                                cudaStream_t stream = 0) {
+  // yasai: the calls used to pass "stream = 0", an assignment, so every cudaMemsetAsync ran on
+  // the legacy default stream. On a non-blocking stream (NCCL's deviceStream) the memset could
+  // then run after copies queued behind it: NCCL's initChannel zeroes channel->devPeers and then
+  // copies the peer pointers in, and DeepSpeed ZeRO-3 (z3w2) hung with a NULL peer pointer.
   if (yasai_capture_memset(mem, c, count, stream)) return g_last_cudaError = cudaSuccess;
-  if (!yasai_rec::Recorder::get().on()) return cudaMemsetAsyncInternal(mem, c, count, stream = 0);
+  if (!yasai_rec::Recorder::get().on()) return cudaMemsetAsyncInternal(mem, c, count, stream);
   const uint64_t t0 = yasai_rec::mono_ns();
   const uint32_t corr = yasai_rec::Recorder::get().corr();
   const void *recorded_stream = stream;
-  const cudaError_t ret = cudaMemsetAsyncInternal(mem, c, count, stream = 0);
+  const cudaError_t ret = cudaMemsetAsyncInternal(mem, c, count, stream);
   yasai_rec_memset("cudaMemsetAsync", t0, corr, ret, count, c, recorded_stream);
   return ret;
 }
