@@ -2775,9 +2775,14 @@ void call_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   // through function tables).
   if (target_func->get_function_size() == 0 && yasai_func::g_lazy_load_name != nullptr)
     yasai_func::g_lazy_load_name(target_func->get_name().c_str());
+  // yasai: "PDOM analysis already done" was printed for every executed call by every thread
+  // (about 2e9 lines for __assertfail in one run, two 110 GB logs); it is printed only with
+  // YASAI_PDOM_VERBOSE=1.
+  static const bool pdom_verbose = getenv("YASAI_PDOM_VERBOSE") && atoi(getenv("YASAI_PDOM_VERBOSE")) != 0;
   if (target_func->is_pdom_set()) {
-    printf("GPGPU-Sim PTX: PDOM analysis already done for %s \n",
-           target_func->get_name().c_str());
+    if (pdom_verbose)
+      printf("GPGPU-Sim PTX: PDOM analysis already done for %s \n",
+             target_func->get_name().c_str());
   } else {
     printf("GPGPU-Sim PTX: finding reconvergence points for \'%s\'...\n",
            target_func->get_name().c_str());

@@ -3,6 +3,7 @@
 
 #include <iostream>
 #include <map>
+#include <cstdlib>
 
 #if (CUDART_VERSION >= 5000)
 #define __CUDA_RUNTIME_API_H__
@@ -153,9 +154,13 @@ void cuda_device_runtime::gpgpusim_cuda_launchDeviceV2(
                          << device_kernel_entry->get_name());
 
       // PDOM analysis is done for Parent kernel but not for child kernel.
+      // yasai: printed only with YASAI_PDOM_VERBOSE=1 (one line per device-side launch).
+      static const bool pdom_verbose =
+          getenv("YASAI_PDOM_VERBOSE") && atoi(getenv("YASAI_PDOM_VERBOSE")) != 0;
       if (device_kernel_entry->is_pdom_set()) {
-        printf("GPGPU-Sim PTX: PDOM analysis already done for %s \n",
-               device_kernel_entry->get_name().c_str());
+        if (pdom_verbose)
+          printf("GPGPU-Sim PTX: PDOM analysis already done for %s \n",
+                 device_kernel_entry->get_name().c_str());
       } else {
         printf("GPGPU-Sim PTX: finding reconvergence points for \'%s\'...\n",
                device_kernel_entry->get_name().c_str());

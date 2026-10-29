@@ -3693,9 +3693,12 @@ yasai_func_run::yasai_func_run(cuda_sim *sim, kernel_info_t &kernel, bool openCL
   const struct gpgpu_ptx_sim_info *kernel_info =
       ptx_sim_kernel_info(kernel_func_info);
 
+  // yasai: the "already done" line of every launch is printed only with YASAI_PDOM_VERBOSE=1.
+  static const bool pdom_verbose = getenv("YASAI_PDOM_VERBOSE") && atoi(getenv("YASAI_PDOM_VERBOSE")) != 0;
   if (kernel_func_info->is_pdom_set()) {
-    printf("GPGPU-Sim PTX: PDOM analysis already done for %s \n",
-           kernel.name().c_str());
+    if (pdom_verbose)
+      printf("GPGPU-Sim PTX: PDOM analysis already done for %s \n",
+             kernel.name().c_str());
   } else {
     printf("GPGPU-Sim PTX: finding reconvergence points for \'%s\'...\n",
            kernel.name().c_str());
