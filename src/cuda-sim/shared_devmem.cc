@@ -79,11 +79,14 @@ struct mc_header {
 /// Physical allocation or multicast object.
 struct phys {
   uint64_t magic;          ///< kPhysMagic while alive
-  int fd;                  ///< this process's descriptor of the segment
+  int fd;                  ///< this process's descriptor of the segment (-1 while anonymous)
   size_t size;             ///< length of the segment (bytes per device for multicast objects)
   bool multicast;          ///< whether this is a multicast object
   mc_header *hdr;          ///< mapped table of a multicast object
   std::atomic<int> refs;   ///< handles, mappings and bindings that keep the object alive
+  bool anon;               ///< cuMemCreate allocation without a segment yet: at most one
+                           ///< whole-object mapping of private anonymous memory (anon_va)
+  uint64_t anon_va;        ///< address of that mapping, or 0 while it is not mapped
 };
 
 namespace {
@@ -194,6 +197,8 @@ phys *wrap_locked(int fd, size_t size) {
   p->multicast = false;
   p->hdr = nullptr;
   p->refs.store(1);
+  p->anon = false;
+  p->anon_va = 0;
   st().live.insert(p);
   return p;
 }
@@ -204,7 +209,7 @@ void release_locked(phys *p) {
   if (p->refs.fetch_sub(1) != 1) return;
   st().live.erase(p);
   if (p->hdr) munmap(p->hdr, sizeof(mc_header));
-  close(p->fd);
+  if (p->fd >= 0) close(p->fd);
   p->magic = 0;
   delete p;
 }
@@ -408,6 +413,65 @@ bool convert_anon_locked(uint64_t b, allocation &a) {
   return true;
 }
 
+/// Gives an anonymous cuMemCreate allocation its segment: a new memfd of the object's size and,
+/// when the object is mapped, a copy of the mapping's non-zero chunks, after which the segment
+/// replaces the anonymous mapping at the same address. The caller holds a quiesce when the
+/// object is mapped (no store may reach the old pages after the copy) and st().mu.
+/// @param p The object (anonymous).
+/// @return True on success; the object is unchanged on failure.
+bool convert_phys_locked(phys *p) {
+  if (!p->anon) return true;
+  int fd = new_memfd(p->size);
+  if (fd < 0) return false;
+  if (p->anon_va) {
+    if (const long kb = pinned_kb())
+      fprintf(stderr, "shared_devmem: WARNING: cuMem allocation at 0x%llx (%zu bytes) becomes a "
+              "shared segment while the process holds %ld kB of pinned memory; an RDMA "
+              "registration of it made earlier would keep its old pages "
+              "(YASAI_DEVMEM_EAGER_MEMFD=1 avoids the conversion)\n",
+              (unsigned long long)p->anon_va, p->size, kb);
+    void *tmp = mmap(nullptr, p->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (tmp == MAP_FAILED) {
+      close(fd);
+      return false;
+    }
+    copy_nonzero(static_cast<char *>(tmp), reinterpret_cast<const char *>(p->anon_va), p->size);
+    munmap(tmp, p->size);
+    void *r = mmap(reinterpret_cast<void *>(p->anon_va), p->size, PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_FIXED, fd, 0);
+    if (r == MAP_FAILED) {
+      fprintf(stderr, "shared_devmem: remapping cuMem allocation 0x%llx failed: %s\n",
+              (unsigned long long)p->anon_va, strerror(errno));
+      close(fd);
+      return false;
+    }
+  }
+  p->fd = fd;
+  p->anon = false;
+  p->anon_va = 0;
+  return true;
+}
+
+/// Whether an object is an anonymous cuMemCreate allocation that is mapped (converting it then
+/// needs a quiesce). Takes st().mu.
+/// @param p Object, or nullptr.
+/// @return True when a conversion of p would copy.
+bool phys_needs_copy(phys *p) {
+  std::lock_guard<std::mutex> lock(st().mu);
+  return p && st().live.count(p) && p->anon && p->anon_va;
+}
+
+/// Gives an anonymous cuMemCreate allocation its segment (convert_phys_locked), taking the
+/// quiesce when the object is mapped and then st().mu.
+/// @param p Object.
+/// @return True when the object has a segment afterwards.
+bool convert_phys(phys *p) {
+  std::unique_ptr<quiesce> q;
+  if (phys_needs_copy(p)) q.reset(new quiesce);
+  std::lock_guard<std::mutex> lock(st().mu);
+  return convert_phys_locked(p);
+}
+
 /// In a forked child: moves every cudaMalloc segment inherited from the parent into a segment
 /// of the child's own (the parent keeps using the old ones), and draws a new token. Refs held by
 /// peers name the parent's descriptors and stay valid for the parent. Anonymous allocations are
@@ -434,9 +498,12 @@ void after_fork_child() {
     close(a.seg->fd);
     a.seg->fd = fd;
   }
-  if (!s.maps.empty())
+  size_t shared_maps = 0;  // anonymous cuMem mappings are private copy-on-write memory already
+  for (auto &kv : s.maps)
+    if (!kv.second.p->anon) shared_maps++;
+  if (shared_maps)
     fprintf(stderr, "shared_devmem: %zu cuMem mappings made before fork stay shared with the "
-            "parent\n", s.maps.size());
+            "parent\n", shared_maps);
 }
 
 /// One-time setup: token, descriptor limit, fork handler, multicast hooks.
@@ -517,6 +584,13 @@ bool alloc_device(uint64_t va, size_t size) {
 phys *create(size_t size) {
   init_once();
   const size_t len = round_up(size ? size : 1, kGranularity);
+  if (!eager_memfd()) {
+    // No segment until the object is shared, pinned or mapped twice (convert_phys_locked).
+    std::lock_guard<std::mutex> lock(st().mu);
+    phys *p = wrap_locked(-1, len);
+    p->anon = true;
+    return p;
+  }
   int fd = new_memfd(len);
   if (fd < 0) return nullptr;
   std::lock_guard<std::mutex> lock(st().mu);
@@ -553,7 +627,10 @@ phys *import_fd(int fd) {
   return p;
 }
 
-int export_fd(phys *p) { return p ? fcntl(p->fd, F_DUPFD_CLOEXEC, 0) : -1; }
+int export_fd(phys *p) {
+  if (!p || !convert_phys(p)) return -1;
+  return fcntl(p->fd, F_DUPFD_CLOEXEC, 0);
+}
 
 void retain(phys *p) {
   if (p) p->refs.fetch_add(1);
@@ -591,10 +668,24 @@ void unreserve(uint64_t va, size_t size) { munmap(reinterpret_cast<void *>(va), 
 
 bool map(uint64_t va, size_t size, size_t offset, phys *p) {
   if (!p || size == 0) return false;
+  // An anonymous allocation keeps private memory only for one mapping of the whole object; a
+  // second or partial mapping gives it its segment first (the quiesce comes before st().mu).
+  std::unique_ptr<quiesce> q;
+  if (phys_needs_copy(p)) q.reset(new quiesce);
   std::lock_guard<std::mutex> lock(st().mu);
   if (p->multicast) {
     host_window::add(va, size, host_window::range_kind::multicast, p, offset);
-  } else if (!place_locked(va, size, offset, p->fd, false)) {
+  } else if (p->anon && !p->anon_va && offset == 0 && size == p->size) {
+    void *r = mmap(reinterpret_cast<void *>(va), size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+    if (r == MAP_FAILED || reinterpret_cast<uint64_t>(r) != va) {
+      fprintf(stderr, "shared_devmem: anonymous mmap at 0x%llx (%zu bytes) failed: %s\n",
+              (unsigned long long)va, size, r == MAP_FAILED ? strerror(errno) : "moved");
+      return false;
+    }
+    host_window::add(va, size, host_window::range_kind::device);
+    p->anon_va = va;
+  } else if (!convert_phys_locked(p) || !place_locked(va, size, offset, p->fd, false)) {
     return false;
   }
   p->refs.fetch_add(1);
@@ -604,11 +695,23 @@ bool map(uint64_t va, size_t size, size_t offset, phys *p) {
 
 bool unmap(uint64_t va, size_t size) {
   (void)size;
+  // An anonymous allocation that stays referenced (its handle, a binding) keeps its contents for
+  // a later mapping: it gets its segment before the anonymous pages go away.
+  phys *ap = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(st().mu);
+    auto it = st().maps.find(va);
+    if (it != st().maps.end() && it->second.p->anon && it->second.p->anon_va == va &&
+        it->second.p->refs.load() > 1)
+      ap = it->second.p;
+  }
+  if (ap) convert_phys(ap);
   std::lock_guard<std::mutex> lock(st().mu);
   state &s = st();
   auto it = s.maps.find(va);
   if (it == s.maps.end()) return false;
   phys *p = it->second.p;
+  if (p->anon && p->anon_va == va) p->anon_va = 0;  // the object is released below
   const size_t len = it->second.size;
   host_window::remove(va);
   if (!p->multicast) {
@@ -739,10 +842,15 @@ bool export_needs_copy(uint64_t addr) { return range_needs_copy(addr, 1); }
 bool range_needs_copy(uint64_t addr, size_t bytes) {
   std::lock_guard<std::mutex> lock(st().mu);
   state &s = st();
+  const uint64_t end = addr + (bytes ? bytes : 1);
   auto it = s.allocs.upper_bound(addr);
   if (it != s.allocs.begin()) --it;
-  for (; it != s.allocs.end() && it->first < addr + (bytes ? bytes : 1); ++it)
+  for (; it != s.allocs.end() && it->first < end; ++it)
     if (it->first + it->second.size > addr && it->second.anon) return true;
+  auto im = s.maps.upper_bound(addr);
+  if (im != s.maps.begin()) --im;
+  for (; im != s.maps.end() && im->first < end; ++im)
+    if (im->first + im->second.size > addr && im->second.p->anon) return true;
   return false;
 }
 
@@ -757,6 +865,11 @@ bool share_range(uint64_t addr, size_t bytes) {
   for (; it != s.allocs.end() && it->first < addr + (bytes ? bytes : 1); ++it)
     if (it->first + it->second.size > addr && it->second.anon)
       ok = convert_anon_locked(it->first, it->second) && ok;
+  auto im = s.maps.upper_bound(addr);
+  if (im != s.maps.begin()) --im;
+  for (; im != s.maps.end() && im->first < addr + (bytes ? bytes : 1); ++im)
+    if (im->first + im->second.size > addr && im->second.p->anon)
+      ok = convert_phys_locked(im->second.p) && ok;
   return ok;
 }
 
@@ -824,6 +937,7 @@ bool mc_bind(phys *mc, size_t mc_offset, phys *mem, size_t mem_offset, size_t si
   if (!mc || !mc->hdr || !mem || mem->multicast) return false;
   if (mc_offset + size > mc->hdr->size || mem_offset + size > mem->size) return false;
   init_once();
+  if (!convert_phys(mem)) return false;  // peers reach the bound memory through its segment
   uint32_t i = __atomic_fetch_add(&mc->hdr->nslots, 1u, __ATOMIC_ACQ_REL);
   if (int(i) >= kMaxMcSlots) return false;
   mc_slot &sl = mc->hdr->slots[i];
