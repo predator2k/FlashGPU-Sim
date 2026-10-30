@@ -6,7 +6,7 @@
 // descriptors, cuMemImportFromShareableHandle, cuMemMap) and through multicast objects
 // (cuMulticastCreate, cuMulticastBindMem, multimem.* instructions). RDMA NICs (rxe) register
 // device buffers with ibv_reg_mr. This module backs all of them with memfd segments:
-//   * Device memory (cuMemCreate allocations once mapped, and cudaMalloc memory once exported by
+//   * Device memory (cuMemCreate allocations once shared, and cudaMalloc memory once exported by
 //     legacy IPC) is a memfd mapped MAP_SHARED at its device address, which comes from the simulator's device heap. The device
 //     address therefore equals the host virtual address (identity mapping, as for mapped host
 //     memory), and the range is registered in host_window as device memory, so kernels, copies,
@@ -20,6 +20,14 @@
 //     that a pinning registration never holds pages that a later conversion replaces.
 //     YASAI_DEVMEM_HOST=0 restores the simulator's own storage for cudaMalloc (legacy IPC then
 //     moves an allocation into a memfd when it is first exported).
+//   * A cuMemCreate allocation likewise has no segment at first. Its first mapping of the whole
+//     object is private anonymous memory at the mapped address; it gets a memfd segment (the
+//     mapping's non-zero chunks copied, the segment mapped in its place) on its first
+//     cuMemExportToShareableHandle, a second or partial mapping, a multicast binding, a pinning
+//     registration (share_range), or an unmap while it is still referenced. NCCL's cuMem buffers
+//     and PyTorch's expandable segments reserve much more than they write, and a read of an
+//     untouched memfd page would allocate it. YASAI_DEVMEM_EAGER_MEMFD=1 creates the segment at
+//     once, as before.
 //   * A segment is reached from another process through its owner's descriptor, by the path
 //     /proc/<owner pid>/fd/<fd> (the "ref"). Legacy IPC handles and multicast bindings carry the
 //     ref; cuMem export hands out a duplicate descriptor that the importer receives over a Unix
