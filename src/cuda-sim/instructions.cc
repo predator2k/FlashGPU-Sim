@@ -4227,12 +4227,21 @@ void bmsk_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   thread->set_operand_value(dst, d, B32_TYPE, thread, pI);
 }
 
+static ptx_reg_t minmax_f32_pair(ptx_reg_t a, ptx_reg_t b, bool maximum);
+
 // yasai: redux.sync.op.type d, a, membermask: reduction of a over the active lanes of the warp
-// (op add/min/max for .u32/.s32, and/or/xor for .b32). Lanes are visited one after another, as
-// in vote_impl: the last active lane writes the result to every lane.
+// (op add/min/max for .u32/.s32, and/or/xor for .b32, min/max with optional .abs and .NaN for
+// .f32 on sm_100a). Lanes are visited one after another, as in vote_impl: the last active lane
+// writes the result to every lane. The .f32 forms follow min.f32/max.f32: NaN inputs are
+// ignored (all NaN gives NaN) unless .NaN is given, which returns the canonical NaN 0x7fffffff
+// when any input is NaN; +0 orders above -0; .abs takes the absolute value of every input.
+// Before, .f32 was reduced as unsigned bit patterns, so every negative value and -inf ranked
+// above every positive value (DeepGEMM's sm100 mega_gate picked expert 0 for every top-k slot).
 void redux_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   static thread_local bool first_in_warp = true;
   static thread_local int64_t acc;
+  static thread_local ptx_reg_t facc;
+  static thread_local bool fnan;
   static thread_local std::list<ptx_thread_info *> threads_in_warp;
   static thread_local unsigned last_tid;
   const unsigned t = pI->get_type();
@@ -4245,12 +4254,35 @@ void redux_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     while ((offset >= 0) && !pI->active(offset)) offset--;
     assert(offset >= 0);
     last_tid = (thread->get_hw_tid() - (thread->get_hw_tid() % pI->warp_size())) + offset;
+    facc.u64 = 0;
+    facc.u32 = 0x7fc00000u;  // NaN: the first non-NaN input replaces it
+    fnan = false;
     switch (op) {
       case ATOMIC_MIN: acc = is_signed ? INT32_MAX : int64_t(UINT32_MAX); break;
       case ATOMIC_MAX: acc = is_signed ? INT32_MIN : 0; break;
       case ATOMIC_AND: acc = int64_t(UINT32_MAX); break;
       default: acc = 0; break;
     }
+  }
+  if (t == F32_TYPE) {
+    if (op != ATOMIC_MIN && op != ATOMIC_MAX) {
+      printf("GPGPU-Sim PTX: redux operation 0x%x not supported for .f32\n", op);
+      abort();
+    }
+    ptx_reg_t x = thread->get_operand_value(pI->src1(), pI->dst(), t, thread, 1);
+    if (pI->is_abs()) x.u32 &= 0x7fffffffu;
+    if (std::isnan(x.f32))
+      fnan = true;
+    else
+      facc = minmax_f32_pair(facc, x, op == ATOMIC_MAX);
+    threads_in_warp.push_back(thread);
+    if (thread->get_hw_tid() == last_tid) {
+      ptx_reg_t d = facc;
+      if (fnan && pI->get_cmpop() == NAN_OPTION) d.u32 = 0x7fffffffu;
+      for (ptx_thread_info *th : threads_in_warp) th->set_operand_value(pI->dst(), d, t, th, pI);
+      first_in_warp = true;
+    }
+    return;
   }
   const uint32_t v = thread->get_operand_value(pI->src1(), pI->dst(), t, thread, 1).u32;
   const int64_t x = is_signed ? int64_t(int32_t(v)) : int64_t(v);
