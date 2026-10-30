@@ -1688,6 +1688,12 @@ cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = N
       dladdr(reinterpret_cast<void *>(&cudaLaunchInternalImpl), &self) != 0 &&
       (self.dli_fname == NULL || strcmp(self.dli_fname, stub.dli_fname) != 0)) {
     host_so = stub.dli_fname;
+    // dladdr names the main executable with an empty string; its path is /proc/self/exe.
+    if (host_so.empty()) {
+      char exe[4096];
+      const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+      if (n > 0) host_so.assign(exe, static_cast<size_t>(n));
+    }
   }
   rec.api("cudaLaunchKernel", t0, t1, corr, int(ret));
   rec.write("\"rec\":\"kernel\",\"start\":%llu,\"end\":%llu,\"dev\":0,\"ctx\":1,\"stream\":%u,"
