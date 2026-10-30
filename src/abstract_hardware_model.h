@@ -1414,7 +1414,13 @@ class core_t {
       }
     }
   }
-  virtual ~core_t() { free(m_thread); }
+  // yasai: the SIMT stacks go with the core. The functional mode creates a core per CTA, and
+  // without this every CTA of every launch kept one simt_stack per warp (about 5.5 kB per CTA of
+  // 8 warps), so long framework runs grew by gigabytes during initialization.
+  virtual ~core_t() {
+    deleteSIMTStack();
+    free(m_thread);
+  }
   virtual void warp_exit(unsigned warp_id) = 0;
   virtual bool warp_waiting_at_barrier(unsigned warp_id) const = 0;
   virtual void checkExecutionStatusAndUpdate(warp_inst_t &inst, unsigned t,
