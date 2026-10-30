@@ -1593,6 +1593,12 @@ class function_info {
   void get_reconvergence_pairs(gpgpu_recon_t *recon_points);
 
   unsigned get_function_size() { return m_instructions.size(); }
+  // yasai: PTX file the function's code was parsed from (the source file of its first
+  // instruction; the files are named after the library or JIT image they came from), or "" for
+  // a function without instructions. Used by the fakeenv kernel record for kernel identity.
+  const char *yasai_ptx_file() const {
+    return m_instructions.empty() ? "" : m_instructions.front()->source_file();
+  }
   // yasai: whether the function allocates tensor memory (tcgen05.alloc); such kernels run one
   // CTA at a time and alone, because the functional TMEM manager is one per process.
   bool yasai_uses_tmem() {
