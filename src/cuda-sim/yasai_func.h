@@ -239,6 +239,7 @@ struct ClusterState {
   std::vector<void *> smem;            // rank -> the CTA's own shared memory (memory_space *)
   std::vector<uint64_t> cta_key;       // rank -> the CTA's uid (functional mbarrier key)
   std::vector<void *> cores;           // rank -> the CTA's functionalCoreSim
+  std::vector<unsigned> hw_cta;        // rank -> the CTA's hardware slot (its TMEM scope)
   unsigned threads_total = 0;          // live threads of the cluster (cluster barrier count)
   unsigned barrier_arrived = 0;        // threads arrived in the current barrier.cluster phase
   unsigned barrier_phase = 0;          // completed barrier.cluster phases

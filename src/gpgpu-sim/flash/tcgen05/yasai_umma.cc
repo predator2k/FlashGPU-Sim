@@ -257,6 +257,16 @@ unsigned own_cta(ptx_thread_info *t) {
   return c == unsigned(-1) ? unsigned(t->get_flat_ctaid()) : c;
 }
 
+// Hardware slot (TMEM scope) of the CTA of cluster rank `rank`. The CTAs of a pair hold
+// whatever slots the pool gave them, which need not be 2k and 2k+1 when several clusters are
+// active at once, so the slot is taken from the executing cluster; `fallback` is used outside
+// a cluster.
+unsigned rank_cta(yasai_func::ClusterState *cl, unsigned rank, unsigned fallback) {
+  if (cl != nullptr && rank < cl->hw_cta.size())
+    return cl->hw_cta[rank];
+  return fallback;
+}
+
 // (lane, column) of accumulator element (m, n) of one CTA (m local to the CTA).
 void d_cell(unsigned m_cta, unsigned n_total, bool pair, bool ws, unsigned m,
             unsigned n, unsigned &lane, unsigned &col) {
@@ -581,7 +591,7 @@ void mma(const ptx_instruction *pI, ptx_thread_info *t) {
           smem_element(t, bd, b_mn, fb, n % n_cta, k, bits) * (b_neg ? -1 : 1);
   }
   for (unsigned c = 0; c < nctas; ++c) {
-    const tcgen05_tmem_scope_t sc = scope_of(t, lead_cta + c);
+    const tcgen05_tmem_scope_t sc = scope_of(t, rank_cta(cl, lead_rank + c, lead_cta + c));
     const uint64_t bits = cl != nullptr ? (uint64_t(lead_rank + c) << 24) : 0;
     const uint32_t d_lane0 = (d_addr >> 16) & 0xFFFF, d_col0 = d_addr & 0xFFFF;
     // N parts of the 2x2 / 1x4 datapath layouts (.ws, cta_group::2): part p
@@ -864,10 +874,9 @@ void cp(const ptx_instruction *pI, ptx_thread_info *t) {
   tcgen05_tmem_manager_t &mgr = t->get_gpu()->get_tcgen05_tmem_manager();
   const unsigned lane0 = (taddr >> 16) & 0xFFFF, col0 = taddr & 0xFFFF;
   for (unsigned c = 0; c < (pair ? 2u : 1u); ++c) {
-    const unsigned cta = pair ? ((me & ~1u) + c) : me;
-    const uint64_t bits =
-        cl != nullptr ? (uint64_t(pair ? ((my_rank & ~1u) + c) : my_rank) << 24)
-                      : 0;
+    const unsigned rank = pair ? ((my_rank & ~1u) + c) : my_rank;
+    const unsigned cta = pair ? rank_cta(cl, rank, (me & ~1u) + c) : me;
+    const uint64_t bits = cl != nullptr ? (uint64_t(rank) << 24) : 0;
     const tcgen05_tmem_scope_t sc = scope_of(t, cta);
     for (unsigned r = 0; r < rows; ++r)
       for (unsigned ch = 0; ch < row_bytes / 16; ++ch) {

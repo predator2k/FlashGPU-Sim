@@ -3852,6 +3852,7 @@ bool yasai_func_run::refill(group &g, unsigned pos) {
       g.state.smem.push_back(core->yasai_shared_memory());
       g.state.cta_key.push_back(core->yasai_cta_key());
       g.state.cores.push_back(core);
+      g.state.hw_cta.push_back(core->yasai_hw_cta());
       yasai_func::count_cta(false);
     }
     for (unsigned r = 0; r < m_csize; r++) g.cores[r]->yasai_join_cluster(&g.state, r);
