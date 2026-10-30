@@ -172,10 +172,12 @@ class cuda_sim;
  *     launch; CTA sampling is off because grid.sync counts every CTA);
  *   * the co-resident limit (the reported SM count x CTAs per SM for this kernel, from the
  *     device properties the application sees, not from the functional cores; divided by
- *     the cluster size) when CTA interleaving is on: YASAI_CTA_INTERLEAVE=1;
+ *     the cluster size) when CTA interleaving is on: YASAI_CTA_INTERLEAVE=1, cluster
+ *     launches included;
  *   * one otherwise (CTA-at-a-time, the former order).
  * A kernel that launches with clusters, except cooperatively without tensor memory, is
- * exclusive: it runs with one group and no other kernel runs beside it. Tensor memory is kept
+ * exclusive: no other kernel runs beside it, and without CTA interleaving it runs with one
+ * group, resetting tensor memory and mbarriers after each cluster. Tensor memory is kept
  * per CTA slot, so a TMEM kernel without clusters interleaves like any other kernel; each CTA
  * has its own 512 columns (on hardware the CTAs of one SM share them, and tcgen05.alloc waits
  * while they are taken). Checkpointing

@@ -3754,7 +3754,11 @@ yasai_func_run::yasai_func_run(cuda_sim *sim, kernel_info_t &kernel, bool openCL
   unsigned ngroups = 1;
   if (m_coop)
     ngroups = total_groups;  // the launch checked that the grid fits
-  else if (!m_exclusive && yasai_env_int("YASAI_CTA_INTERLEAVE", 0) == 1)
+  else if ((!m_exclusive || m_csize > 1) && yasai_env_int("YASAI_CTA_INTERLEAVE", 0) == 1)
+    // A cluster launch stays exclusive (no other kernel beside it) but keeps its co-resident
+    // clusters active together: a persistent kernel whose clusters wait for each other through
+    // global memory (DeepGEMM's mega_gate with 2-SM UMMA, ScoreBarrier over all its CTAs) never
+    // finishes when its clusters run one at a time.
     ngroups = std::max(1u, coresident / m_csize);
   ngroups = std::min(ngroups, std::max(1u, total_groups));
   m_sms = kernel.yasai_reported_sms() > 0 ? kernel.yasai_reported_sms() : nsm;
@@ -3922,9 +3926,11 @@ bool yasai_func_run::step() {
     }
     retire(*g);
     // yasai: functional mode reuses CTA ids across launches and TMEM per CTA; an exclusive
-    // kernel resets the tensor memory and the mbarriers after each CTA or cluster, as before.
-    // (mbarriers of concurrently running CTAs are keyed by their CTA uids.)
-    if (m_exclusive) {
+    // kernel that runs one group at a time resets the tensor memory and the mbarriers after each
+    // CTA or cluster, as before. With several groups active the reset would clear the state of
+    // the groups still running, so retire() frees only the retired CTAs' TMEM and mbarriers
+    // (mbarriers of concurrently running CTAs are keyed by their CTA uids).
+    if (m_exclusive && !m_interleaved) {
       gpgpu_ctx->the_gpgpusim->g_the_gpu->get_tcgen05_tmem_manager().reset();
       yasai_func::mbar_reset_all();
     }
