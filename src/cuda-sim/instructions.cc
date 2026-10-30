@@ -218,6 +218,33 @@ static inline uint16_t f16_bits_from_f32(float value, unsigned rounding_mode) {
   }
 }
 
+// yasai: f16 result of a scalar f16 operation computed exactly in double (the sum or difference
+// of two f16 values and the product of two are exact in double; a * b + c is exact unless the
+// exponents differ by more than 53 bits), rounded once with the instruction's rounding mode.
+static inline half f16_from_double(double value, unsigned rounding_mode) {
+  uint16_t bits;
+  switch (rounding_mode) {
+    case RZ_OPTION:
+    case RZI_OPTION:
+      bits = half_float::detail::float2half<std::round_toward_zero>(value);
+      break;
+    case RM_OPTION:
+    case RMI_OPTION:
+      bits = half_float::detail::float2half<std::round_toward_neg_infinity>(value);
+      break;
+    case RP_OPTION:
+    case RPI_OPTION:
+      bits = half_float::detail::float2half<std::round_toward_infinity>(value);
+      break;
+    default:
+      bits = half_float::detail::float2half<std::round_to_nearest>(value);
+      break;
+  }
+  half h;
+  std::memcpy(&h, &bits, sizeof bits);
+  return h;
+}
+
 static inline void set_fenv_rounding_mode(unsigned rounding_mode) {
   switch (rounding_mode) {
     case RN_OPTION:
@@ -1215,8 +1242,9 @@ void addp_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       data.s64 = src1_data.s64 + src2_data.s64 + (src3_data.pred & 0x4);
       break;
     case F16_TYPE:
-      data.f16 = src1_data.f16 + src2_data.f16;
-      break;  // assert(0); break;
+      data.f16 = f16_from_double(double(float(src1_data.f16)) + double(float(src2_data.f16)),
+                                 rounding_mode);
+      break;
     case F32_TYPE:
       data.f32 = src1_data.f32 + src2_data.f32;
       break;
@@ -1340,8 +1368,9 @@ void add_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       data.u64 = src1_data.u64 + src2_data.u64;
       break;
     case F16_TYPE:
-      data.f16 = src1_data.f16 + src2_data.f16;
-      break;  // assert(0); break;
+      data.f16 = f16_from_double(double(float(src1_data.f16)) + double(float(src2_data.f16)),
+                                 rounding_mode);
+      break;
     case F16X2_TYPE: {
       uint16_t s1lo = static_cast<uint16_t>(src1_data.u32 & 0xFFFFu);
       uint16_t s1hi = static_cast<uint16_t>((src1_data.u32 >> 16) & 0xFFFFu);
@@ -5164,7 +5193,8 @@ void mad_def(const ptx_instruction *pI, ptx_thread_info *thread,
           assert(0);
           break;
       }
-      d.f16 = a.f16 * b.f16 + c.f16;
+      d.f16 = f16_from_double(double(float(a.f16)) * double(float(b.f16)) + double(float(c.f16)),
+                              rounding_mode);  // yasai: one rounding (fused)
       if (pI->saturation_mode()) {
         if (d.f16 < 0)
           d.f16 = 0;
@@ -5708,7 +5738,7 @@ void mul_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
           break;
       }
 
-      d.f16 = a.f16 * b.f16;
+      d.f16 = f16_from_double(double(float(a.f16)) * double(float(b.f16)), rounding_mode);
 
       if (pI->saturation_mode()) {
         if (d.f16 < 0)
@@ -7518,8 +7548,9 @@ void sub_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       data.u64 = src1_data.u64 - src2_data.u64;
       break;
     case F16_TYPE:
-      data.f16 = src1_data.f16 - src2_data.f16;
-      break;  // assert(0); break;
+      data.f16 = f16_from_double(double(float(src1_data.f16)) - double(float(src2_data.f16)),
+                                 pI->rounding_mode());
+      break;
     case F32X2_TYPE: {
       uint32_t s1lo = static_cast<uint32_t>(src1_data.u64 & 0xFFFFFFFFu);
       uint32_t s1hi = static_cast<uint32_t>(src1_data.u64 >> 32);
