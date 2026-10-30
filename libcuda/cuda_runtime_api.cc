@@ -1669,16 +1669,38 @@ cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = N
       entry ? yasai_scope::source_name(entry->get_name()) : std::string("unknown");
   const gpgpu_ptx_sim_info *info = entry ? entry->get_kernel_info() : NULL;
   const dim3 g = config.grid_dim(), b = config.block_dim();
+  // Kernel identity (fakeenv convert/kernel_identity.py): the PTX .target and .version of the
+  // function's module, the PTX file it was parsed from (named after its library or JIT image)
+  // and, for a kernel registered by a library (__cudaRegisterFunction), the shared object that
+  // holds its host stub. A function created by cuModuleLoadData has no host stub in a library:
+  // its handle lies in this runtime, so host_so is empty then.
+  std::string ptx_target, ptx_file;
+  char ptx_ver[16] = "";
+  if (entry != NULL && entry->get_function_size() > 0) {
+    const ptx_version &pv = entry->get_ptx_version();
+    ptx_target = pv.target_str();
+    snprintf(ptx_ver, sizeof(ptx_ver), "%.1f", pv.ver());
+    ptx_file = entry->yasai_ptx_file();
+  }
+  std::string host_so;
+  Dl_info stub, self;
+  if (hostFun != NULL && dladdr(hostFun, &stub) != 0 && stub.dli_fname != NULL &&
+      dladdr(reinterpret_cast<void *>(&cudaLaunchInternalImpl), &self) != 0 &&
+      (self.dli_fname == NULL || strcmp(self.dli_fname, stub.dli_fname) != 0)) {
+    host_so = stub.dli_fname;
+  }
   rec.api("cudaLaunchKernel", t0, t1, corr, int(ret));
   rec.write("\"rec\":\"kernel\",\"start\":%llu,\"end\":%llu,\"dev\":0,\"ctx\":1,\"stream\":%u,"
             "\"corr\":%u,\"name\":\"%s\",\"grid\":[%u,%u,%u],\"block\":[%u,%u,%u],"
             "\"cluster\":[1,1,1],\"smem_static\":%u,\"smem_dynamic\":%zu,\"regs\":%u,"
             "\"local_per_thread\":0,\"graph_id\":0,\"graph_node\":0,\"launch_type\":0,"
-            "\"queued\":0,\"submitted\":0,\"device_launched\":0",
+            "\"queued\":0,\"submitted\":0,\"device_launched\":0,\"ptx_target\":\"%s\","
+            "\"ptx_version\":\"%s\",\"ptx_file\":\"%s\",\"host_so\":\"%s\"",
             (unsigned long long)t0, (unsigned long long)t1,
             rec.stream_id(config.get_stream()), corr, yasai_rec::esc(name.c_str()).c_str(),
             g.x, g.y, g.z, b.x, b.y, b.z, info ? info->smem : 0u, (size_t)config.shared_mem(),
-            info ? info->regs : 0u);
+            info ? info->regs : 0u, yasai_rec::esc(ptx_target.c_str()).c_str(), ptx_ver,
+            yasai_rec::esc(ptx_file.c_str()).c_str(), yasai_rec::esc(host_so.c_str()).c_str());
   return ret;
 }
 

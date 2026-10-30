@@ -385,6 +385,9 @@ class ptx_version {
     assert(m_valid);
     return m_ptx_extensions;
   }
+  // yasai: the .target string as written in the PTX (for example "sm_120a"), or "" before
+  // set_target; the fakeenv kernel record reports it as the compile target.
+  const std::string &target_str() const { return m_sm_version_str; }
 
  private:
   void check_target_extension(const char *ext) {
