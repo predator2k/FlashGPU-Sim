@@ -186,6 +186,10 @@ class cuda_sim;
  * (yasai_acquire_cta_slot: shared memory, CTA, warp, mbarrier, tcgen05 and local memory state),
  * shared by all concurrently running kernels; %smid is the CTA's virtual SM, its co-resident
  * placement round-robin over the reported SM count.
+ * With YASAI_FUNC_PROGRESS_S=N (N > 0) step() prints one "yasai: progress kernel ..." line and
+ * flushes stdout every N wall seconds of a kernel, so a watchdog that stops a run whose log has
+ * not grown can tell a slow kernel from a hang; unset or 0 prints nothing. Checkpointed runs
+ * (the former loop) do not print it.
  */
 class yasai_func_run {
  public:
@@ -243,6 +247,17 @@ class yasai_func_run {
   unsigned m_sms = 1;             // SM count the application sees (virtual %smid)
   bool m_interleaved = false;     // more than one group is active at once
   std::vector<group *> m_groups;  // active groups (null: slot drained)
+  /// Prints the progress line when YASAI_FUNC_PROGRESS_S seconds have passed since the kernel
+  /// started or since the last line (called by step() only when the switch is on).
+  /// @param period_s The YASAI_FUNC_PROGRESS_S period in seconds (> 0).
+  void progress(int period_s);
+  unsigned long m_ctas_total = 0;    // CTAs in the grid
+  unsigned long m_ctas_issued = 0;   // CTAs started so far (all ranks of started clusters)
+  unsigned long m_ctas_skipped = 0;  // CTAs that CTA sampling skipped so far
+  unsigned long m_ctas_done = 0;     // CTAs retired so far
+  unsigned m_insn_start = 0;         // process instruction count (g_ptx_sim_num_insn) at start
+  double m_start_s = 0;              // monotonic wall time (s) at the kernel's start
+  double m_progress_next_s = 0;      // monotonic wall time (s) of the next progress line
 };
 
 #define RECONVERGE_RETURN_PC ((address_type) - 2)

@@ -49,6 +49,7 @@ static std::shared_mutex &yasai_pc_finfo_mu() {
 class ptx_recognizer;
 typedef void *yyscan_t;
 #include <stdio.h>
+#include <time.h>
 #include <algorithm>
 #include <map>
 #include <set>
@@ -3663,6 +3664,13 @@ int yasai_env_int(const char *name, int dflt) {
   return (v != NULL && *v != '\0') ? atoi(v) : dflt;
 }
 
+// Monotonic wall time in seconds (progress lines of yasai_func_run).
+double yasai_mono_s() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return double(ts.tv_sec) + 1e-9 * double(ts.tv_nsec);
+}
+
 }  // namespace
 
 // yasai: tensor memory is kept per hardware CTA slot (TMEM scope (0, slot)) and cleared when the
@@ -3720,6 +3728,10 @@ yasai_func_run::yasai_func_run(cuda_sim *sim, kernel_info_t &kernel, bool openCL
   m_block = yasai_func::Dim3{block.x, block.y, block.z};
   // The kernel object may be released by register_finished_kernel, so keep its name here.
   m_name = kernel.name();
+  m_ctas_total = (unsigned long)grid.x * grid.y * grid.z;
+  m_insn_start = sim->g_ptx_sim_num_insn;
+  m_start_s = yasai_mono_s();
+  m_progress_next_s = m_start_s + yasai_env_int("YASAI_FUNC_PROGRESS_S", 0);
   m_scope = yasai_func::scope_new();
   yasai_func::scope_set(m_scope);
   yasai_func::kernel_begin(m_name, m_grid, m_block);
@@ -3808,10 +3820,12 @@ bool yasai_func_run::refill(group &g, unsigned pos) {
       // whose grid barrier counts every CTA).
       if (!m_coop && !yasai_func::cta_is_representative(m_grid, id)) {
         yasai_func::count_cta(true);
+        ++m_ctas_skipped;
         m_kernel.increment_cta_id();
         continue;
       }
       yasai_func::count_cta(false);
+      ++m_ctas_issued;
       // The core takes its own hardware CTA slot from the pool (yasai_acquire_cta_slot), so
       // co-resident CTAs of this and of concurrent kernels hold distinct slots.
       functionalCoreSim *core = new functionalCoreSim(&m_kernel, gpu, m_warp_size);
@@ -3836,6 +3850,7 @@ bool yasai_func_run::refill(group &g, unsigned pos) {
     const unsigned cz = cl_linear / (m_ncl.x * m_ncl.y);
     if (!m_coop && !yasai_func::cta_is_representative(m_ncl, cl_linear)) {
       for (unsigned r = 0; r < m_csize; r++) yasai_func::count_cta(true);
+      m_ctas_skipped += m_csize;
       continue;
     }
     g.state = yasai_func::ClusterState();
@@ -3854,6 +3869,7 @@ bool yasai_func_run::refill(group &g, unsigned pos) {
       g.state.cores.push_back(core);
       g.state.hw_cta.push_back(core->yasai_hw_cta());
       yasai_func::count_cta(false);
+      ++m_ctas_issued;
     }
     for (unsigned r = 0; r < m_csize; r++) g.cores[r]->yasai_join_cluster(&g.state, r);
     return true;
@@ -3870,6 +3886,7 @@ void yasai_func_run::retire(group &g) {
     // CTA's hardware slot), so the next CTA in the slot allocates from an empty TMEM.
     if (m_uses_tmem) tmem.clear_cta(0, core->yasai_hw_cta());
     delete core;
+    ++m_ctas_done;
   }
   g.cores.clear();
 }
@@ -3891,6 +3908,10 @@ bool yasai_func_run::step() {
       getenv("YASAI_CTA_SAMPLE_HANG_ROUNDS")
           ? strtoul(getenv("YASAI_CTA_SAMPLE_HANG_ROUNDS"), NULL, 10)
           : 20000000ul;
+  // yasai: YASAI_FUNC_PROGRESS_S=<n> prints a progress line every n wall seconds (see the
+  // class comment); unset or 0 prints nothing.
+  static const int progress_s = yasai_env_int("YASAI_FUNC_PROGRESS_S", 0);
+  if (progress_s > 0) progress(progress_s);
   const bool sampled = yasai_func::cta_sampled();
   bool any = false;
   for (unsigned gi = 0; gi < m_groups.size(); gi++) {
@@ -3947,6 +3968,20 @@ bool yasai_func_run::step() {
   }
   if (!any) finish();
   return m_done;
+}
+
+void yasai_func_run::progress(int period_s) {
+  const double now = yasai_mono_s();
+  if (now < m_progress_next_s) return;
+  m_progress_next_s = now + period_s;
+  // Instructions are the process-wide functional count since this kernel started, so they
+  // include kernels running concurrently with it (unsigned difference, as the counter wraps).
+  const unsigned insn = m_sim->g_ptx_sim_num_insn - m_insn_start;
+  printf("yasai: progress kernel %s: CTAs issued %lu done %lu skipped %lu of %lu, "
+         "instructions %u since start, %.0f s\n",
+         m_name.c_str(), m_ctas_issued, m_ctas_done, m_ctas_skipped, m_ctas_total, insn,
+         now - m_start_s);
+  fflush(stdout);
 }
 
 void yasai_func_run::run_checkpointed() {
