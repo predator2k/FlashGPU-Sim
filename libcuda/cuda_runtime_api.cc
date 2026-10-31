@@ -309,6 +309,12 @@ struct _cuda_device_id *gpgpu_context::GPGPUSim_Init() {
 #if (CUDART_VERSION >= 4000)
     prop->maxThreadsPerMultiProcessor = sc.n_thread_per_shader;
 #endif
+#if (CUDART_VERSION >= 11000)
+    // yasai: the configuration's CTA limit per SM (-gpgpu_shader_cta), which the co-resident
+    // count (yasai_coresident_ctas) already uses. Left at 0 before, so PyTorch's multi-block
+    // top-k (mbtopk::get_items_per_thread) divided by zero on the host.
+    prop->maxBlocksPerMultiProcessor = sc.max_cta_per_core;
+#endif
     the_gpgpusim->the_cude_device = new _cuda_device_id(this, cfg, prop);
     the_device = the_gpgpusim->the_cude_device;
   }
@@ -2914,8 +2920,8 @@ cudaDeviceGetAttributeInternal(int *value, enum cudaDeviceAttr attr, int device,
       case 105:  // Unassigned
         *value = 0;
         break;
-      case 106:  // cudaDevAttrMaxBlocksPerMultiprocessor
-        *value = 32;  // Reasonable default for modern GPUs
+      case 106:  // cudaDevAttrMaxBlocksPerMultiprocessor (yasai: the property, from the configuration)
+        *value = prop->maxBlocksPerMultiProcessor;
         break;
       case 107:  // Unassigned
         *value = 0;
