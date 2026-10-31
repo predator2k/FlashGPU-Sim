@@ -86,13 +86,56 @@ void *gpgpu_sim_thread_sequential(void *ctx_ptr) {
   return NULL;
 }
 
+// yasai: the concurrent simulation thread of this process (termination_callback drains its work
+// at exit), its context and the process that started it (a forked child inherits the atexit
+// handler but not the thread).
+static gpgpu_context *g_yasai_sim_ctx = NULL;
+static pthread_t g_yasai_sim_thread;
+static pid_t g_yasai_sim_pid = 0;
+
+// yasai: wall seconds exit waits for the queued device work (YASAI_EXIT_DRAIN_S, default 600; 0
+// skips the wait).
+static int yasai_exit_drain_s() {
+  const char *v = getenv("YASAI_EXIT_DRAIN_S");
+  return (v != NULL && *v != '\0') ? atoi(v) : 600;
+}
+
 static void termination_callback() {
   printf("GPGPU-Sim: *** exit detected ***\n");
   fflush(stdout);
+  // yasai: exit runs the atexit handlers and static destructors next, which free the modules' PTX
+  // state, while the simulation thread may still execute a launch the application never waited
+  // for (the last asynchronous kernel of a benchmark loop); it then read freed state and aborted
+  // with "Assertion pc == inst.pc" after the program had finished (DeepGEMM mega_gate test).
+  // Like a context teardown, exit first waits until the queued device work is done, at most
+  // YASAI_EXIT_DRAIN_S seconds. Skipped on the simulation thread itself and in a forked child.
+  if (g_yasai_sim_ctx == NULL || g_yasai_sim_pid != getpid() ||
+      pthread_equal(pthread_self(), g_yasai_sim_thread))
+    return;
+  GPGPUsim_ctx *g = g_yasai_sim_ctx->the_gpgpusim;
+  if (g == NULL || g->g_stream_manager == NULL) return;
+  const int limit_s = yasai_exit_drain_s();
+  const double t0 = yasai_real_mono_s();
+  for (;;) {
+    pthread_mutex_lock(&(g->g_sim_lock));
+    const bool idle = (g->g_stream_manager->empty() && !g->g_sim_active) || g->g_sim_done;
+    pthread_mutex_unlock(&(g->g_sim_lock));
+    if (idle) return;
+    if (yasai_real_mono_s() - t0 >= limit_s) {
+      printf("GPGPU-Sim: exit: device work still queued after %d s (YASAI_EXIT_DRAIN_S); "
+             "exiting without it\n", limit_s);
+      fflush(stdout);
+      return;
+    }
+    yasai_real_usleep(1000);
+  }
 }
 
 void *gpgpu_sim_thread_concurrent(void *ctx_ptr) {
   gpgpu_context *ctx = (gpgpu_context *)ctx_ptr;
+  g_yasai_sim_ctx = ctx;
+  g_yasai_sim_thread = pthread_self();
+  g_yasai_sim_pid = getpid();
   atexit(termination_callback);
   // concurrent kernel execution simulation thread
   do {
