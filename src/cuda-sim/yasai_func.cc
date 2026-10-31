@@ -5,6 +5,7 @@
 #include <shared_mutex>
 
 #include <chrono>
+#include "../yasai_realtime.h"
 #include <regex>
 #include <cmath>
 #include <cstdio>
@@ -33,7 +34,7 @@ struct KernelCounters {
   uint64_t skipped_fp_warp = 0;   // warp instructions whose FP value computation was skipped
   uint64_t ctas_run = 0;          // CTAs executed
   uint64_t ctas_skipped = 0;      // CTAs skipped by CTA sampling
-  std::chrono::steady_clock::time_point start;  // wall clock at kernel_begin
+  double start = 0;  // real monotonic seconds at kernel_begin (yasai_realtime.h)
 };
 
 // Trace state of the current kernel.
@@ -184,7 +185,7 @@ void kernel_begin(const std::string &name, Dim3 grid, Dim3 block) {
     if (g_trace.file) std::fwrite("YWR1", 1, 4, g_trace.file);
   }
   g_kernel_seq++;
-  g_counters.start = std::chrono::steady_clock::now();
+  g_counters.start = yasai_real_mono_s();
 }
 
 bool tracing() { return g_trace.file != nullptr && !g_trace.truncated; }
@@ -342,9 +343,7 @@ void count_cta(bool skipped) {
 }
 
 void kernel_end(const std::string &name, Dim3 g, Dim3 b) {
-  const double trace_secs = std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                                          g_counters.start)
-                                .count();
+  const double trace_secs = yasai_real_mono_s() - g_counters.start;
   if (g_trace.file) {
     flush_trace();
     std::fclose(g_trace.file);
@@ -371,9 +370,7 @@ void kernel_end(const std::string &name, Dim3 g, Dim3 b) {
   }
   g_pc_src.clear();
   if (!config().stats) return;
-  const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                                    g_counters.start)
-                          .count();
+  const double secs = yasai_real_mono_s() - g_counters.start;
   std::printf(
       "yasai-func kernel=%s grid=%u,%u,%u block=%u,%u,%u ctas_run=%llu ctas_skipped=%llu "
       "warp_insts=%llu thread_insts=%llu skipped_fp_warp=%llu secs=%.6f warp_inst_per_s=%.1f "

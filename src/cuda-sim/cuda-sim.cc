@@ -43,6 +43,7 @@ static std::shared_mutex &yasai_pc_finfo_mu() {
   return *m;
 }
 #include "../yasai_subprocess.h"
+#include "../yasai_realtime.h"
 
 #include "instructions.h"
 #include "ptx_ir.h"
@@ -3664,11 +3665,10 @@ int yasai_env_int(const char *name, int dflt) {
   return (v != NULL && *v != '\0') ? atoi(v) : dflt;
 }
 
-// Monotonic wall time in seconds (progress lines of yasai_func_run).
+// Real monotonic wall time in seconds (progress lines of yasai_func_run); a direct system call,
+// so a time-dilation preload does not stretch the progress period (yasai_realtime.h).
 double yasai_mono_s() {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return double(ts.tv_sec) + 1e-9 * double(ts.tv_nsec);
+  return yasai_real_mono_s();
 }
 
 }  // namespace
@@ -4055,7 +4055,7 @@ void yasai_func_run::finish() {
   // g_simulation_starttime g_simulation_starttime is initilized by
   // gpgpu_ptx_sim_init_perf() in gpgpusim_entrypoint.cc upon starting gpgpu-sim
   time_t end_time, elapsed_time, days, hrs, minutes, sec;
-  end_time = time((time_t *)NULL);
+  end_time = yasai_real_time();
   elapsed_time =
       MAX(end_time - gpgpu_ctx->the_gpgpusim->g_simulation_starttime, 1);
 

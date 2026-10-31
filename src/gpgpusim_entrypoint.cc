@@ -39,6 +39,7 @@
 #include "option_parser.h"
 #include "stream_manager.h"
 #include "cuda-sim/shared_devmem.h"
+#include "yasai_realtime.h"
 
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 
@@ -107,7 +108,7 @@ void *gpgpu_sim_thread_concurrent(void *ctx_ptr) {
       unsigned idle_us = 50;
       while (ctx->the_gpgpusim->g_stream_manager->empty_protected() &&
              !ctx->the_gpgpusim->g_sim_done) {
-        usleep(idle_us);
+        yasai_real_usleep(idle_us);
         if (idle_us < 1000) idle_us *= 2;
       }
     }
@@ -401,7 +402,7 @@ gpgpu_sim *gpgpu_context::gpgpu_ptx_sim_init_perf() {
   the_gpgpusim->g_stream_manager = new stream_manager(
       (the_gpgpusim->g_the_gpu), func_sim->g_cuda_launch_blocking);
 
-  the_gpgpusim->g_simulation_starttime = time((time_t *)NULL);
+  the_gpgpusim->g_simulation_starttime = yasai_real_time();
 
   sem_init(&(the_gpgpusim->g_sim_signal_start), 0, 0);
   sem_init(&(the_gpgpusim->g_sim_signal_finish), 0, 0);
@@ -452,7 +453,7 @@ void gpgpu_context::start_sim_thread(int api) {
 
 void gpgpu_context::print_simulation_time() {
   time_t current_time, difference, d, h, m, s;
-  current_time = time((time_t *)NULL);
+  current_time = yasai_real_time();
   difference = MAX(current_time - the_gpgpusim->g_simulation_starttime, 1);
 
   d = difference / (3600 * 24);

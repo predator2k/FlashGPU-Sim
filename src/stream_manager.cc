@@ -31,6 +31,7 @@
 #include "cuda-sim/cuda-sim.h"
 #include "gpgpu-sim/gpu-sim.h"
 #include "gpgpusim_entrypoint.h"
+#include "yasai_realtime.h"
 
 #include <unistd.h>
 #include <condition_variable>
@@ -105,7 +106,7 @@ bool yasai_stream_trace() {
 
 // yasai: sleeps for a growing interval (20 us up to 1 ms) between polls of a host wait.
 void yasai_backoff(unsigned *us) {
-  usleep(*us);
+  yasai_real_usleep(*us);
   if (*us < 1000) *us *= 2;
 }
 
@@ -152,7 +153,7 @@ void CUstream_st::synchronize() {
     pthread_mutex_unlock(&m_lock);
     // yasai: sleep between polls, so the waiting host thread leaves the core to the simulation
     // thread that executes the stream (one core per rank under taskset)
-    if (!done) usleep(100);
+    if (!done) yasai_real_usleep(100);
   } while (!done);
 }
 
@@ -748,7 +749,7 @@ uint64_t stream_manager::push(stream_operation op) {
     while (!empty()) {
       // sleep to prevent CPU hog by empty spin
       // sleep time increased exponentially ensure fast response when needed
-      usleep(wait_amount);
+      yasai_real_usleep(wait_amount);
       wait_amount *= 2;
       if (wait_amount > wait_cap) wait_amount = wait_cap;
     }
