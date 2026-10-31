@@ -54,6 +54,7 @@ class ptx_recognizer;
 #include <map>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include "../abstract_hardware_model.h"
 #include "../gpgpu-sim/gpu-sim.h"
 #include "../gpgpu-sim/shader.h"
@@ -4088,6 +4089,30 @@ void cvta_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
                       from_addr.u64, to_addr.u64, pI->to_string().c_str());
 }
 
+// Integer quotient a / b as a GPU computes it. The PTX ISA leaves a zero divisor and the signed
+// minimum divided by -1 machine-specific; host division raises SIGFPE on both. An RTX 5090
+// returns all ones for every dividend over a zero divisor and the minimum for minimum / -1
+// (fakeenv test int_div_zero). T is the operand type; a and b are the dividend and divisor.
+template <typename T>
+static T yasai_int_div(T a, T b) {
+  typedef typename std::make_unsigned<T>::type U;
+  if (b == 0) return T(U(~U(0)));
+  if (std::is_signed<T>::value && b == T(-1)) return T(U(U(0) - U(a)));
+  return T(a / b);
+}
+
+// Integer remainder a % b as a GPU computes it: all ones over a zero divisor and 0 for any
+// signed dividend over -1 (RTX 5090, fakeenv test int_div_zero); host % raises SIGFPE on a zero
+// divisor and on the signed minimum % -1. T is the operand type; a and b are the dividend and
+// divisor.
+template <typename T>
+static T yasai_int_rem(T a, T b) {
+  typedef typename std::make_unsigned<T>::type U;
+  if (b == 0) return T(U(~U(0)));
+  if (std::is_signed<T>::value && b == T(-1)) return T(0);
+  return T(a % b);
+}
+
 void div_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   ptx_reg_t data;
 
@@ -4102,40 +4127,40 @@ void div_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
   switch (i_type) {
     case S8_TYPE:
-      data.s8 = src1_data.s8 / src2_data.s8;
+      data.s8 = yasai_int_div(src1_data.s8, src2_data.s8);
       break;
     case S16_TYPE:
-      data.s16 = src1_data.s16 / src2_data.s16;
+      data.s16 = yasai_int_div(src1_data.s16, src2_data.s16);
       break;
     case S32_TYPE:
-      data.s32 = src1_data.s32 / src2_data.s32;
+      data.s32 = yasai_int_div(src1_data.s32, src2_data.s32);
       break;
     case S64_TYPE:
-      data.s64 = src1_data.s64 / src2_data.s64;
+      data.s64 = yasai_int_div(src1_data.s64, src2_data.s64);
       break;
     case U8_TYPE:
-      data.u8 = src1_data.u8 / src2_data.u8;
+      data.u8 = yasai_int_div(src1_data.u8, src2_data.u8);
       break;
     case U16_TYPE:
-      data.u16 = src1_data.u16 / src2_data.u16;
+      data.u16 = yasai_int_div(src1_data.u16, src2_data.u16);
       break;
     case U32_TYPE:
-      data.u32 = src1_data.u32 / src2_data.u32;
+      data.u32 = yasai_int_div(src1_data.u32, src2_data.u32);
       break;
     case U64_TYPE:
-      data.u64 = src1_data.u64 / src2_data.u64;
+      data.u64 = yasai_int_div(src1_data.u64, src2_data.u64);
       break;
     case B8_TYPE:
-      data.u8 = src1_data.u8 / src2_data.u8;
+      data.u8 = yasai_int_div(src1_data.u8, src2_data.u8);
       break;
     case B16_TYPE:
-      data.u16 = src1_data.u16 / src2_data.u16;
+      data.u16 = yasai_int_div(src1_data.u16, src2_data.u16);
       break;
     case B32_TYPE:
-      data.u32 = src1_data.u32 / src2_data.u32;
+      data.u32 = yasai_int_div(src1_data.u32, src2_data.u32);
       break;
     case B64_TYPE:
-      data.u64 = src1_data.u64 / src2_data.u64;
+      data.u64 = yasai_int_div(src1_data.u64, src2_data.u64);
       break;
     case F16_TYPE:
       data.f16 = src1_data.f16 / src2_data.f16;
@@ -6173,17 +6198,23 @@ void rem_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   src2_data = thread->get_operand_value(src2, dst, i_type, thread, 1);
 
   switch (i_type) {
+    case S16_TYPE:
+      data.s16 = yasai_int_rem(src1_data.s16, src2_data.s16);
+      break;
+    case U16_TYPE:
+      data.u16 = yasai_int_rem(src1_data.u16, src2_data.u16);
+      break;
     case S32_TYPE:
-      data.s32 = src1_data.s32 % src2_data.s32;
+      data.s32 = yasai_int_rem(src1_data.s32, src2_data.s32);
       break;
     case S64_TYPE:
-      data.s64 = src1_data.s64 % src2_data.s64;
+      data.s64 = yasai_int_rem(src1_data.s64, src2_data.s64);
       break;
     case U32_TYPE:
-      data.u32 = src1_data.u32 % src2_data.u32;
+      data.u32 = yasai_int_rem(src1_data.u32, src2_data.u32);
       break;
     case U64_TYPE:
-      data.u64 = src1_data.u64 % src2_data.u64;
+      data.u64 = yasai_int_rem(src1_data.u64, src2_data.u64);
       break;
     default:
       assert(0);
