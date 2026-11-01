@@ -75,4 +75,10 @@ class GPGPUsim_ctx {
   bool break_limit;
 };
 
+
+// yasai: re-registers the process-exit drain of queued device work with atexit (at most once a
+// minute; called at kernel launches), so it runs before the destructors of static objects that
+// were first used after the previous registration. See gpgpusim_entrypoint.cc.
+void yasai_exit_drain_refresh();
+
 #endif

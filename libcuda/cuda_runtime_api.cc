@@ -3133,6 +3133,8 @@ __host__ cudaError_t CUDARTAPI cudaUnbindTextureInternal(
 __host__ cudaError_t CUDARTAPI cudaLaunchKernelInternal(
     const char *hostFun, dim3 gridDim, dim3 blockDim, const void **args,
     size_t sharedMem, cudaStream_t stream, gpgpu_context *gpgpu_ctx = NULL) {
+  // yasai: keeps the exit drain registered after the static objects created so far.
+  yasai_exit_drain_refresh();
   gpgpu_context *ctx;
   if (gpgpu_ctx) {
     ctx = gpgpu_ctx;

@@ -3191,12 +3191,20 @@ unsigned ptx_sim_init_thread(kernel_info_t &kernel,
   // are shared.
   static std::recursive_mutex init_thread_mu;
   std::lock_guard<std::recursive_mutex> init_thread_lk(init_thread_mu);
-  static std::map<unsigned, memory_space *> shared_memory_lookup;
-  static std::map<unsigned, memory_space *> sstarr_memory_lookup;
-  static std::map<unsigned, ptx_cta_info *> ptx_cta_lookup;
-  static std::map<std::pair<unsigned, unsigned>, ptx_warp_info *> ptx_warp_lookup;
-  static std::map<unsigned, std::map<unsigned, memory_space *> >
-      local_memory_lookup;
+  // yasai: these tables are created on the first call (the first CTA, on the simulation thread)
+  // and never destroyed: as function-local statics their destructors ran at process exit before
+  // the exit drain, while the simulation thread still started a queued kernel's CTAs and used
+  // them (SIGSEGV in std::_Rb_tree_decrement after DeepGEMM's mega_gate test had finished).
+  static std::map<unsigned, memory_space *> &shared_memory_lookup =
+      *new std::map<unsigned, memory_space *>();
+  static std::map<unsigned, memory_space *> &sstarr_memory_lookup =
+      *new std::map<unsigned, memory_space *>();
+  static std::map<unsigned, ptx_cta_info *> &ptx_cta_lookup =
+      *new std::map<unsigned, ptx_cta_info *>();
+  static std::map<std::pair<unsigned, unsigned>, ptx_warp_info *> &ptx_warp_lookup =
+      *new std::map<std::pair<unsigned, unsigned>, ptx_warp_info *>();
+  static std::map<unsigned, std::map<unsigned, memory_space *> > &local_memory_lookup =
+      *new std::map<unsigned, std::map<unsigned, memory_space *> >();
 
   if (*thread_info != NULL) {
     ptx_thread_info *thd = *thread_info;

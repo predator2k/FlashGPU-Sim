@@ -29,6 +29,8 @@
 #include "gpgpusim_entrypoint.h"
 #include <unistd.h>
 #include <stdio.h>
+#include <atomic>
+#include <mutex>
 
 #include "../libcuda/gpgpu_context.h"
 #include "cuda-sim/cuda-sim.h"
@@ -100,9 +102,67 @@ static int yasai_exit_drain_s() {
   return (v != NULL && *v != '\0') ? atoi(v) : 600;
 }
 
+// yasai: set once the exit drain has run (it is registered several times, see
+// yasai_exit_drain_refresh), so only the first call waits and every later call returns at once.
+static std::atomic<bool> g_yasai_drain_done(false);
+// yasai: calls of the drain so far (YASAI_EXIT_DRAIN_REPORT=1 prints one line per call).
+static std::atomic<int> g_yasai_drain_calls(0);
+// yasai: real time (s) of the last atexit registration of the drain.
+static double g_yasai_drain_reg_s = -1e30;
+// yasai: atexit registrations of the drain made by kernel launches so far.
+static int g_yasai_drain_regs = 0;
+// yasai: guards g_yasai_drain_reg_s and g_yasai_drain_regs (launches come from several threads).
+static std::mutex g_yasai_drain_mu;
+
+static void yasai_exit_drain();
+
+// yasai: every registration adds one atexit entry that runs at exit (a 30 h run re-registering
+// once a minute would leave about 2,000), so launches register the drain at most 64 times,
+// YASAI_EXIT_DRAIN_REREG_S (default 60) seconds apart; the first 64 minutes of launches cover the
+// static objects that a run creates (modules, kernels and CTA tables are first used early), and
+// the drain itself returns at once after its first call.
+void yasai_exit_drain_refresh() {
+  if (g_yasai_sim_ctx == NULL) return;
+  static const double interval_s = [] {
+    const char *v = getenv("YASAI_EXIT_DRAIN_REREG_S");
+    return (v != NULL && *v != '\0') ? atof(v) : 60.0;
+  }();
+  const double now = yasai_real_mono_s();
+  std::lock_guard<std::mutex> lk(g_yasai_drain_mu);
+  if (g_yasai_drain_regs >= 64 || now - g_yasai_drain_reg_s < interval_s) return;
+  g_yasai_drain_reg_s = now;
+  g_yasai_drain_regs++;
+  atexit(yasai_exit_drain);
+}
+
 static void termination_callback() {
   printf("GPGPU-Sim: *** exit detected ***\n");
   fflush(stdout);
+  yasai_exit_drain();
+}
+
+// yasai: the exit drain of queued device work; runs once however often it is registered.
+static void yasai_exit_drain() {
+  static const bool report = getenv("YASAI_EXIT_DRAIN_REPORT") != NULL &&
+                             atoi(getenv("YASAI_EXIT_DRAIN_REPORT")) != 0;
+  const int call = ++g_yasai_drain_calls;
+  if (g_yasai_drain_done.exchange(true)) {
+    if (report) {
+      printf("yasai: exit drain call %d returned at once\n", call);
+      fflush(stdout);
+    }
+    return;
+  }
+  struct DrainReport {  // prints the first call's wait when it returns (YASAI_EXIT_DRAIN_REPORT)
+    bool on;
+    int call;
+    double t0;
+    ~DrainReport() {
+      if (!on) return;
+      printf("yasai: exit drain call %d waited %.3f s\n", call, yasai_real_mono_s() - t0);
+      fflush(stdout);
+    }
+  } rep{report, call, yasai_real_mono_s()};
   // yasai: exit runs the atexit handlers and static destructors next, which free the modules' PTX
   // state, while the simulation thread may still execute a launch the application never waited
   // for (the last asynchronous kernel of a benchmark loop); it then read freed state and aborted
