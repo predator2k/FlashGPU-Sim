@@ -88,7 +88,7 @@ endif
 
 PROG     =cuda
 
-CXX_SRCS =  cuda_runtime_api.cc yasai_jit_image.cc yasai_vmm.cc yasai_cudart_gap.cc yasai_dark_api.cc yasai_fatbin_units.cc
+CXX_SRCS =  cuda_runtime_api.cc yasai_jit_image.cc yasai_vmm.cc yasai_cudart_gap.cc yasai_dark_api.cc yasai_fatbin_units.cc yasai_fill_kernel.cc
 LEX_SRCS = cuobjdump.l
 YACC_SRCS = cuobjdump.y
 CXXFLAGS += -DCUDART_VERSION=$(CUDART_VERSION)

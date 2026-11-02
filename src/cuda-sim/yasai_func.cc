@@ -35,6 +35,7 @@ struct KernelCounters {
   uint64_t ctas_run = 0;          // CTAs executed
   uint64_t ctas_skipped = 0;      // CTAs skipped by CTA sampling
   double start = 0;  // real monotonic seconds at kernel_begin (yasai_realtime.h)
+  bool host_executed = false;  // executed on the host (set_host_executed), no warp records
 };
 
 // Trace state of the current kernel.
@@ -157,6 +158,8 @@ const Config &config() {
 
 // g_launch_only: the current kernel matches YASAI_LAUNCH_ONLY_REGEX; g_sample_kernel: it is
 // CTA-sampled by YASAI_CTA_SAMPLE_REGEX (both set by kernel_begin, in the selected scope).
+
+void set_host_executed() { g_counters.host_executed = true; }
 
 void kernel_begin(const std::string &name, Dim3 grid, Dim3 block) {
   g_counters = KernelCounters();
@@ -354,7 +357,7 @@ void kernel_end(const std::string &name, Dim3 g, Dim3 b) {
                    "\"warps_per_cta\": %u, \"records\": %llu, \"bytes\": %llu, "
                    "\"truncated\": %s, \"registers\": %zu, \"warp_insts\": %llu, "
                    "\"ctas_run\": %llu, \"ctas_skipped\": %llu, \"cta_sample\": %s, "
-                   "\"skip_fp\": %s, \"secs\": %.6f}\n",
+                   "\"skip_fp\": %s, \"host_executed\": %s, \"secs\": %.6f}\n",
                    name.c_str(), g.x, g.y, g.z, b.x, b.y, b.z, (b.x * b.y * b.z + 31) / 32,
                    (unsigned long long)g_trace.records,
                    (unsigned long long)(g_trace.bytes + 4), g_trace.truncated ? "true" : "false",
@@ -362,7 +365,7 @@ void kernel_end(const std::string &name, Dim3 g, Dim3 b) {
                    (unsigned long long)g_counters.ctas_run,
                    (unsigned long long)g_counters.ctas_skipped,
                    config().cta_sample ? "true" : "false", config().skip_fp ? "true" : "false",
-                   trace_secs);
+                   g_counters.host_executed ? "true" : "false", trace_secs);
       std::fclose(meta);
     }
     g_trace.file = nullptr;
@@ -374,13 +377,13 @@ void kernel_end(const std::string &name, Dim3 g, Dim3 b) {
   std::printf(
       "yasai-func kernel=%s grid=%u,%u,%u block=%u,%u,%u ctas_run=%llu ctas_skipped=%llu "
       "warp_insts=%llu thread_insts=%llu skipped_fp_warp=%llu secs=%.6f warp_inst_per_s=%.1f "
-      "skip_fp=%d cta_sample=%d\n",
+      "skip_fp=%d cta_sample=%d host_executed=%d\n",
       name.c_str(), g.x, g.y, g.z, b.x, b.y, b.z,
       (unsigned long long)g_counters.ctas_run, (unsigned long long)g_counters.ctas_skipped,
       (unsigned long long)g_counters.warp_insts, (unsigned long long)g_counters.thread_insts,
       (unsigned long long)g_counters.skipped_fp_warp, secs,
       secs > 0 ? g_counters.warp_insts / secs : 0.0, (int)config().skip_fp,
-      (int)config().cta_sample);
+      (int)config().cta_sample, (int)g_counters.host_executed);
   std::fflush(stdout);
 }
 

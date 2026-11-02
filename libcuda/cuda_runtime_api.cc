@@ -173,6 +173,7 @@ typedef enum CUoutput_mode_enum {
 #include "../src/cuda-sim/shared_devmem.h"
 #include "../src/cuda-sim/yasai_module_scope.h"
 #include "yasai_fatbin_units.h"
+#include "yasai_fill_kernel.h"
 #include "yasai_vmm.h"
 #include "../src/cuda-sim/ptx_ir.h"
 #include "../src/cuda-sim/ptx_loader.h"
@@ -1641,6 +1642,11 @@ cudaError_t cudaSetupArgumentInternal(const void *arg, size_t size,
 
 cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx);
 
+// yasai: set by cudaLaunchInternalImpl when the launch it pushed is a host-executed fill
+// (yasai_fill_kernel.h), so cudaLaunchInternal marks the kernel record; per thread, because
+// launches from several host threads may interleave.
+static thread_local bool t_yasai_host_fill_launch = false;
+
 // yasai: stream capture (CUDA graphs; implemented at the end of this file). Each returns true
 // when the stream is being captured and the operation was recorded into its graph instead of
 // being issued.
@@ -1670,7 +1676,9 @@ cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = N
   kernel_config config = ctx->api->g_cuda_launch_stack.back();
   const uint64_t t0 = yasai_rec::mono_ns();
   const uint32_t corr = rec.corr();
+  t_yasai_host_fill_launch = false;
   const cudaError_t ret = cudaLaunchInternalImpl(hostFun, gpgpu_ctx);
+  const bool host_fill = t_yasai_host_fill_launch;
   const uint64_t t1 = yasai_rec::mono_ns();
   function_info *entry = GPGPUSim_Context(ctx)->get_kernel(hostFun);
   // yasai: a renamed kernel (yasai_module_scope.h) is recorded under its source name
@@ -1710,12 +1718,16 @@ cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = N
             "\"cluster\":[1,1,1],\"smem_static\":%u,\"smem_dynamic\":%zu,\"regs\":%u,"
             "\"local_per_thread\":0,\"graph_id\":0,\"graph_node\":0,\"launch_type\":0,"
             "\"queued\":0,\"submitted\":0,\"device_launched\":0,\"ptx_target\":\"%s\","
-            "\"ptx_version\":\"%s\",\"ptx_file\":\"%s\",\"host_so\":\"%s\"",
+            "\"ptx_version\":\"%s\",\"ptx_file\":\"%s\",\"host_so\":\"%s\"%s",
             (unsigned long long)t0, (unsigned long long)t1,
             rec.stream_id(config.get_stream()), corr, yasai_rec::esc(name.c_str()).c_str(),
             g.x, g.y, g.z, b.x, b.y, b.z, info ? info->smem : 0u, (size_t)config.shared_mem(),
             info ? info->regs : 0u, yasai_rec::esc(ptx_target.c_str()).c_str(), ptx_ver,
-            yasai_rec::esc(ptx_file.c_str()).c_str(), yasai_rec::esc(host_so.c_str()).c_str());
+            yasai_rec::esc(ptx_file.c_str()).c_str(), yasai_rec::esc(host_so.c_str()).c_str(),
+            // A host-executed fill runs no simulated instruction: the record says so, and its
+            // time source is "none" (no simulated time exists for it; start and end above are
+            // the launch call's host times, as for every kernel record).
+            host_fill ? ",\"host_executed\":1,\"time_source\":\"none\"" : "");
   return ret;
 }
 
@@ -1836,6 +1848,23 @@ cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx
     unsigned long long ws = yasai_func::grid_ws_take();
     if (ws == 0) ws = (unsigned long long)device_gpu->gpu_malloc(64);
     grid->set_yasai_cooperative(true, ws);
+  }
+
+  // yasai: a fill kernel that yasai_fill recognizes runs as a host write at its place in the
+  // stream (yasai_func_run); a fill-family kernel whose layout does not match runs in full.
+  // Only the functional simulator (yasai_func_run) performs the write; performance mode runs all.
+  if (yasai_fill::enabled() && ctx->func_sim->g_ptx_sim_mode) {
+    const yasai_fill::Plan fp = yasai_fill::recognize(grid->name(), grid->entry(), config.get_args());
+    if (fp.host) {
+      grid->set_yasai_host_fill(fp.dst, fp.count, fp.pattern);
+      t_yasai_host_fill_launch = true;
+      printf("yasai: fill kernel host-executed: %s type=%s count=%llu dst=0x%llx\n",
+             grid->name().c_str(), fp.type.c_str(), (unsigned long long)fp.count,
+             (unsigned long long)fp.dst);
+    } else if (fp.candidate) {
+      printf("yasai: fill kernel runs in full: %s (%s)\n", grid->name().c_str(),
+             fp.reason.c_str());
+    }
   }
 
   // do dynamic PDOM analysis for performance simulation scenario

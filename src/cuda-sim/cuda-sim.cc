@@ -3673,6 +3673,9 @@ int yasai_env_int(const char *name, int dflt) {
   return (v != NULL && *v != '\0') ? atoi(v) : dflt;
 }
 
+// Bytes per memcpy_to_gpu call of a host-executed fill (whole elements; 1 MiB).
+size_t yasai_fill_chunk_bytes() { return size_t(1) << 20; }
+
 // Real monotonic wall time in seconds (progress lines of yasai_func_run); a direct system call,
 // so a time-dilation preload does not stretch the progress period (yasai_realtime.h).
 double yasai_mono_s() {
@@ -3743,6 +3746,36 @@ yasai_func_run::yasai_func_run(cuda_sim *sim, kernel_info_t &kernel, bool openCL
   m_scope = yasai_func::scope_new();
   yasai_func::scope_set(m_scope);
   yasai_func::kernel_begin(m_name, m_grid, m_block);
+
+  // yasai: host-executed fill (YASAI_FILL_KERNEL_HOST, libcuda/yasai_fill_kernel.h): the
+  // destination gets count copies of the element bytes, written here at the kernel's place in
+  // its stream, and no CTA runs. The writes go through memcpy_to_gpu in chunks of whole
+  // elements, so every byte equals what the kernel's stores would leave.
+  if (kernel.yasai_host_fill()) {
+    const std::string &pat = kernel.yasai_fill_pattern();
+    const unsigned long long count = kernel.yasai_fill_count();
+    const size_t esz = pat.size();
+    if (esz > 0 && count > 0) {
+      const size_t chunk_elems = std::max<size_t>(1, yasai_fill_chunk_bytes() / esz);
+      std::string buf;
+      buf.reserve(chunk_elems * esz);
+      for (size_t i = 0; i < chunk_elems; ++i) buf += pat;
+      gpgpu_sim *gpu = gpgpu_ctx->the_gpgpusim->g_the_gpu;
+      unsigned long long done = 0;
+      while (done < count) {
+        const unsigned long long n = std::min<unsigned long long>(chunk_elems, count - done);
+        gpu->memcpy_to_gpu((size_t)(kernel.yasai_fill_dst() + done * esz), buf.data(),
+                           (size_t)(n * esz));
+        done += n;
+      }
+    }
+    yasai_func::set_host_executed();
+    kernel.set_all_ctas_issued();
+    printf("yasai: fill kernel %s written on the host: %llu elements of %zu bytes at 0x%llx\n",
+           m_name.c_str(), count, esz, kernel.yasai_fill_dst());
+    finish();
+    return;
+  }
 
   sim->cp_count = gpgpu_ctx->the_gpgpusim->g_the_gpu->checkpoint_insn_Y;
   sim->cp_cta_resume = gpgpu_ctx->the_gpgpusim->g_the_gpu->checkpoint_CTA_t;

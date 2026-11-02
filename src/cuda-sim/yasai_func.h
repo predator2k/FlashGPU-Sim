@@ -100,6 +100,11 @@ void count_cta(bool skipped);
 // and block extents, and closes the kernel's trace file.
 void kernel_end(const std::string &name, Dim3 grid, Dim3 block);
 
+// Marks the current kernel (between kernel_begin and kernel_end) as executed on the host
+// (YASAI_FILL_KERNEL_HOST): its trace metadata and statistics line say host_executed, and it has
+// no warp records.
+void set_host_executed();
+
 // Class codes of the trace entries (the OPCODE_CLASSES of the NVBit converter, so the replay
 // treats both trace sources alike).
 enum ClassCode : uint8_t {

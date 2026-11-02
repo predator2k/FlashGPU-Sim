@@ -251,8 +251,27 @@ public:
   void set_yasai_reported_sms(unsigned sms) { m_yasai_reported_sms = sms; }
   unsigned yasai_reported_sms() const { return m_yasai_reported_sms; }
   unsigned long long yasai_grid_ws() const { return m_yasai_grid_ws; }
+  // yasai: host-executed fill (YASAI_FILL_KERNEL_HOST, libcuda/yasai_fill_kernel.h): the
+  // functional simulator writes count copies of pattern (one element's bytes) at device address
+  // dst instead of running the kernel's CTAs. Set at launch when the kernel is recognized.
+  //   dst: device address of element 0; count: element count; pattern: one element's bytes
+  void set_yasai_host_fill(unsigned long long dst, unsigned long long count,
+                           const std::string &pattern) {
+    m_yasai_host_fill = true;
+    m_yasai_fill_dst = dst;
+    m_yasai_fill_count = count;
+    m_yasai_fill_pattern = pattern;
+  }
+  bool yasai_host_fill() const { return m_yasai_host_fill; }
+  unsigned long long yasai_fill_dst() const { return m_yasai_fill_dst; }
+  unsigned long long yasai_fill_count() const { return m_yasai_fill_count; }
+  const std::string &yasai_fill_pattern() const { return m_yasai_fill_pattern; }
 
 private:
+  bool m_yasai_host_fill = false;            // yasai: see set_yasai_host_fill
+  unsigned long long m_yasai_fill_dst = 0;   // yasai: fill destination (device address)
+  unsigned long long m_yasai_fill_count = 0; // yasai: fill element count
+  std::string m_yasai_fill_pattern;          // yasai: bytes of one fill element
   dim3 m_yasai_cluster_dim = dim3(1, 1, 1);  // yasai: see set_cluster_dim
   bool m_yasai_cooperative = false;          // yasai: see set_yasai_cooperative
   unsigned m_yasai_coresident = 0;           // yasai: see set_yasai_coresident
