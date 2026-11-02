@@ -1596,11 +1596,12 @@ class function_info {
   // yasai: number of parameters of the kernel's PTX entry, as parsed (yasai_fill_kernel checks a
   // kernel's parameter layout with it).
   unsigned yasai_param_count() const { return (unsigned)m_ptx_kernel_param_info.size(); }
-  // yasai: declared size in bytes of the PTX entry's parameter i, or 0 when there is none.
+  // yasai: declared size in bytes of the PTX entry's parameter i, or 0 when there is none
+  // (param_info keeps the size in bits, as the parser declares it).
   //   i: parameter index (0 is the first parameter)
   size_t yasai_param_size(unsigned i) const {
     const auto it = m_ptx_kernel_param_info.find(i);
-    return it == m_ptx_kernel_param_info.end() ? 0 : it->second.get_size();
+    return it == m_ptx_kernel_param_info.end() ? 0 : it->second.get_size() / 8;
   }
   // yasai: PTX file the function's code was parsed from (the source file of its first
   // instruction; the files are named after the library or JIT image they came from), or "" for
