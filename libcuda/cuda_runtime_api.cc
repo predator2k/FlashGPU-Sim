@@ -128,6 +128,8 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <limits.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <vector>
 #include <memory>
@@ -4686,6 +4688,187 @@ __host__ cudaError_t CUDARTAPI cudaGetExportTable(
 
 // #include "../../cuobjdump_to_ptxplus/cuobjdump_parser.h"
 
+// yasai: shared PTX extraction. `cuobjdump -xptx all` of PYTORCH_BIN's libraries writes several
+// GB per process into its working directory (about 5.6 GB for a four-architecture libtorch_cuda
+// and DeepEP), and every rank of a multi-process run extracts the same files from the same
+// libraries. With YASAI_PTX_EXTRACT_DIR set, the files are extracted and settled once per key
+// into <YASAI_PTX_EXTRACT_DIR>/<key>/: the first process takes an exclusive lock on
+// <key>.lock, extracts, settles (yasai_fatbin::settle_listing), writes the list and a done
+// marker; every other process waits for the lock, finds the marker and only reads. Each process
+// then links the listed files into its working directory, so the rest of the loader sees the
+// same file names as without the option. A process that dies during extraction leaves no
+// marker, and the next process extracts again.
+namespace {
+
+/// Version of the shared extraction's layout (part of the key, so a changed layout or settling
+/// rule never reuses an older directory).
+const char *const kYasaiPtxExtractLayout = "yasai-ptx-extract-v1";
+
+/// Single-quoted shell word for s.
+/// @param s Text to quote.
+/// @return s in single quotes, with embedded quotes escaped.
+std::string yasai_shell_quote(const std::string &s) {
+  std::string q = "'";
+  for (char c : s) q += c == '\'' ? std::string("'\\''") : std::string(1, c);
+  return q + "'";
+}
+
+/// Lines a shell command prints (LD_PRELOAD removed for the child), empty lines dropped.
+/// @param cmd Shell command.
+/// @return Its output lines.
+std::vector<std::string> yasai_command_lines(const std::string &cmd) {
+  std::vector<std::string> out;
+  FILE *p = yasai_popen(cmd.c_str(), "r");
+  if (p == NULL) return out;
+  std::string cur;
+  for (int c; (c = fgetc(p)) != EOF;) {
+    if (c == '\n') {
+      if (!cur.empty()) out.push_back(cur);
+      cur.clear();
+    } else {
+      cur += char(c);
+    }
+  }
+  if (!cur.empty()) out.push_back(cur);
+  pclose(p);
+  return out;
+}
+
+/// Key of a shared extraction: sha256 over the layout version, cuobjdump's version text, and
+/// for each library (in order) its canonical path and the sha256 of its content.
+/// @param binaries Canonical library paths, in extraction order.
+/// @return 64 hex digits, or "" when a hash could not be computed.
+std::string yasai_ptx_extract_key(const std::vector<std::string> &binaries) {
+  std::string cmd = std::string("{ echo ") + kYasaiPtxExtractLayout +
+                    "; $CUDA_INSTALL_PATH/bin/cuobjdump --version";
+  for (const std::string &b : binaries)
+    cmd += "; echo " + yasai_shell_quote(b) + "; sha256sum < " + yasai_shell_quote(b) +
+           " || echo yasai-hash-failed";
+  cmd += "; } 2>&1 | sha256sum";
+  const std::vector<std::string> l = yasai_command_lines(cmd);
+  if (l.empty() || l[0].size() < 64) return "";
+  const std::string key = l[0].substr(0, 64);
+  for (char c : key)
+    if (!isxdigit(static_cast<unsigned char>(c))) return "";
+  return key;
+}
+
+/// Writes text to path through a temporary file and rename, so readers see all or nothing.
+/// @param path Destination.
+/// @param text Content.
+/// @return True when written.
+bool yasai_write_atomic(const std::string &path, const std::string &text) {
+  const std::string tmp = path + ".tmp" + std::to_string(getpid());
+  {
+    std::ofstream o(tmp, std::ios::trunc);
+    o << text;
+    if (!o) return false;
+  }
+  return rename(tmp.c_str(), path.c_str()) == 0;
+}
+
+/// Extracts and settles the PTX files of binaries once per key under root (see above), links
+/// them into the working directory and writes their names to list_file, one per line, in the
+/// order the unshared path writes them.
+/// @param binaries_in Library paths (PYTORCH_BIN's, or the program), in extraction order.
+/// @param root_in YASAI_PTX_EXTRACT_DIR.
+/// @param list_file List file of the loader (in the working directory).
+/// @return True on success; false leaves the caller to report the failure.
+bool yasai_shared_ptx_extract(const std::vector<std::string> &binaries_in, const std::string &root_in,
+                              const char *list_file) {
+  std::vector<std::string> binaries;
+  for (const std::string &b : binaries_in) {
+    char buf[PATH_MAX];
+    binaries.push_back(realpath(b.c_str(), buf) ? std::string(buf) : b);
+  }
+  yasai_system(("mkdir -p " + yasai_shell_quote(root_in)).c_str());
+  char rbuf[PATH_MAX];
+  if (realpath(root_in.c_str(), rbuf) == NULL) {
+    printf("ERROR: YASAI_PTX_EXTRACT_DIR %s cannot be created\n", root_in.c_str());
+    return false;
+  }
+  const std::string root(rbuf);
+  const std::string key = yasai_ptx_extract_key(binaries);
+  if (key.empty()) {
+    printf("ERROR: shared PTX extraction: no key (sha256sum or cuobjdump failed)\n");
+    return false;
+  }
+  const std::string dir = root + "/" + key;
+  const std::string list_path = dir + "/yasai_extract.list";
+  const std::string done_path = dir + "/yasai_extract.done";
+  const int lock_fd = open((dir + ".lock").c_str(), O_CREAT | O_RDWR, 0644);
+  if (lock_fd < 0 || flock(lock_fd, LOCK_EX) != 0) {
+    printf("ERROR: shared PTX extraction: cannot lock %s.lock\n", dir.c_str());
+    if (lock_fd >= 0) close(lock_fd);
+    return false;
+  }
+  bool extracted = false;
+  bool ok = true;
+  struct stat sb;
+  if (stat(done_path.c_str(), &sb) != 0) {
+    // First process for this key: extract and settle under the lock.
+    yasai_system(("rm -rf " + yasai_shell_quote(dir)).c_str());
+    mkdir(dir.c_str(), 0755);
+    std::vector<std::vector<std::string>> names(binaries.size());
+    for (size_t k = 0; ok && k < binaries.size(); ++k) {
+      printf("Extracting all PTX files of %s into %s (shared)\n", binaries[k].c_str(), dir.c_str());
+      const std::string x = "cd " + yasai_shell_quote(dir) +
+                            " && $CUDA_INSTALL_PATH/bin/cuobjdump -xptx all " +
+                            yasai_shell_quote(binaries[k]) + " > /dev/null";
+      ok = yasai_system(x.c_str()) == 0;
+      if (ok)
+        names[k] = yasai_command_lines("$CUDA_INSTALL_PATH/bin/cuobjdump -lptx " +
+                                       yasai_shell_quote(binaries[k]) +
+                                       " | cut -d \":\" -f 2 | awk '{$1=$1}1'");
+    }
+    if (ok) {
+      const std::vector<std::vector<std::string>> settled =
+          yasai_fatbin::settle_listing(binaries, names, dir, yasai_system);
+      std::string list;
+      for (size_t k = 0; k < settled.size(); ++k)
+        for (const std::string &n : settled[k]) list += std::to_string(k) + "\t" + n + "\n";
+      ok = yasai_write_atomic(list_path, list) &&
+           yasai_write_atomic(done_path, key + " pid=" + std::to_string(getpid()) + "\n");
+      extracted = ok;
+    }
+  }
+  // Every process reads the list (the first one reads back what it wrote).
+  std::vector<std::vector<std::string>> settled(binaries.size());
+  if (ok) {
+    std::ifstream in(list_path);
+    for (std::string l; std::getline(in, l);) {
+      const size_t tab = l.find('\t');
+      if (tab == std::string::npos) continue;
+      const size_t k = size_t(atol(l.substr(0, tab).c_str()));
+      if (k < settled.size()) settled[k].push_back(l.substr(tab + 1));
+    }
+    if (!extracted) yasai_fatbin::record_listing(binaries, settled, dir);
+  }
+  flock(lock_fd, LOCK_UN);
+  close(lock_fd);
+  if (!ok) {
+    printf("ERROR: shared PTX extraction into %s failed\n", dir.c_str());
+    return false;
+  }
+  size_t n = 0;
+  std::ofstream relist(list_file, std::ios::trunc);
+  for (const auto &v : settled)
+    for (const std::string &name : v) {
+      unlink(name.c_str());
+      if (symlink((dir + "/" + name).c_str(), name.c_str()) != 0) {
+        printf("ERROR: shared PTX extraction: cannot link %s\n", name.c_str());
+        return false;
+      }
+      relist << name << "\n";
+      ++n;
+    }
+  printf("yasai: PTX extraction %s %s (%zu files)\n", extracted ? "extracted into" : "reused from",
+         dir.c_str(), n);
+  return true;
+}
+
+}  // namespace
+
 // extracts all ptx files from binary and dumps into
 // prog_name.unique_no.sm_<>.ptx files
 void cuda_runtime_api::extract_ptx_files_using_cuobjdump_internal(
@@ -4745,7 +4928,12 @@ void cuda_runtime_api::extract_ptx_files_using_cuobjdump_internal(
     std::ifstream infile(ptx_list_file_name);
     std::string line;
     while (std::getline(infile, line)) context->no_of_ptx++;
-    if (context->no_of_ptx) {
+    const char *shared_dir = getenv("YASAI_PTX_EXTRACT_DIR");
+    if (context->no_of_ptx && shared_dir != NULL && *shared_dir != '\0') {
+      // yasai: shared extraction (yasai_shared_ptx_extract above).
+      // A failure ends the process with status 1 (the unshared path exits with 0 here).
+      if (!yasai_shared_ptx_extract(binaries, shared_dir, ptx_list_file_name)) exit(1);
+    } else if (context->no_of_ptx) {
       for (const std::string &b : binaries) {
         printf("Extracting all PTX files of %s (%d listed in total)\n", b.c_str(),
                context->no_of_ptx);

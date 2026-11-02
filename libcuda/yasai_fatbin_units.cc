@@ -260,6 +260,16 @@ void note_elf(const std::string &elf_path) {
   st().noted.insert(path);
 }
 
+void record_listing(const std::vector<std::string> &elf_paths,
+                    const std::vector<std::vector<std::string>> &settled, const std::string &dir) {
+  for (size_t e = 0; e < elf_paths.size() && e < settled.size(); ++e) {
+    const std::string elf = canonical(elf_paths[e]);
+    std::lock_guard<std::mutex> lock(st().mu);
+    for (size_t i = 0; i < settled[e].size(); ++i)
+      st().listed[canonical(dir + "/" + settled[e][i])] = std::make_pair(elf, unsigned(i + 1));
+  }
+}
+
 std::vector<std::vector<std::string>> settle_listing(
     const std::vector<std::string> &elf_paths, const std::vector<std::vector<std::string>> &names,
     const std::string &dir, int (*run)(const char *)) {

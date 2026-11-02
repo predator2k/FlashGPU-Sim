@@ -53,6 +53,16 @@ std::vector<std::vector<std::string>> settle_listing(
     const std::vector<std::string> &elf_paths, const std::vector<std::vector<std::string>> &names,
     const std::string &dir, int (*run)(const char *));
 
+/// Records PTX files that settle_listing settled earlier, possibly in another process (the shared
+/// extraction of YASAI_PTX_EXTRACT_DIR), so that unit_of_ptx_file finds them: every file is
+/// recorded with its (ELF file, cuobjdump number), the number being its position in its ELF
+/// file's list plus one, as settle_listing records it.
+/// @param elf_paths ELF files, in extraction order.
+/// @param settled For each ELF file, its file names as settle_listing returned them.
+/// @param dir Directory that holds the files.
+void record_listing(const std::vector<std::string> &elf_paths,
+                    const std::vector<std::vector<std::string>> &settled, const std::string &dir);
+
 /// Records an ELF file whose extracted PTX files unit_of_ptx_file may be asked about (the
 /// PYTORCH_BIN libraries, libraries registered after start-up).
 /// @param elf_path Library or program path.
