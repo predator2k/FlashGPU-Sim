@@ -35,6 +35,8 @@ struct Plan {
   uint64_t count = 0;      ///< element count N (the kernel's first parameter)
   std::string pattern;     ///< bytes of one element (FillFunctor's value, sizeof(T) bytes)
   std::string type;        ///< FillFunctor's type as mangled in the name (for example "i")
+  std::string dtype;       ///< the type's PyTorch dtype name (for example "int32"), "" if unknown
+  size_t elem_bytes = 0;   ///< sizeof(T)
   std::string reason;      ///< why a candidate runs in full (empty when host is true)
 };
 

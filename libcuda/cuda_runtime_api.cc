@@ -1646,6 +1646,8 @@ cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx
 // (yasai_fill_kernel.h), so cudaLaunchInternal marks the kernel record; per thread, because
 // launches from several host threads may interleave.
 static thread_local bool t_yasai_host_fill_launch = false;
+// yasai: the record fields of that fill (element count, dtype name, element bytes).
+static thread_local std::string t_yasai_host_fill_fields;
 
 // yasai: stream capture (CUDA graphs; implemented at the end of this file). Each returns true
 // when the stream is being captured and the operation was recorded into its graph instead of
@@ -1679,6 +1681,7 @@ cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = N
   t_yasai_host_fill_launch = false;
   const cudaError_t ret = cudaLaunchInternalImpl(hostFun, gpgpu_ctx);
   const bool host_fill = t_yasai_host_fill_launch;
+  const std::string host_fill_fields = host_fill ? t_yasai_host_fill_fields : std::string();
   const uint64_t t1 = yasai_rec::mono_ns();
   function_info *entry = GPGPUSim_Context(ctx)->get_kernel(hostFun);
   // yasai: a renamed kernel (yasai_module_scope.h) is recorded under its source name
@@ -1724,10 +1727,11 @@ cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = N
             g.x, g.y, g.z, b.x, b.y, b.z, info ? info->smem : 0u, (size_t)config.shared_mem(),
             info ? info->regs : 0u, yasai_rec::esc(ptx_target.c_str()).c_str(), ptx_ver,
             yasai_rec::esc(ptx_file.c_str()).c_str(), yasai_rec::esc(host_so.c_str()).c_str(),
-            // A host-executed fill runs no simulated instruction: the record says so, and its
+            // A host-executed fill runs no simulated instruction: the record says so, its
             // time source is "none" (no simulated time exists for it; start and end above are
-            // the launch call's host times, as for every kernel record).
-            host_fill ? ",\"host_executed\":1,\"time_source\":\"none\"" : "");
+            // the launch call's host times, as for every kernel record), and it carries the
+            // fill's problem (fill_count elements of fill_type, fill_elem_bytes each).
+            host_fill_fields.c_str());
   return ret;
 }
 
@@ -1858,9 +1862,15 @@ cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx
     if (fp.host) {
       grid->set_yasai_host_fill(fp.dst, fp.count, fp.pattern);
       t_yasai_host_fill_launch = true;
-      printf("yasai: fill kernel host-executed: %s type=%s count=%llu dst=0x%llx\n",
-             grid->name().c_str(), fp.type.c_str(), (unsigned long long)fp.count,
-             (unsigned long long)fp.dst);
+      char f[160];
+      snprintf(f, sizeof(f),
+               ",\"host_executed\":1,\"time_source\":\"none\",\"fill_count\":%llu,"
+               "\"fill_type\":\"%s\",\"fill_elem_bytes\":%zu",
+               (unsigned long long)fp.count, fp.dtype.c_str(), fp.elem_bytes);
+      t_yasai_host_fill_fields = f;
+      printf("yasai: fill kernel host-executed: %s type=%s (%s, %zu bytes) count=%llu dst=0x%llx\n",
+             grid->name().c_str(), fp.type.c_str(), fp.dtype.c_str(), fp.elem_bytes,
+             (unsigned long long)fp.count, (unsigned long long)fp.dst);
     } else if (fp.candidate) {
       printf("yasai: fill kernel runs in full: %s (%s)\n", grid->name().c_str(),
              fp.reason.c_str());

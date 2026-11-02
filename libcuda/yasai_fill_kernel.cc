@@ -13,26 +13,40 @@ namespace yasai_fill {
 
 namespace {
 
-/// Size in bytes of FillFunctor's type T, from its Itanium mangling; 0 for a type not listed
-/// (such a kernel runs in full).
+/// Size in bytes and PyTorch dtype name of FillFunctor's type T, from its Itanium mangling;
+/// size 0 for a type not listed (such a kernel runs in full).
 /// @param t The mangled type (for example "i", "N3c104HalfE", "N3c107complexIfEE").
-size_t type_size(const std::string &t) {
+/// @param dtype Set to the dtype name (for example "int32", "float16", "float8_e4m3fn").
+size_t type_size(const std::string &t, std::string *dtype) {
   if (t.size() == 1) {
     switch (t[0]) {
-      case 'a': case 'b': case 'c': case 'h': return 1;  // int8, bool, char, uint8
-      case 's': case 't': return 2;                      // int16, uint16
-      case 'i': case 'j': case 'f': return 4;            // int32, uint32, float
-      case 'l': case 'm': case 'x': case 'y': case 'd': return 8;  // int64, uint64, double
+      case 'a': *dtype = "int8"; return 1;
+      case 'b': *dtype = "bool"; return 1;
+      case 'c': *dtype = "char"; return 1;
+      case 'h': *dtype = "uint8"; return 1;
+      case 's': *dtype = "int16"; return 2;
+      case 't': *dtype = "uint16"; return 2;
+      case 'i': *dtype = "int32"; return 4;
+      case 'j': *dtype = "uint32"; return 4;
+      case 'f': *dtype = "float32"; return 4;
+      case 'l': case 'x': *dtype = "int64"; return 8;
+      case 'm': case 'y': *dtype = "uint64"; return 8;
+      case 'd': *dtype = "float64"; return 8;
       default: return 0;
     }
   }
-  static const std::regex one_byte("N3c10[0-9]+Float8_[a-z0-9]+E");
-  if (t == "N3c104HalfE" || t == "N3c108BFloat16E") return 2;
-  if (std::regex_match(t, one_byte)) return 1;
-  if (t == "N3c107complexIfEE") return 8;
-  if (t == "N3c107complexIdEE") return 16;
+  static const std::regex float8("N3c10[0-9]+Float8_([a-z0-9]+)E");
   static const std::regex complex16("N3c107complexINS[0-9A-Z]*_(4Half|8BFloat16)EEE");
-  if (std::regex_match(t, complex16)) return 4;
+  std::smatch m;
+  if (t == "N3c104HalfE") { *dtype = "float16"; return 2; }
+  if (t == "N3c108BFloat16E") { *dtype = "bfloat16"; return 2; }
+  if (std::regex_match(t, m, float8)) { *dtype = "float8_" + m[1].str(); return 1; }
+  if (t == "N3c107complexIfEE") { *dtype = "complex64"; return 8; }
+  if (t == "N3c107complexIdEE") { *dtype = "complex128"; return 16; }
+  if (std::regex_match(t, m, complex16)) {
+    *dtype = m[1].str() == "4Half" ? "complex32" : "complex_bfloat16";
+    return 4;
+  }
   return 0;
 }
 
@@ -75,7 +89,8 @@ Plan recognize(const std::string &mangled, function_info *entry, const gpgpu_ptx
   }
   p.candidate = true;
   p.type = m[1].str();
-  const size_t tsize = type_size(p.type);
+  const size_t tsize = type_size(p.type, &p.dtype);
+  p.elem_bytes = tsize;
   if (tsize == 0) {
     p.reason = "FillFunctor type " + p.type + " not in the size table";
     return p;
