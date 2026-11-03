@@ -365,6 +365,10 @@ void symbol_table::dump_until_top() {
 }
 
 unsigned operand_info::get_uid() {
+  // yasai: operands constructed while a pool thread executes a parallel step (get_pred,
+  // argument buffers of calls) take uid 0: operand uids are never read, and the shared counter
+  // would be a data race and a contended cache line (YASAI_FUNC_THREADS).
+  if (yasai_func::t_counts != nullptr) return 0;
   unsigned result = (gpgpu_ctx->operand_info_sm_next_uid)++;
   return result;
 }
@@ -662,6 +666,51 @@ void function_info::connect_basic_blocks()  // iterate across m_basic_blocks of
       assert(pI->get_opcode() == BRA_OP || pI->get_opcode() == BRX_OP);
   }
 }
+// yasai: see ptx_ir.h. A call cycle counts as no floating-point atomic for the inner call (the
+// outer function decides).
+bool function_info::yasai_float_atomics() {
+  if (m_yasai_float_atomics == 2) return false;
+  if (m_yasai_float_atomics >= 0) return m_yasai_float_atomics == 1;
+  m_yasai_float_atomics = 2;
+  bool found = false;
+  for (const ptx_instruction *pI : m_instructions) {
+    const int opc = pI->get_opcode();
+    if (opc == ATOM_OP || opc == RED_OP || opc == MULTIMEM_RED_OP) {
+      switch (pI->get_type()) {
+        case F16_TYPE:
+        case F16X2_TYPE:
+        case BF16_TYPE:
+        case F32_TYPE:
+        case F64_TYPE:
+        case FF64_TYPE:
+          if (pI->get_atomic() == ATOMIC_ADD) found = true;
+          break;
+        default:
+          break;
+      }
+    } else if (opc == TMA_OP) {
+      if (pI->get_atomic() != 0) found = true;
+      for (int o : pI->get_options())
+        if (o == ATOMIC_ADD) found = true;
+    } else if (opc == CALL_OP) {
+      const operand_info &target = pI->func_addr();
+      function_info *f = target.is_function_address() ? target.get_symbol()->get_pc() : NULL;
+      if (f == NULL || f->get_function_size() == 0) {
+        // printf, malloc and the other runtime calls are declarations without a body.
+        const std::string name = f != NULL ? f->get_name() : std::string();
+        if (f == NULL || (name != "vprintf" && name != "malloc" && name != "free" &&
+                          name != "__assertfail" && name.compare(0, 4, "cuda") != 0))
+          found = true;
+      } else if (f->yasai_float_atomics()) {
+        found = true;
+      }
+    }
+    if (found) break;
+  }
+  m_yasai_float_atomics = found ? 1 : 0;
+  return found;
+}
+
 bool function_info::connect_break_targets()  // connecting break instructions
                                              // with proper targets
 {

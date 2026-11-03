@@ -319,6 +319,76 @@ speedup in our testing. The maximum supported thread count is 32.
 See [Parallel Simulation](docs/development-notes.md#parallel-simulation) for
 implementation details.
 
+### yasai: CTA-parallel functional execution
+
+`OMP_NUM_THREADS` parallelizes only the cycle-level performance mode. In the functional mode
+(`PTX_SIM_MODE_FUNC=1`), `YASAI_FUNC_THREADS=N` runs the CTAs of a kernel on N host threads
+(at most 32). The default of 1 keeps the serial code path, so results and logs do not change.
+
+* **Scheduling.** A step of a parallel kernel run hands its active CTA groups (one CTA, or all
+  CTAs of a cluster) to the N threads one group at a time. A thread runs its group for up to 64
+  rounds (one round executes every warp of the group once), then takes the next group. A
+  finished group is replaced by the next CTA or cluster at once. Every active group therefore
+  advances in every step, and no CTA keeps a thread while it waits for another CTA.
+* **Active groups.** A kernel without CTA interleaving has N groups active, which are N CTAs or
+  clusters at a time instead of one. A kernel with interleaving (`YASAI_CTA_INTERLEAVE=1`, and
+  `YASAI_CTA_INTERLEAVE_REGEX` when it is set) or a cooperative launch keeps the co-resident
+  limit of groups, as in serial mode, spread over the N threads.
+* **Which mechanism applies.** Inter-CTA waiting on CTAs with lower ids, and waiting among up to
+  N CTAs, progresses without interleaving. A kernel that needs more than N co-resident CTAs to
+  progress needs the interleave path: NCCL and DeepEP kernels, Marlin, and persistent kernels
+  with a global barrier. For such kernels `YASAI_CTA_INTERLEAVE_REGEX` names them, exactly as in
+  serial mode.
+* **Kernels that stay serial.** A kernel runs with one group, on the serial code path, in these
+  cases:
+  * a warp trace is written (`YASAI_TRACE_DIR`), because the record order and the register
+    numbering follow the execution order;
+  * the kernel's name matches `YASAI_FUNC_SERIAL_REGEX` (`std::regex_search`, ECMAScript);
+  * `YASAI_FUNC_FLOAT_ATOMIC_SERIAL=1` is set and the kernel adds with a floating-point `atom`,
+    `red` or `multimem.red`, has a TMA reduction, or calls a function whose body is unknown;
+  * checkpointing is on.
+
+  Each such launch prints `yasai-func serial kernel=<name> reason=<trace|serial-regex|float-atomic>`.
+* **Determinism.** A kernel whose result does not depend on the order of its CTAs gives the
+  serial result bit for bit. The order of floating-point atomic additions varies between parallel
+  runs, so such sums can differ in the last bits from run to run and from the serial run.
+  `YASAI_FUNC_FLOAT_ATOMIC_SERIAL=1` makes those kernels serial and their results equal to the
+  serial run, which costs their parallel speedup. Integer atomics give the same final values;
+  values that a kernel derives from the order of atomics (tickets, `atomicAdd` slot indices) can
+  differ, as on a GPU. Device `printf` lines of different CTAs can appear in another order.
+  `%smid` keeps its serial value, which is the CTA id modulo the SM count, for kernels without
+  interleaving.
+* **Thread safety.**
+  * Each CTA keeps its own thread, warp, register, local and shared state, and its own SIMT stacks.
+  * The per-thread instruction copies and the line statistics are indexed by the pool thread.
+  * The functional mbarriers are sharded by CTA under mutexes.
+  * `atom`, `red` and TMA reductions on global memory hold a striped lock of their 64-byte
+    granules. Memory shared with other processes also keeps its host compare-and-swap.
+  * `membar` and `fence` issue a host sequential-consistency fence.
+  * The first call of a function body (PDOM analysis and lazy loading) is serialized.
+  * Instruction counters are summed per thread and added at the end of a step.
+* **Measured speedup.** The workload was the fp32 SIMT CUTLASS GEMM that the cuBLAS replacement
+  runs for the reference of Triton tutorial 06. A 1,024-CTA slice of its 49,152-CTA launch was
+  measured on 8 cores shared with other processes:
+
+  | Threads | GEMM seconds |
+  | --- | --- |
+  | 1 | 360 |
+  | 4 | 202 |
+  | 8 | 92.8 |
+  | 16 | 92.4 |
+  | 32 | 96.9 |
+
+  The runs with 16 and 32 threads oversubscribe the 8 cores. All runs give the same result
+  bytes.
+* **Rule for kernels without interleaving.** A kernel that does not interleave runs at most N
+  CTA groups at once. This includes a kernel that `YASAI_CTA_INTERLEAVE_REGEX` does not match.
+  With N=1 this is the former "one CTA group at a time". A kernel that must stay strictly
+  CTA-serial is named in `YASAI_FUNC_SERIAL_REGEX`. The regression keeps the 1-thread `ilv_regex`
+  check (`max_active=1`). Its items `ilv_regex_threads` and `func_serial_regex` check N=8.
+* **Records.** Every kernel record of the fakeenv recorder carries `"func_threads":N`, which is
+  the process's `YASAI_FUNC_THREADS`, so that runs with different thread counts are told apart.
+
 ### Inspect Statistics
 
 FlashGPU-Sim prints detailed simulation statistics to the run log. Use the

@@ -34,6 +34,7 @@
 #include "../tr1_hash_map.h"
 #include "ptx_ir.h"
 #include "ptx_sim.h"
+#include "yasai_func.h"
 
 #ifdef FLASH_GPGPU_SIM_OMP
 #include <array>
@@ -148,7 +149,8 @@ static std::array<ptx_file_line_stats_map_t, FLASH_GPGPU_SIM_OMP_MAX_THREADS>
 ptx_file_line_stats_map_t &get_tracker() {
 
 #ifdef FLASH_GPGPU_SIM_OMP
-  auto tid = omp_get_thread_num();
+  // yasai: the OpenMP thread, or the pool thread of a parallel functional step.
+  auto tid = yasai_func::thread_index();
   assert(tid < ptx_file_line_stats_thread_tracker.size());
   return ptx_file_line_stats_thread_tracker[tid];
 #else

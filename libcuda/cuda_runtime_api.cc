@@ -1724,7 +1724,8 @@ cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = N
             "\"cluster\":[1,1,1],\"smem_static\":%u,\"smem_dynamic\":%zu,\"regs\":%u,"
             "\"local_per_thread\":0,\"graph_id\":0,\"graph_node\":0,\"launch_type\":0,"
             "\"queued\":0,\"submitted\":0,\"device_launched\":0,\"ptx_target\":\"%s\","
-            "\"ptx_version\":\"%s\",\"ptx_file\":\"%s\",\"host_so\":\"%s\"%s",
+            "\"ptx_version\":\"%s\",\"ptx_file\":\"%s\",\"host_so\":\"%s\"%s,"
+            "\"func_threads\":%u",
             (unsigned long long)t0, (unsigned long long)t1,
             rec.stream_id(config.get_stream()), corr, yasai_rec::esc(name.c_str()).c_str(),
             g.x, g.y, g.z, b.x, b.y, b.z, info ? info->smem : 0u, (size_t)config.shared_mem(),
@@ -1734,7 +1735,12 @@ cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = N
             // time source is "none" (no simulated time exists for it; start and end above are
             // the launch call's host times, as for every kernel record), and it carries the
             // fill's problem (fill_count elements of fill_type, fill_elem_bytes each).
-            host_fill_fields.c_str());
+            host_fill_fields.c_str(),
+            // The host threads that execute the CTAs of the process's functional kernels
+            // (YASAI_FUNC_THREADS, 1 = serial; a kernel that stays serial, see yasai_func_run,
+            // still records the process's value), so that runs with different counts are told
+            // apart.
+            yasai_func::func_threads());
   return ret;
 }
 

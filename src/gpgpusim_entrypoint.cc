@@ -272,10 +272,12 @@ void *gpgpu_sim_thread_concurrent(void *ctx_ptr) {
               new yasai_func_run(ctx->the_gpgpusim->gpgpu_ctx->func_sim, *k, false));
         }
         // Each run executes up to 64 rounds per turn, so the stream bookkeeping between turns
-        // (operation() above) costs little.
+        // (operation() above) costs little. A parallel run (YASAI_FUNC_THREADS) executes that
+        // many rounds of every active group in one step.
         for (size_t i = 0; i < func_runs.size();) {
           bool done = false;
-          for (int round = 0; round < 64 && !done; round++) done = func_runs[i]->step();
+          const int steps = func_runs[i]->parallel() ? 1 : 64;
+          for (int round = 0; round < steps && !done; round++) done = func_runs[i]->step();
           if (done) {
             delete func_runs[i];
             func_runs.erase(func_runs.begin() + i);

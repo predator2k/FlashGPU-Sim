@@ -191,6 +191,29 @@ class cuda_sim;
  * flushes stdout every N wall seconds of a kernel, so a watchdog that stops a run whose log has
  * not grown can tell a slow kernel from a hang; unset or 0 prints nothing. Checkpointed runs
  * (the former loop) do not print it.
+ *
+ * CTA-parallel execution (YASAI_FUNC_THREADS=N, N > 1): a parallel run's step() executes up to
+ * kParallelRounds rounds of every active group on N host threads (yasai_func::pool_run), the
+ * simulation thread being one of them. The active groups are handed out to the threads one at a
+ * time; a thread runs its group for up to kParallelRounds rounds (retiring a finished group and
+ * starting the next CTA or cluster in its place under m_refill_mu) and then takes the next
+ * group, so no CTA keeps a thread while it waits for another one: every active group advances
+ * in every step. One parallel step is as much work per group as one turn of 64 serial steps,
+ * so the simulation loop gives a parallel run one step per turn. The active groups are
+ *   * the same as above for a cooperative or interleaved run (the co-resident limit), spread
+ *     over the N threads; inter-CTA waiting then progresses as in the serial interleaving;
+ *   * N otherwise (N CTAs or clusters at once instead of one), which also lets CTAs that wait
+ *     for a CTA with a lower id finish, but a kernel that needs more than N co-resident CTAs
+ *     (Marlin, NCCL, DeepEP) still needs YASAI_CTA_INTERLEAVE.
+ * Without interleaving, %smid stays the serial value (CTA id modulo the SM count), and a retired
+ * CTA frees only its own tensor memory and mbarriers (never the global reset of the exclusive
+ * serial path). A run stays serial (one group, the code path of N = 1) while a warp trace is
+ * written (YASAI_TRACE_DIR: the record order and the register numbering follow the execution
+ * order), for kernels named by YASAI_FUNC_SERIAL_REGEX (std::regex_search, ECMAScript), for
+ * checkpointing, and, with YASAI_FUNC_FLOAT_ATOMIC_SERIAL=1, for kernels whose code has a
+ * floating-point atom or red, or a TMA reduction (function_info::yasai_float_atomics): the
+ * order of such updates varies between parallel runs, so their sums can differ in the last
+ * bits; the option makes those kernels bit for bit equal to the serial run.
  */
 class yasai_func_run {
  public:
@@ -210,6 +233,10 @@ class yasai_func_run {
   static bool is_exclusive(kernel_info_t &kernel);
   /// The kernel launch.
   kernel_info_t &kernel() const { return m_kernel; }
+  /// Whether the run executes its CTAs on the pool (YASAI_FUNC_THREADS, see the class comment).
+  bool parallel() const { return m_par; }
+  /// Rounds of every active group that one parallel step executes.
+  static const unsigned kParallelRounds = 64;
 
  private:
   /// One active CTA or cluster.
@@ -229,6 +256,25 @@ class yasai_func_run {
   void finish();
   /// The former CTA-at-a-time loop with checkpoint support, run to completion.
   void run_checkpointed();
+  /// step() of a parallel run (see the class comment).
+  /// @return True when the kernel has finished.
+  bool step_parallel();
+  /// Executes one round of every CTA of group g on the calling thread (the thread's executing
+  /// cluster and rank are set for the round).
+  /// @return True while a thread of the group is live.
+  bool run_round(group &g);
+  /// Stops the process when group g has run YASAI_HANG_ROUNDS rounds, or, for a CTA-sampled
+  /// kernel, YASAI_CTA_SAMPLE_HANG_ROUNDS rounds (the dumps of the serial path).
+  /// @param g The group, after its round counter was advanced.
+  /// @param sampled Whether the kernel is CTA-sampled.
+  void check_hang(const group &g, bool sampled);
+  /// Whether the run must stay serial although YASAI_FUNC_THREADS > 1; sets reason.
+  /// @param reason Receives the cause (for the "yasai-func serial" line).
+  bool serial_only(const char **reason);
+
+  bool m_par = false;           // the run executes on the pool (parallel())
+  unsigned m_threads = 1;       // YASAI_FUNC_THREADS of a parallel run
+  std::mutex m_refill_mu;       // a parallel run's refill(), and the CTA counters it changes
 
   cuda_sim *m_sim;
   kernel_info_t &m_kernel;

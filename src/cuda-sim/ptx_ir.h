@@ -1611,6 +1611,11 @@ class function_info {
   }
   // yasai: whether the function allocates tensor memory (tcgen05.alloc); such kernels run one
   // CTA at a time and alone, because the functional TMEM manager is one per process.
+  // yasai: whether the function, or a function it calls, adds with an atom, red or multimem.red
+  // on a floating-point type, or has a TMA reduction (whose element type only the tensor map
+  // gives). An indirect call, or a call of a body that is not loaded yet, counts as one.
+  // YASAI_FUNC_FLOAT_ATOMIC_SERIAL runs such kernels serially (yasai_func_run). Cached.
+  bool yasai_float_atomics();
   bool yasai_uses_tmem() {
     if (m_yasai_uses_tmem < 0) {
       m_yasai_uses_tmem = 0;
@@ -1810,6 +1815,8 @@ class function_info {
   std::vector<const symbol *> m_args;
   std::list<ptx_instruction *> m_instructions;
   int m_yasai_uses_tmem = -1;  // yasai: cache of yasai_uses_tmem (-1: not computed)
+  // yasai: cache of yasai_float_atomics (-1: not computed, 2: being computed, for recursion)
+  int m_yasai_float_atomics = -1;
   std::vector<basic_block_t *> m_basic_blocks;
   std::list<std::pair<unsigned, unsigned> > m_back_edges;
   std::unordered_map<const symbol *, const symbol *> m_reg_alloc_aliases;

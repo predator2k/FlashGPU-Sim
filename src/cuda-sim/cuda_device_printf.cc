@@ -30,6 +30,7 @@
 #include "ptx_ir.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -77,9 +78,8 @@ static std::string yasai_call_string(const ptx_instruction *pI, ptx_thread_info 
 //   pI: the call; thread: calling thread; target_func: the declared __assertfail
 void yasai_cuda_assertfail(const ptx_instruction *pI, ptx_thread_info *thread,
                            const function_info *target_func) {
-  static unsigned printed = 0;
-  if (printed >= 16 || target_func->num_args() < 4) return;
-  printed++;
+  static std::atomic<unsigned> printed{0};  // yasai: threads of parallel CTAs assert at once
+  if (target_func->num_args() < 4 || printed.fetch_add(1) >= 16) return;
   const std::string msg = yasai_call_string(pI, thread, target_func, 0, 512);
   const std::string file = yasai_call_string(pI, thread, target_func, 1, 512);
   const unsigned line = (unsigned)yasai_call_param(pI, thread, target_func, 2);

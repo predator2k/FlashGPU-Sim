@@ -189,6 +189,10 @@ static uint64_t rmw(ptx_thread_info *thread, const ptx_instruction *pI, memory_s
   unsigned eb, pairs;
   classify(type, pI->is_bf16x2(), &eb, &pairs);
   const unsigned bytes = eb * pairs;
+  // The RmwGuard makes a global update atomic across pool threads (YASAI_FUNC_THREADS); shared
+  // memory belongs to the CTA or cluster that one thread runs.
+  std::optional<yasai_func::RmwGuard> guard;
+  if (space == global_space) guard.emplace(addr, bytes);
   if (shared_word(space, addr, bytes))
     return host_rmw(addr, bytes, op, type, pI->is_bf16x2(), b, c);
   uint64_t old = 0;

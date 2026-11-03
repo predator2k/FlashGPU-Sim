@@ -30,6 +30,7 @@
 void cuda_device_runtime::gpgpusim_cuda_getParameterBufferV2(
     const ptx_instruction *pI, ptx_thread_info *thread,
     const function_info *target_func) {
+  std::lock_guard<std::recursive_mutex> yasai_lk(m_yasai_mu);  // yasai
   DEV_RUNTIME_REPORT("Calling cudaGetParameterBufferV2");
 
   unsigned n_return = target_func->has_return();
@@ -112,6 +113,7 @@ void cuda_device_runtime::gpgpusim_cuda_getParameterBufferV2(
 void cuda_device_runtime::gpgpusim_cuda_launchDeviceV2(
     const ptx_instruction *pI, ptx_thread_info *thread,
     const function_info *target_func) {
+  std::lock_guard<std::recursive_mutex> yasai_lk(m_yasai_mu);  // yasai
   DEV_RUNTIME_REPORT("Calling cudaLaunchDeviceV2");
 
   unsigned n_return = target_func->has_return();
@@ -255,6 +257,7 @@ void cuda_device_runtime::gpgpusim_cuda_launchDeviceV2(
 void cuda_device_runtime::gpgpusim_cuda_streamCreateWithFlags(
     const ptx_instruction *pI, ptx_thread_info *thread,
     const function_info *target_func) {
+  std::lock_guard<std::recursive_mutex> yasai_lk(m_yasai_mu);  // yasai
   DEV_RUNTIME_REPORT("Calling cudaStreamCreateWithFlags");
 
   unsigned n_return = target_func->has_return();
@@ -314,6 +317,7 @@ void cuda_device_runtime::gpgpusim_cuda_streamCreateWithFlags(
 }
 
 void cuda_device_runtime::launch_one_device_kernel() {
+  std::lock_guard<std::recursive_mutex> yasai_lk(m_yasai_mu);  // yasai
   if (!g_cuda_device_launch_op.empty()) {
     device_launch_operation_t &op = g_cuda_device_launch_op.front();
 
@@ -325,6 +329,7 @@ void cuda_device_runtime::launch_one_device_kernel() {
 }
 
 void cuda_device_runtime::launch_all_device_kernels() {
+  std::lock_guard<std::recursive_mutex> yasai_lk(m_yasai_mu);  // yasai
   while (!g_cuda_device_launch_op.empty()) {
     launch_one_device_kernel();
   }

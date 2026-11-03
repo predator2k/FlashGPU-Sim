@@ -10,6 +10,8 @@
  * This wastes space, but it is simple and effective.
  */
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -41,6 +43,11 @@ private:
   int m_thread_cnt;
 
   all_inst_mem_t m_all_inst_mem;
+  // yasai: one mutex per thread table. The owner thread looks up its table without it and takes
+  // it only to insert; update_predecoded_inst takes it for each table it searches, because it can
+  // run on a pool thread (a function body pre-decoded at its first call, YASAI_FUNC_THREADS)
+  // while the other pool threads insert into their tables.
+  std::unique_ptr<std::mutex[]> m_insert_mu;
 
   const ptx_instruction *get_or_allocate(int thread_id, uint64_t pc,
                                          const ptx_instruction *static_inst);

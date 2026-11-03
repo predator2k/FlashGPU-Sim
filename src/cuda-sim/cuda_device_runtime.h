@@ -1,5 +1,6 @@
 #ifndef __cuda_device_runtime_h__
 #define __cuda_device_runtime_h__
+#include <mutex>
 // Jin: cuda_device_runtime.h
 // Defines CUDA device runtime APIs for CDP support
 class device_launch_config_t {
@@ -46,6 +47,9 @@ class cuda_device_runtime {
   unsigned g_TB_launch_latency;
   unsigned long long g_max_total_param_size;
   bool g_cdp_enabled;
+  // yasai: serializes the device runtime calls of kernels (pool threads of a parallel functional
+  // step call them at the same time) and the launches of the queued child kernels.
+  std::recursive_mutex m_yasai_mu;
 
   // backward pointer
   class gpgpu_context* gpgpu_ctx;

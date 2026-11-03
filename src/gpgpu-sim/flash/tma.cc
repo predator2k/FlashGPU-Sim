@@ -2404,6 +2404,8 @@ static void do_tma_transfer(
           abort();
         }
         std::vector<uint8_t> destination(req_size);
+        // yasai: the read-modify-write is atomic across pool threads (YASAI_FUNC_THREADS).
+        yasai_func::RmwGuard rmw_guard(global_req_addr, req_size);
         global_mem->read(global_req_addr, req_size, destination.data());
         apply_tma_tensor_reduction(reduction_op,
                                    tensormap.fields.tensorDataType,
@@ -2474,6 +2476,8 @@ static void reduce_add_f32_mem(memory_space *src_mem, uint64_t src_addr,
 
   std::vector<float> src(size_in_bytes / sizeof(float));
   std::vector<float> dst(size_in_bytes / sizeof(float));
+  // yasai: the read-modify-write is atomic across pool threads (YASAI_FUNC_THREADS).
+  yasai_func::RmwGuard rmw_guard(dst_addr, size_in_bytes);
   src_mem->read(src_addr, size_in_bytes, src.data());
   dst_mem->read(dst_addr, size_in_bytes, dst.data());
   for (size_t i = 0; i < dst.size(); ++i) {

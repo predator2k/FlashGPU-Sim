@@ -144,11 +144,14 @@ void ptx_warp_info::inc_done_threads() { m_done_threads++; }
 void ptx_warp_info::reset_done_threads() { m_done_threads = 0; }
 
 ptx_thread_info::~ptx_thread_info() {
-  m_gpu->gpgpu_ctx->func_sim->g_ptx_thread_info_delete_count++;
+  // yasai: threads of CTAs that retire on different pool threads are deleted at the same time.
+  __atomic_fetch_add(&m_gpu->gpgpu_ctx->func_sim->g_ptx_thread_info_delete_count, 1u,
+                     __ATOMIC_RELAXED);
 }
 
 ptx_thread_info::ptx_thread_info(kernel_info_t &kernel) : m_kernel(kernel) {
-  m_uid = kernel.entry()->gpgpu_ctx->func_sim->g_ptx_thread_info_uid_next++;
+  m_uid = __atomic_fetch_add(&kernel.entry()->gpgpu_ctx->func_sim->g_ptx_thread_info_uid_next,
+                             1u, __ATOMIC_RELAXED);  // yasai: CTAs of pool threads
   m_core = NULL;
   m_barrier_num = -1;
   m_at_barrier = false;

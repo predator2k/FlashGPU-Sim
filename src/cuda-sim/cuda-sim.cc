@@ -52,6 +52,8 @@ typedef void *yyscan_t;
 #include <stdio.h>
 #include <time.h>
 #include <algorithm>
+#include <atomic>
+#include <functional>
 #include <regex>
 #include <map>
 #include <set>
@@ -3082,7 +3084,12 @@ using flash_gpgpu_sim::wgmma_wait_group_impl;
         dump_regs(stdout);
     }
     update_pc();
-    m_gpu->gpgpu_ctx->func_sim->g_ptx_sim_num_insn++;
+    // yasai: a pool thread of a parallel step counts in its ThreadCounts (yasai_func_run).
+    yasai_func::ThreadCounts *yasai_counts = yasai_func::t_counts;
+    if (yasai_counts != NULL)
+      yasai_counts->ptx_insn++;
+    else
+      m_gpu->gpgpu_ctx->func_sim->g_ptx_sim_num_insn++;
 
     // not using it with functional simulation mode
     if (!(this->m_functionalSimulationMode))
@@ -3129,7 +3136,7 @@ using flash_gpgpu_sim::wgmma_wait_group_impl;
                         [m_gpu->gpgpu_ctx->func_sim->g_ptx_kernel_count],
                     (int)pI->get_opcode());
     }
-    if ((m_gpu->gpgpu_ctx->func_sim->g_ptx_sim_num_insn % 100000) == 0) {
+    if (yasai_counts == NULL && (m_gpu->gpgpu_ctx->func_sim->g_ptx_sim_num_insn % 100000) == 0) {
       dim3 ctaid = get_ctaid();
       dim3 tid = get_tid();
       GPPRINTF(LIVENESS,
@@ -3300,11 +3307,18 @@ unsigned ptx_sim_init_thread(kernel_info_t &kernel,
     new_tid += tid;
     ptx_thread_info *thd = new ptx_thread_info(kernel);
     ptx_warp_info *warp_info = NULL;
-    if (ptx_warp_lookup.find(std::make_pair(sid, hw_warp_id)) == ptx_warp_lookup.end()) {
+    // yasai: in the functional mode the key includes the hardware CTA slot. shfl and match count
+    // the lanes of a warp instruction in its ptx_warp_info, and with sid 0 for every functional
+    // CTA, warp w of every live CTA shared one, which CTAs on different pool threads
+    // (YASAI_FUNC_THREADS) update at the same time.
+    const std::pair<unsigned, unsigned> warp_key =
+        isInFunctionalSimulationMode ? std::make_pair(0x80000000u | hw_cta_id, hw_warp_id)
+                                     : std::make_pair(unsigned(sid), hw_warp_id);
+    if (ptx_warp_lookup.find(warp_key) == ptx_warp_lookup.end()) {
       warp_info = new ptx_warp_info();
-      ptx_warp_lookup[std::make_pair(sid, hw_warp_id)] = warp_info;
+      ptx_warp_lookup[warp_key] = warp_info;
     } else {
-      warp_info = ptx_warp_lookup[std::make_pair(sid, hw_warp_id)];
+      warp_info = ptx_warp_lookup[warp_key];
     }
     thd->m_warp_info = warp_info;
 
@@ -3856,6 +3870,18 @@ yasai_func_run::yasai_func_run(cuda_sim *sim, kernel_info_t &kernel, bool openCL
   ngroups = std::min(ngroups, std::max(1u, total_groups));
   m_sms = kernel.yasai_reported_sms() > 0 ? kernel.yasai_reported_sms() : nsm;
   m_interleaved = ngroups > 1;
+  // yasai: CTA-parallel execution (YASAI_FUNC_THREADS, see the class comment). A run without
+  // interleaving gets one group per thread; m_interleaved keeps the serial meaning (%smid).
+  if (yasai_func::func_threads() > 1) {
+    const char *reason = "";
+    if (serial_only(&reason)) {
+      printf("yasai-func serial kernel=%s reason=%s\n", m_name.c_str(), reason);
+    } else {
+      m_par = true;
+      m_threads = yasai_func::func_threads();
+      if (!m_interleaved) ngroups = std::min(m_threads, std::max(1u, total_groups));
+    }
+  }
   if (m_coop) {
     // Zeroes the grid barrier workspace for this launch (wsSize, barrier word).
     gpgpu_ctx->the_gpgpusim->g_the_gpu->gpu_memset((size_t)kernel.yasai_grid_ws(), 0, 64);
@@ -3967,13 +3993,134 @@ void yasai_func_run::retire(group &g) {
     // CTA's hardware slot), so the next CTA in the slot allocates from an empty TMEM.
     if (m_uses_tmem) tmem.clear_cta(0, core->yasai_hw_cta());
     delete core;
-    ++m_ctas_done;
+    __atomic_fetch_add(&m_ctas_done, 1ul, __ATOMIC_RELAXED);  // pool threads retire at once
   }
   g.cores.clear();
 }
 
+bool yasai_func_run::serial_only(const char **reason) {
+  if (yasai_func::tracing()) {
+    *reason = "trace";
+    return true;
+  }
+  static const char *serial_rx = getenv("YASAI_FUNC_SERIAL_REGEX");
+  if (serial_rx != NULL && *serial_rx != '\0') {
+    static const std::regex rx(serial_rx);
+    if (std::regex_search(m_name, rx)) {
+      *reason = "serial-regex";
+      return true;
+    }
+  }
+  static const bool float_serial = yasai_env_int("YASAI_FUNC_FLOAT_ATOMIC_SERIAL", 0) != 0;
+  if (float_serial && m_kernel.entry()->yasai_float_atomics()) {
+    *reason = "float-atomic";
+    return true;
+  }
+  return false;
+}
+
+bool yasai_func_run::run_round(group &g) {
+  bool live = false;
+  if (m_csize > 1) yasai_func::set_cluster(&g.state);
+  for (unsigned r = 0; r < g.cores.size(); r++) {
+    yasai_func::set_current_rank(r);
+    live = g.cores[r]->yasai_round() || live;
+  }
+  yasai_func::set_cluster(nullptr);
+  yasai_func::set_current_rank(0);
+  return live;
+}
+
+void yasai_func_run::check_hang(const group &g, bool sampled) {
+  // The same switches as step(): YASAI_HANG_ROUNDS and YASAI_CTA_SAMPLE_HANG_ROUNDS.
+  static const unsigned long hang_rounds =
+      getenv("YASAI_HANG_ROUNDS") ? strtoul(getenv("YASAI_HANG_ROUNDS"), NULL, 10) : 0;
+  static const unsigned long sample_hang_rounds =
+      getenv("YASAI_CTA_SAMPLE_HANG_ROUNDS")
+          ? strtoul(getenv("YASAI_CTA_SAMPLE_HANG_ROUNDS"), NULL, 10)
+          : 20000000ul;
+  const bool hang = hang_rounds != 0 && g.rounds == hang_rounds;
+  const bool sample_hang = sampled && sample_hang_rounds != 0 && g.rounds == sample_hang_rounds;
+  if (!hang && !sample_hang) return;
+  static std::mutex dump_mu;  // one dump; the process stops after it
+  std::lock_guard<std::mutex> lk(dump_mu);
+  if (hang) {
+    fprintf(stderr, "yasai: kernel %s: CTA group still live after %lu rounds\n", m_name.c_str(),
+            hang_rounds);
+  } else {
+    fprintf(stderr,
+            "yasai: sampled kernel appears to need all CTAs: %s (a CTA group is still live "
+            "after %lu rounds; name it in YASAI_CTA_SAMPLE_EXCLUDE_REGEX)\n",
+            m_name.c_str(), sample_hang_rounds);
+    printf("yasai: sampled kernel appears to need all CTAs: %s\n", m_name.c_str());
+    fflush(stdout);
+  }
+  for (functionalCoreSim *core : g.cores) core->yasai_dump_warps(stderr);
+  abort();
+}
+
+bool yasai_func_run::step_parallel() {
+  gpgpu_context *gpgpu_ctx = m_sim->gpgpu_ctx;
+  yasai_func::scope_set(m_scope);
+  static const int progress_s = yasai_env_int("YASAI_FUNC_PROGRESS_S", 0);
+  if (progress_s > 0) progress(progress_s);
+  const bool sampled = yasai_func::cta_sampled();
+  unsigned active = 0;
+  for (group *g : m_groups)
+    if (g != nullptr) active++;
+  if (active == 0) {
+    finish();
+    return true;
+  }
+  std::atomic<size_t> next{0};
+  std::atomic<bool> retired{false};
+  // One thread's share: groups taken one at a time, each run for up to kParallelRounds rounds;
+  // a finished group is retired and refilled with the next CTA or cluster (under m_refill_mu,
+  // which also keeps the CTA counters and the kernel's CTA iteration consistent).
+  const std::function<void(unsigned)> job = [&](unsigned) {
+    yasai_func::ThreadCounts counts;
+    yasai_func::t_counts = &counts;
+    for (size_t gi; (gi = next.fetch_add(1, std::memory_order_relaxed)) < m_groups.size();) {
+      group *g = m_groups[gi];
+      if (g == nullptr) continue;
+      for (unsigned r = 0; r < kParallelRounds;) {
+        if (run_round(*g)) {
+          ++r;
+          ++g->rounds;
+          check_hang(*g, sampled);
+          continue;
+        }
+        retire(*g);
+        retired.store(true, std::memory_order_relaxed);
+        bool more;
+        {
+          std::lock_guard<std::mutex> lk(m_refill_mu);
+          more = refill(*g, unsigned(gi));
+        }
+        if (!more) {
+          delete g;
+          m_groups[gi] = nullptr;
+          break;
+        }
+      }
+    }
+    yasai_func::flush_thread_counts(counts, &m_sim->g_ptx_sim_num_insn);
+    yasai_func::t_counts = nullptr;
+  };
+  yasai_func::pool_run(std::min(m_threads, active), job);
+#if (CUDART_VERSION >= 5000)
+  if (retired.load(std::memory_order_relaxed))
+    gpgpu_ctx->device_runtime->launch_all_device_kernels();
+#endif
+  bool any = false;
+  for (group *g : m_groups) any = any || g != nullptr;
+  if (!any) finish();
+  return m_done;
+}
+
 bool yasai_func_run::step() {
   if (m_done) return true;
+  if (m_par) return step_parallel();
   gpgpu_context *gpgpu_ctx = m_sim->gpgpu_ctx;
   yasai_func::scope_set(m_scope);
   // yasai: YASAI_HANG_ROUNDS=<n> stops a CTA or cluster that is still live after n rounds and
@@ -4739,6 +4886,9 @@ void ptxinfo_opencl_addinfo(std::map<std::string, function_info *> &kernels) {
 
 struct rec_pts cuda_sim::find_reconvergence_points(function_info *finfo) {
   rec_pts tmp;
+  // yasai: functions are analysed on any thread (host threads, pool threads at a first call).
+  static std::mutex *rpts_mu = new std::mutex;
+  std::lock_guard<std::mutex> rpts_lk(*rpts_mu);
   std::map<function_info *, rec_pts>::iterator r = g_rpts.find(finfo);
 
   if (r == g_rpts.end()) {

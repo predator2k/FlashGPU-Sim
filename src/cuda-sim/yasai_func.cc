@@ -4,7 +4,14 @@
 
 #include <shared_mutex>
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <thread>
+#include <pthread.h>
+#ifdef FLASH_GPGPU_SIM_OMP
+#include <omp.h>
+#endif
 #include "../yasai_realtime.h"
 #include <regex>
 #include <cmath>
@@ -27,7 +34,9 @@ namespace yasai_func {
 
 namespace {
 
-// Per-kernel counters; the functional mode runs one kernel at a time on one thread.
+// Per-kernel counters. Pool threads of a parallel step count in their ThreadCounts and add them
+// with atomic additions (flush_thread_counts); ctas_run and ctas_skipped change under the run's
+// refill lock.
 struct KernelCounters {
   uint64_t warp_insts = 0;        // executed warp instructions
   uint64_t thread_insts = 0;      // executed thread instructions (sum of active lanes)
@@ -334,6 +343,11 @@ uint8_t class_of(int opc, int space, bool is_store, bool is_atomic) {
 }
 
 void count_warp_inst(unsigned active_threads) {
+  if (ThreadCounts *c = t_counts) {
+    c->warp_insts++;
+    c->thread_insts += active_threads;
+    return;
+  }
   g_counters.warp_insts++;
   g_counters.thread_insts += active_threads;
 }
@@ -431,7 +445,12 @@ bool skip_fp_value(const ptx_instruction *pI, unsigned lane_id) {
     default:
       skip = false;
   }
-  if (skip && lane_id == 0) g_counters.skipped_fp_warp++;
+  if (skip && lane_id == 0) {
+    if (ThreadCounts *c = t_counts)
+      c->skipped_fp_warp++;
+    else
+      g_counters.skipped_fp_warp++;
+  }
   return skip;
 }
 
@@ -459,8 +478,21 @@ struct MbarState {
   uint32_t phase = 0;      // current phase number
 };
 
-// All functional mbarriers, keyed by (CTA key, shared-memory address).
-std::map<std::pair<uint64_t, uint32_t>, MbarState> g_mbars;
+// All functional mbarriers, keyed by (CTA key, shared-memory address), in shards selected by the
+// CTA key, each with its own mutex: CTAs that run on different pool threads (YASAI_FUNC_THREADS)
+// update their mbarriers at the same time. The CTAs of one cluster run on one thread, so a remote
+// mbarrier (mbar_canonical) is updated by that thread only.
+struct MbarShard {
+  std::mutex mu;                                           // guards map
+  std::map<std::pair<uint64_t, uint32_t>, MbarState> map;  // mbarriers of the shard's CTA keys
+};
+constexpr unsigned kMbarShards = 64;
+MbarShard g_mbar_shards[kMbarShards];
+
+// The shard of the mbarriers of CTA key cta_key.
+MbarShard &mbar_shard(uint64_t cta_key) {
+  return g_mbar_shards[(cta_key * 0x9E3779B97F4A7C15ull) >> 58];
+}
 
 // True when YASAI_MBAR_DEBUG is set: every functional mbarrier operation is printed.
 bool mbar_debug() {
@@ -492,7 +524,8 @@ void mbar_try_advance(MbarState &m) {
 }  // namespace
 
 namespace {
-ClusterState *g_cluster = nullptr;  // see cluster()
+// See cluster(); per thread, because pool threads execute different clusters at once.
+thread_local ClusterState *g_cluster = nullptr;
 }  // namespace
 
 ClusterState *cluster() { return g_cluster; }
@@ -505,7 +538,7 @@ std::recursive_mutex &ptx_load_mutex() {
 }
 
 namespace {
-unsigned g_current_rank = 0;  // see current_rank()
+thread_local unsigned g_current_rank = 0;  // see current_rank(); per thread, as g_cluster
 }  // namespace
 
 unsigned current_rank() { return g_current_rank; }
@@ -649,7 +682,12 @@ void mbar_canonical(uint64_t &cta_key, uint32_t &addr) {
   addr = uint32_t(off);
 }
 
-void mbar_reset_all() { g_mbars.clear(); }
+void mbar_reset_all() {
+  for (MbarShard &sh : g_mbar_shards) {
+    std::lock_guard<std::mutex> lk(sh.mu);
+    sh.map.clear();
+  }
+}
 
 namespace {
 std::mutex &grid_ws_mu() {
@@ -677,17 +715,17 @@ void grid_ws_give(uint64_t ws) {
 }
 
 void mbar_reset_cta(uint64_t cta_key) {
-  for (auto it = g_mbars.begin(); it != g_mbars.end();) {
-    if (it->first.first == cta_key)
-      it = g_mbars.erase(it);
-    else
-      ++it;
-  }
+  MbarShard &sh = mbar_shard(cta_key);
+  std::lock_guard<std::mutex> lk(sh.mu);
+  auto it = sh.map.lower_bound({cta_key, 0u});
+  while (it != sh.map.end() && it->first.first == cta_key) it = sh.map.erase(it);
 }
 
 void mbar_init(uint64_t cta_key, uint32_t addr, uint32_t count) {
   mbar_canonical(cta_key, addr);
-  MbarState &m = g_mbars[{cta_key, addr}];
+  MbarShard &sh = mbar_shard(cta_key);
+  std::lock_guard<std::mutex> lk(sh.mu);
+  MbarState &m = sh.map[{cta_key, addr}];
   m = MbarState();
   m.expected = count;
   m.pending = count;
@@ -696,8 +734,10 @@ void mbar_init(uint64_t cta_key, uint32_t addr, uint32_t count) {
 
 void mbar_arrive(uint64_t cta_key, uint32_t addr, uint32_t count) {
   mbar_canonical(cta_key, addr);
-  auto it = g_mbars.find({cta_key, addr});
-  if (it == g_mbars.end()) {
+  MbarShard &sh = mbar_shard(cta_key);
+  std::lock_guard<std::mutex> lk(sh.mu);
+  auto it = sh.map.find({cta_key, addr});
+  if (it == sh.map.end()) {
     mbar_log("arrive", cta_key, addr, count, nullptr);
     return;
   }
@@ -708,8 +748,10 @@ void mbar_arrive(uint64_t cta_key, uint32_t addr, uint32_t count) {
 
 void mbar_expect_tx(uint64_t cta_key, uint32_t addr, int64_t bytes) {
   mbar_canonical(cta_key, addr);
-  auto it = g_mbars.find({cta_key, addr});
-  if (it == g_mbars.end()) {
+  MbarShard &sh = mbar_shard(cta_key);
+  std::lock_guard<std::mutex> lk(sh.mu);
+  auto it = sh.map.find({cta_key, addr});
+  if (it == sh.map.end()) {
     mbar_log("expect_tx", cta_key, addr, bytes, nullptr);
     return;
   }
@@ -719,8 +761,10 @@ void mbar_expect_tx(uint64_t cta_key, uint32_t addr, int64_t bytes) {
 
 void mbar_complete_tx(uint64_t cta_key, uint32_t addr, int64_t bytes) {
   mbar_canonical(cta_key, addr);
-  auto it = g_mbars.find({cta_key, addr});
-  if (it == g_mbars.end()) {
+  MbarShard &sh = mbar_shard(cta_key);
+  std::lock_guard<std::mutex> lk(sh.mu);
+  auto it = sh.map.find({cta_key, addr});
+  if (it == sh.map.end()) {
     mbar_log("complete_tx", cta_key, addr, bytes, nullptr);
     return;
   }
@@ -731,13 +775,13 @@ void mbar_complete_tx(uint64_t cta_key, uint32_t addr, int64_t bytes) {
 
 bool mbar_phase_done(uint64_t cta_key, uint32_t addr, uint32_t parity) {
   mbar_canonical(cta_key, addr);
-  auto it = g_mbars.find({cta_key, addr});
-  if (it == g_mbars.end()) {
-    static bool warned = false;
-    if (!warned) {
+  MbarShard &sh = mbar_shard(cta_key);
+  std::lock_guard<std::mutex> lk(sh.mu);
+  auto it = sh.map.find({cta_key, addr});
+  if (it == sh.map.end()) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true))
       std::printf("yasai-func: mbarrier wait on 0x%x without init; treated as complete\n", addr);
-      warned = true;
-    }
     return true;
   }
   const bool done = (it->second.phase & 1u) != (parity & 1u);
@@ -745,7 +789,12 @@ bool mbar_phase_done(uint64_t cta_key, uint32_t addr, uint32_t parity) {
   return done;
 }
 
-void mbar_inval(uint64_t cta_key, uint32_t addr) { mbar_canonical(cta_key, addr); g_mbars.erase({cta_key, addr}); }
+void mbar_inval(uint64_t cta_key, uint32_t addr) {
+  mbar_canonical(cta_key, addr);
+  MbarShard &sh = mbar_shard(cta_key);
+  std::lock_guard<std::mutex> lk(sh.mu);
+  sh.map.erase({cta_key, addr});
+}
 
 namespace {
 
@@ -777,6 +826,185 @@ const symbol *function_of(uint64_t value) {
   std::shared_lock<std::shared_mutex> lk(func_handles_mu());
   const uint64_t idx = value & 0x0000ffffffffffffull;
   return idx < g_func_symbols.size() ? g_func_symbols[idx] : nullptr;
+}
+
+// ---- CTA-parallel functional execution ----------------------------------------------------------
+
+thread_local ThreadCounts *t_counts = nullptr;
+
+unsigned func_threads() {
+  static const unsigned n = [] {
+    const char *v = std::getenv("YASAI_FUNC_THREADS");
+    long t = (v != nullptr && *v != '\0') ? std::strtol(v, nullptr, 10) : 1;
+    if (t < 1) t = 1;
+    if (t > long(kMaxFuncThreads)) t = kMaxFuncThreads;
+    return unsigned(t);
+  }();
+  return n;
+}
+
+namespace {
+
+// Pool index of the calling thread: 1 .. kMaxFuncThreads - 1 on a worker thread, -1 elsewhere.
+thread_local int t_pool_index = -1;
+
+// One worker thread of the pool.
+struct PoolWorker {
+  std::mutex mu;                 // guards the wake-up of the worker (gen changes under it)
+  std::condition_variable cv;    // signalled when gen changes
+  std::atomic<uint64_t> gen{0};  // jobs given to this worker so far
+};
+
+// The pool: worker threads 1 .. started, the current job and the number of workers still running
+// it. Created at the first parallel step (in a forked child again: the parent's workers do not
+// exist there) and never destroyed, because detached workers wait on it until the process exits.
+struct Pool {
+  unsigned started = 0;                                // workers started (indices 1 .. started)
+  PoolWorker workers[kMaxFuncThreads];                 // index 0 is the caller, unused
+  const std::function<void(unsigned)> *job = nullptr;  // the current job
+  std::atomic<unsigned> pending{0};                    // workers still running the job
+  std::mutex done_mu;                                  // guards the wake-up of the caller
+  std::condition_variable done_cv;                     // signalled when pending reaches 0
+  std::mutex run_mu;                                   // serializes pool_run
+};
+
+Pool *g_pool = nullptr;                      // the pool of this process (see Pool)
+std::mutex *g_pool_mu = new std::mutex;      // guards the creation of g_pool
+
+// Spin iterations of a waiting pool thread before it blocks (about 30 us).
+constexpr int kPoolSpin = 2000;
+
+// Pause hint of a spin loop.
+inline void cpu_relax() {
+#if defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#endif
+}
+
+// Runs the jobs given to worker idx of pool p, forever.
+void pool_worker_main(Pool *p, unsigned idx) {
+  t_pool_index = int(idx);
+  PoolWorker &w = p->workers[idx];
+  uint64_t seen = 0;
+  for (;;) {
+    uint64_t g = w.gen.load(std::memory_order_acquire);
+    for (int i = 0; i < kPoolSpin && g == seen; i++) {
+      cpu_relax();
+      g = w.gen.load(std::memory_order_acquire);
+    }
+    if (g == seen) {
+      std::unique_lock<std::mutex> lk(w.mu);
+      w.cv.wait(lk, [&] { return w.gen.load(std::memory_order_acquire) != seen; });
+      g = w.gen.load(std::memory_order_acquire);
+    }
+    seen = g;
+    (*p->job)(idx);
+    if (p->pending.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      std::lock_guard<std::mutex> lk(p->done_mu);
+      p->done_cv.notify_one();
+    }
+  }
+}
+
+// In a forked child: the parent's worker threads are gone, so the next parallel step creates a
+// new pool (the old one is left as it is; its mutexes may be held by threads that no longer
+// exist).
+void pool_atfork_child() {
+  g_pool = nullptr;
+  g_pool_mu = new std::mutex;
+}
+
+// The pool, created on first use.
+Pool *pool() {
+  std::lock_guard<std::mutex> lk(*g_pool_mu);
+  if (g_pool == nullptr) {
+    static bool atfork_registered = false;
+    if (!atfork_registered) {
+      pthread_atfork(nullptr, nullptr, pool_atfork_child);
+      atfork_registered = true;
+    }
+    g_pool = new Pool;
+  }
+  return g_pool;
+}
+
+}  // namespace
+
+int thread_index() {
+  if (t_pool_index >= 0) return t_pool_index;
+#ifdef FLASH_GPGPU_SIM_OMP
+  return omp_get_thread_num();
+#else
+  return 0;
+#endif
+}
+
+void pool_run(unsigned n, const std::function<void(unsigned)> &job) {
+  if (n > kMaxFuncThreads) n = kMaxFuncThreads;
+  if (n <= 1) {
+    job(0);
+    return;
+  }
+  Pool *p = pool();
+  std::lock_guard<std::mutex> run_lk(p->run_mu);
+  while (p->started + 1 < n) {
+    const unsigned idx = ++p->started;
+    std::thread(pool_worker_main, p, idx).detach();
+  }
+  p->job = &job;
+  p->pending.store(n - 1, std::memory_order_relaxed);
+  for (unsigned i = 1; i < n; i++) {
+    PoolWorker &w = p->workers[i];
+    {
+      std::lock_guard<std::mutex> lk(w.mu);
+      w.gen.fetch_add(1, std::memory_order_release);
+    }
+    w.cv.notify_one();
+  }
+  job(0);
+  for (int i = 0; i < kPoolSpin && p->pending.load(std::memory_order_acquire) != 0; i++)
+    cpu_relax();
+  if (p->pending.load(std::memory_order_acquire) != 0) {
+    std::unique_lock<std::mutex> lk(p->done_mu);
+    p->done_cv.wait(lk, [&] { return p->pending.load(std::memory_order_acquire) == 0; });
+  }
+}
+
+void flush_thread_counts(ThreadCounts &c, unsigned *ptx_insn) {
+  __atomic_fetch_add(&g_counters.warp_insts, c.warp_insts, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&g_counters.thread_insts, c.thread_insts, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&g_counters.skipped_fp_warp, c.skipped_fp_warp, __ATOMIC_RELAXED);
+  if (ptx_insn != nullptr) __atomic_fetch_add(ptx_insn, unsigned(c.ptx_insn), __ATOMIC_RELAXED);
+  c = ThreadCounts();
+}
+
+namespace {
+
+// The mutexes of RmwGuard.
+std::mutex g_rmw_locks[RmwGuard::kRmwLocks];
+
+}  // namespace
+
+RmwGuard::RmwGuard(uint64_t addr, uint64_t bytes) {
+  const uint64_t g0 = addr >> 6;
+  const uint64_t g1 = (addr + (bytes ? bytes : 1) - 1) >> 6;
+  const uint64_t k = g1 - g0 + 1;
+  if (k >= kRmwLocks) {
+    m_first = 0;
+    m_count = kRmwLocks;
+  } else {
+    m_first = unsigned(g0 % kRmwLocks);
+    m_count = unsigned(k);
+  }
+  // Increasing index order: a run that wraps takes the low part first.
+  const unsigned end = m_first + m_count;
+  if (end > kRmwLocks)
+    for (unsigned i = 0; i < end - kRmwLocks; i++) g_rmw_locks[i].lock();
+  for (unsigned i = m_first; i < end && i < kRmwLocks; i++) g_rmw_locks[i].lock();
+}
+
+RmwGuard::~RmwGuard() {
+  for (unsigned i = 0; i < m_count; i++) g_rmw_locks[(m_first + i) % kRmwLocks].unlock();
 }
 
 }  // namespace yasai_func

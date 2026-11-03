@@ -29,6 +29,7 @@
 #define YASAI_FUNC_H
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -238,7 +239,7 @@ uint64_t own_rank_bits();
 unsigned current_rank();
 void set_current_rank(unsigned rank);
 
-// State of the cluster that the functional executor runs; one cluster at a time.
+// State of a cluster that the functional executor runs; all CTAs of a cluster run on one thread.
 struct ClusterState {
   unsigned size = 0;                   // CTAs in the cluster
   std::vector<void *> smem;            // rank -> the CTA's own shared memory (memory_space *)
@@ -250,7 +251,8 @@ struct ClusterState {
   unsigned barrier_phase = 0;          // completed barrier.cluster phases
 };
 
-// The executing cluster, or null when the launch has no cluster (or between clusters).
+// The cluster the calling thread executes, or null when the launch has no cluster (or between
+// clusters). Per thread, as current_rank().
 ClusterState *cluster();
 
 // Starts (state non-null) or ends (null) the execution of a cluster.
@@ -323,6 +325,64 @@ uint64_t function_handle(const symbol *s);
 
 // Returns the function symbol of a handle, or null when value is not a handle.
 const symbol *function_of(uint64_t value);
+
+// ---- CTA-parallel functional execution (YASAI_FUNC_THREADS) -----------------------------------
+// With YASAI_FUNC_THREADS=N (N > 1) the simulation thread steps the CTA groups of a kernel run on
+// a pool of N host threads (yasai_func_run::step in cuda-sim.cc); the simulation thread is pool
+// thread 0 and N - 1 worker threads are started at the first parallel step. N = 1 (the default)
+// keeps the serial code path. The functions below are the shared state that parallel CTAs need.
+
+// Most pool threads (the size of the per-thread tables of dyn_ptx_inst_manager and ptx-stats).
+constexpr unsigned kMaxFuncThreads = 32;
+
+// YASAI_FUNC_THREADS, clamped to [1, kMaxFuncThreads] (read once).
+unsigned func_threads();
+
+// Index of the calling thread in the per-thread tables: the pool index of a pool worker
+// (1 .. N - 1), otherwise omp_get_thread_num() (0 outside an OpenMP region, which includes the
+// simulation thread).
+int thread_index();
+
+// Runs job(i) for i in [0, n) on n pool threads, the caller as thread 0, and returns when every
+// call has returned. n is at most kMaxFuncThreads; calls are serialized.
+//   n: threads (1 runs job(0) on the caller); job: the work of one thread
+void pool_run(unsigned n, const std::function<void(unsigned)> &job);
+
+// Counts of one pool thread during a parallel step, added to the kernel scope's counters and the
+// process instruction count by flush_thread_counts (instead of a shared counter per instruction).
+struct ThreadCounts {
+  uint64_t ptx_insn = 0;         // thread instructions (cuda_sim::g_ptx_sim_num_insn)
+  uint64_t warp_insts = 0;       // see count_warp_inst
+  uint64_t thread_insts = 0;     // see count_warp_inst
+  uint64_t skipped_fp_warp = 0;  // see skip_fp_value
+};
+
+// The calling thread's counts while it executes a share of a parallel step, else null.
+extern thread_local ThreadCounts *t_counts;
+
+// Adds c to the selected scope's counters and to *ptx_insn (the process instruction count), with
+// atomic additions, and clears c.
+void flush_thread_counts(ThreadCounts &c, unsigned *ptx_insn);
+
+// Locks that make read-modify-write updates of memory atomic across pool threads: atom, red and
+// multimem reductions on simulator storage and on host_window memory (which also use host
+// compare-and-swap, for other processes), and the bulk and tensor reductions of TMA. A lock
+// covers a 64-byte granule of addresses; granule g uses mutex g mod kRmwLocks, so a range of
+// granules uses a run of consecutive mutexes, which it takes in increasing index order (all of
+// them for a range of kRmwLocks granules or more).
+class RmwGuard {
+ public:
+  static constexpr unsigned kRmwLocks = 1024;  // mutexes
+  // Locks the granules of [addr, addr + bytes) (bytes 0 counts as 1).
+  RmwGuard(uint64_t addr, uint64_t bytes);
+  ~RmwGuard();
+  RmwGuard(const RmwGuard &) = delete;
+  RmwGuard &operator=(const RmwGuard &) = delete;
+
+ private:
+  unsigned m_first = 0;  // mutex index of the first granule
+  unsigned m_count = 0;  // mutexes locked from m_first on, modulo kRmwLocks
+};
 
 }  // namespace yasai_func
 

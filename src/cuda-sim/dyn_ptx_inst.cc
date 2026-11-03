@@ -1,6 +1,7 @@
 #include "dyn_ptx_inst.h"
 
 #include "ptx_ir.h"
+#include "yasai_func.h"
 
 #ifdef FLASH_GPGPU_SIM_OMP
 #include <omp.h>
@@ -19,6 +20,7 @@ dyn_ptx_inst_manager::dyn_ptx_inst_manager()
 dyn_ptx_inst_manager::dyn_ptx_inst_manager() : m_thread_cnt(1) {
 #endif
   m_all_inst_mem.resize(m_thread_cnt);
+  m_insert_mu.reset(new std::mutex[m_thread_cnt]);
 }
 
 dyn_ptx_inst_manager::~dyn_ptx_inst_manager() {
@@ -43,6 +45,7 @@ dyn_ptx_inst_manager::get_or_allocate(int thread_id, uint64_t pc,
   if (it == thread_inst_mem.end()) {
     // allocate a new dynamic instruction
     auto *inst = new ptx_instruction(*static_inst);
+    std::lock_guard<std::mutex> lk(m_insert_mu[thread_id]);
     it = thread_inst_mem.emplace(pc, inst).first;
 #ifdef FLASH_GPGPU_SIM_OMP
     // printf("GPGPU-Sim PTX: Thread %d allocated dyn ptx_inst for PC 0x%llx\n",
@@ -56,7 +59,8 @@ const ptx_instruction *
 dyn_ptx_inst_manager::get_or_allocate(uint64_t pc,
                                       const ptx_instruction *static_inst) {
 #ifdef FLASH_GPGPU_SIM_OMP
-  int thread_id = omp_get_thread_num();
+  // yasai: the OpenMP thread, or the pool thread of a parallel functional step.
+  int thread_id = yasai_func::thread_index();
   assert(thread_id < FLASH_GPGPU_SIM_OMP_MAX_THREADS);
 #else
   int thread_id = 0;
@@ -68,6 +72,7 @@ void dyn_ptx_inst_manager::update_predecoded_inst_impl(
     uint64_t pc, ptx_instruction *static_inst) {
   for (int thread_id = 0; thread_id < m_thread_cnt; thread_id++) {
     auto &thread_inst_mem = m_all_inst_mem[thread_id];
+    std::lock_guard<std::mutex> lk(m_insert_mu[thread_id]);
     auto it = thread_inst_mem.find(pc);
     if (it == thread_inst_mem.end()) {
       continue;

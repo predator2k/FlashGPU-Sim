@@ -50,8 +50,10 @@ class ptx_recognizer;
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <atomic>
 #include <cmath>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -1555,6 +1557,12 @@ void atom_callback(const inst_t *inst, ptx_thread_info *thread) {
   else
     abort();
 
+  // yasai: a global atom holds the RmwGuard of its address, so it is atomic with respect to the
+  // atomics, reductions and TMA reductions that other pool threads (YASAI_FUNC_THREADS) execute;
+  // shared memory belongs to one CTA or cluster, which one thread runs.
+  std::optional<yasai_func::RmwGuard> rmw_guard;
+  if (space == global_space)
+    rmw_guard.emplace(effective_address, size / 8);
   // yasai: a word of memory shared with other processes is updated with a host
   // compare-and-swap loop, so that the atomic holds across processes.
   if (yasai_atom_is_shared(pI, space, effective_address)) {
@@ -2026,6 +2034,8 @@ void fence_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   // fence instruction - memory barrier
   // Currently treated as NOP since memory ordering is not simulated
   GPPRINTF_INST_EXEC(WIP, "[STUB] fence instruction not implemented%s\n", "");
+  // yasai: as membar, a host fence orders the stores of pool threads.
+  std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
 void griddepcontrol_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
@@ -2780,7 +2790,7 @@ void mma_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst) {
 }
 
 void call_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
-  static unsigned call_uid_next = 1;
+  static std::atomic<unsigned> call_uid_next{1};  // yasai: calls on pool threads
 
   const operand_info &target = pI->func_addr();
   const symbol *func_addr = NULL;
@@ -2809,20 +2819,28 @@ void call_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   // (about 2e9 lines for __assertfail in one run, two 110 GB logs); it is printed only with
   // YASAI_PDOM_VERBOSE=1.
   static const bool pdom_verbose = getenv("YASAI_PDOM_VERBOSE") && atoi(getenv("YASAI_PDOM_VERBOSE")) != 0;
-  if (target_func->is_pdom_set()) {
+  // yasai: with YASAI_FUNC_THREADS several pool threads can reach the first call of a function at
+  // once; the analysis runs under the PTX load mutex, and the flag is read again inside it.
+  bool pdom_set = target_func->is_pdom_set();
+  std::atomic_thread_fence(std::memory_order_acquire);
+  if (pdom_set) {
     if (pdom_verbose)
       printf("GPGPU-Sim PTX: PDOM analysis already done for %s \n",
              target_func->get_name().c_str());
   } else {
-    printf("GPGPU-Sim PTX: finding reconvergence points for \'%s\'...\n",
-           target_func->get_name().c_str());
-    /*
-     * Some of the instructions like printf() gives the gpgpusim the wrong
-     * impression that it is a function call. As printf() doesnt have a body
-     * like functions do, doing pdom analysis for printf() causes a crash.
-     */
-    if (target_func->get_function_size() > 0) target_func->do_pdom();
-    target_func->set_pdom();
+    std::lock_guard<std::recursive_mutex> pdom_lk(yasai_func::ptx_load_mutex());
+    if (!target_func->is_pdom_set()) {
+      printf("GPGPU-Sim PTX: finding reconvergence points for \'%s\'...\n",
+             target_func->get_name().c_str());
+      /*
+       * Some of the instructions like printf() gives the gpgpusim the wrong
+       * impression that it is a function call. As printf() doesnt have a body
+       * like functions do, doing pdom analysis for printf() causes a crash.
+       */
+      if (target_func->get_function_size() > 0) target_func->do_pdom();
+      std::atomic_thread_fence(std::memory_order_release);
+      target_func->set_pdom();
+    }
   }
 
   // check that number of args and return match function requirements
@@ -2897,7 +2915,7 @@ void call_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   }
 
   thread->callstack_push(callee_pc + pI->inst_size(), callee_rpc,
-                         return_var_src, return_var_dst, call_uid_next++);
+                         return_var_src, return_var_dst, call_uid_next.fetch_add(1, std::memory_order_relaxed));
 
   copy_buffer_list_into_frame(thread, arg_values);
 
@@ -2906,7 +2924,7 @@ void call_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
 // Ptxplus version of call instruction. Jumps to a label not a different Kernel.
 void callp_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
-  static unsigned call_uid_next = 1;
+  static std::atomic<unsigned> call_uid_next{1};  // yasai: calls on pool threads
 
   const operand_info &target = pI->dst();
   ptx_reg_t target_pc =
@@ -2924,7 +2942,7 @@ void callp_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   }
 
   thread->callstack_push_plus(callee_pc + pI->inst_size(), callee_rpc,
-                              return_var_src, return_var_dst, call_uid_next++);
+                              return_var_src, return_var_dst, call_uid_next.fetch_add(1, std::memory_order_relaxed));
   thread->set_npc(target_pc);
 }
 
@@ -5397,6 +5415,9 @@ void max_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
 void membar_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   // handled by timing simulator
+  // yasai: CTAs on other pool threads (YASAI_FUNC_THREADS) observe the stores before the fence
+  // no later than the stores after it.
+  std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
 void min_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
