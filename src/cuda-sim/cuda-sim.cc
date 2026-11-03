@@ -52,6 +52,7 @@ typedef void *yyscan_t;
 #include <stdio.h>
 #include <time.h>
 #include <algorithm>
+#include <regex>
 #include <map>
 #include <set>
 #include <sstream>
@@ -3676,6 +3677,21 @@ int yasai_env_int(const char *name, int dflt) {
 // Bytes per memcpy_to_gpu call of a host-executed fill (whole elements; 1 MiB).
 size_t yasai_fill_chunk_bytes() { return size_t(1) << 20; }
 
+// Whether a kernel's co-resident CTAs interleave: YASAI_CTA_INTERLEAVE=1 and, when
+// YASAI_CTA_INTERLEAVE_REGEX is set, the kernel name matches it (std::regex_search with the
+// ECMAScript grammar, as the CTA sampling lists; anchor with ^ to match a prefix). Without the
+// regex every kernel interleaves under YASAI_CTA_INTERLEAVE=1, as before.
+//   name: the kernel's name (as kernel_begin sees it)
+bool yasai_interleave_kernel(const std::string &name) {
+  if (yasai_env_int("YASAI_CTA_INTERLEAVE", 0) != 1) return false;
+  static const char *r = getenv("YASAI_CTA_INTERLEAVE_REGEX");
+  if (r == NULL || *r == '\0') return true;
+  static const std::regex rx(r);
+  const bool on = std::regex_search(name, rx);
+  printf("yasai-func cta-interleave=%d kernel=%s\n", on ? 1 : 0, name.c_str());
+  return on;
+}
+
 // Real monotonic wall time in seconds (progress lines of yasai_func_run); a direct system call,
 // so a time-dilation preload does not stretch the progress period (yasai_realtime.h).
 double yasai_mono_s() {
@@ -3831,7 +3847,7 @@ yasai_func_run::yasai_func_run(cuda_sim *sim, kernel_info_t &kernel, bool openCL
   unsigned ngroups = 1;
   if (m_coop)
     ngroups = total_groups;  // the launch checked that the grid fits
-  else if ((!m_exclusive || m_csize > 1) && yasai_env_int("YASAI_CTA_INTERLEAVE", 0) == 1)
+  else if ((!m_exclusive || m_csize > 1) && yasai_interleave_kernel(m_name))
     // A cluster launch stays exclusive (no other kernel beside it) but keeps its co-resident
     // clusters active together: a persistent kernel whose clusters wait for each other through
     // global memory (DeepGEMM's mega_gate with 2-SM UMMA, ScoreBarrier over all its CTAs) never

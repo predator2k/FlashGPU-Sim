@@ -173,7 +173,8 @@ class cuda_sim;
  *   * the co-resident limit (the reported SM count x CTAs per SM for this kernel, from the
  *     device properties the application sees, not from the functional cores; divided by
  *     the cluster size) when CTA interleaving is on: YASAI_CTA_INTERLEAVE=1, cluster
- *     launches included;
+ *     launches included, and, when YASAI_CTA_INTERLEAVE_REGEX is set, only for kernels whose
+ *     names it matches (regex_search, ECMAScript; the others run one group at a time);
  *   * one otherwise (CTA-at-a-time, the former order).
  * A kernel that launches with clusters, except cooperatively without tensor memory, is
  * exclusive: no other kernel runs beside it, and without CTA interleaving it runs with one
