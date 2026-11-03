@@ -1603,6 +1603,15 @@ class function_info {
     const auto it = m_ptx_kernel_param_info.find(i);
     return it == m_ptx_kernel_param_info.end() ? 0 : it->second.get_size() / 8;
   }
+  // yasai: the symbol of the PTX entry's parameter i, or null (lazy execution's analysis).
+  //   i: parameter index (0 is the first parameter)
+  const symbol *yasai_param_symbol(unsigned i) {
+    const auto it = m_ptx_kernel_param_info.find(i);
+    if (it == m_ptx_kernel_param_info.end() || m_symtab == NULL) return NULL;
+    return m_symtab->lookup(it->second.get_name().c_str());
+  }
+  // yasai: the function's instructions in program order (lazy execution's analysis).
+  const std::list<ptx_instruction *> &yasai_instructions() const { return m_instructions; }
   // yasai: PTX file the function's code was parsed from (the source file of its first
   // instruction; the files are named after the library or JIT image they came from), or "" for
   // a function without instructions. Used by the fakeenv kernel record for kernel identity.

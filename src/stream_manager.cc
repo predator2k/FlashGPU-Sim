@@ -29,6 +29,7 @@
 #include "stream_manager.h"
 #include "../libcuda/gpgpu_context.h"
 #include "cuda-sim/cuda-sim.h"
+#include "cuda-sim/yasai_lazy.h"
 #include "gpgpu-sim/gpu-sim.h"
 #include "gpgpusim_entrypoint.h"
 #include "yasai_realtime.h"
@@ -250,6 +251,9 @@ bool stream_operation::do_operation(gpgpu_sim *gpu) {
       m_stream->record_next_done();
       break;
     case stream_host_fn:
+      // yasai: a host function may read any device memory: every pending deferred kernel runs
+      // first (yasai_lazy.h).
+      yasai_lazy::observe_all("host function");
       // yasai: completed by the host-callback thread when the function returns.
       yasai_host_callbacks::get().post(m_host_fn, m_host_fn_user, m_stream);
       break;
@@ -447,6 +451,8 @@ bool stream_manager::register_finished_kernel(unsigned grid_uid) {
       stream->yasai_note_kernel_done();
       stream->record_next_done();
       m_grid_id_to_stream.erase(grid_uid);
+      // yasai: a deferred launch stays alive; lazy execution runs and deletes it.
+      if (kernel->yasai_lazy_keep()) return true;
       kernel->notify_parent_finished();
       delete kernel;
       return true;

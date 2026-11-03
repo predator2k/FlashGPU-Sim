@@ -184,6 +184,18 @@ bool forget_alloc(uint64_t base);
 /// @return True when addr lies in a known allocation or mapping.
 bool range_of(uint64_t addr, uint64_t *base, size_t *size);
 
+/// Finds the allocation or mapping that holds `addr`, as range_of, and tells whether it is shared
+/// with another process (it has a segment: exported, opened from another process, created with
+/// YASAI_DEVMEM_EAGER_MEMFD=1, or bound to a multicast object) or private to this process
+/// (anonymous memory, or the simulator's own storage). Lazy kernel execution defers only kernels
+/// whose memory is private.
+/// @param addr Any device address.
+/// @param base Receives the first address.
+/// @param size Receives the length.
+/// @param shared Receives whether the memory has a segment.
+/// @return True when addr lies in a known allocation or mapping.
+bool private_range_of(uint64_t addr, uint64_t *base, size_t *size, bool *shared);
+
 /// Legacy IPC export of the allocation that holds `addr`: returns its segment ref (moving a
 /// storage allocation into a segment first, once).
 /// @param addr Address inside a cudaMalloc allocation.

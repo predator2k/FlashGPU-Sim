@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <list>
 #include <map>
+#include <memory>
 #include <string>
 
 #ifdef FLASH_GPGPU_SIM_OMP
@@ -18,6 +19,9 @@ class memory_space;
 struct CUstream_st;
 struct cudaArray;
 struct textureInfo;
+namespace yasai_lazy {
+struct LaunchInfo;
+}
 
 #if !defined(__VECTOR_TYPES_H__)
 #include "vector_types.h"
@@ -266,8 +270,17 @@ public:
   unsigned long long yasai_fill_dst() const { return m_yasai_fill_dst; }
   unsigned long long yasai_fill_count() const { return m_yasai_fill_count; }
   const std::string &yasai_fill_pattern() const { return m_yasai_fill_pattern; }
+  // yasai: lazy execution state of the launch (yasai_lazy.h), set at launch.
+  void set_yasai_lazy(const std::shared_ptr<yasai_lazy::LaunchInfo> &info) { m_yasai_lazy = info; }
+  std::shared_ptr<yasai_lazy::LaunchInfo> yasai_lazy() const { return m_yasai_lazy; }
+  // yasai: a deferred launch (yasai_lazy) that the stream registers as finished but must not
+  // delete: lazy execution owns it and runs it later.
+  void set_yasai_lazy_keep(bool keep) { m_yasai_lazy_keep = keep; }
+  bool yasai_lazy_keep() const { return m_yasai_lazy_keep; }
 
 private:
+  std::shared_ptr<yasai_lazy::LaunchInfo> m_yasai_lazy;  // yasai: see set_yasai_lazy
+  bool m_yasai_lazy_keep = false;                        // yasai: see set_yasai_lazy_keep
   bool m_yasai_host_fill = false;            // yasai: see set_yasai_host_fill
   unsigned long long m_yasai_fill_dst = 0;   // yasai: fill destination (device address)
   unsigned long long m_yasai_fill_count = 0; // yasai: fill element count

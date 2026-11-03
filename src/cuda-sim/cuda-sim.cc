@@ -78,6 +78,7 @@ typedef void *yyscan_t;
 
 #include "dyn_ptx_inst.h"
 #include "yasai_func.h"
+#include "yasai_lazy.h"
 
 int g_debug_execution = 0;
 // Output debug information to file options
@@ -988,6 +989,8 @@ void gpgpu_t::memcpy_to_gpu(size_t dst_start_addr, const void *src,
         count, (unsigned long long)src, (unsigned long long)dst_start_addr, m_global_mem);
     fflush(stdout);
   }
+  // yasai: pending deferred kernels that read or write the range run first (yasai_lazy.h).
+  yasai_lazy::observe(0, 0, dst_start_addr, count);
   {
     host_window::copy_zero_skip_scope copy;  // yasai: zero-over-zero pieces may be skipped
     shared_devmem::exec_scope work;  // yasai: no conversion during the copy
@@ -1010,6 +1013,8 @@ void gpgpu_t::memcpy_from_gpu(void *dst, size_t src_start_addr, size_t count) {
     fflush(stdout);
   }
   unsigned char *dst_data = (unsigned char *)dst;
+  // yasai: pending deferred kernels that write the range run first (yasai_lazy.h).
+  yasai_lazy::observe(src_start_addr, count, 0, 0);
   m_global_mem->read(src_start_addr, count, dst_data);
 
   // Copy into the performance model.
@@ -1027,6 +1032,7 @@ void gpgpu_t::memcpy_gpu_to_gpu(size_t dst, size_t src, size_t count) {
            count, (unsigned long long)src, (unsigned long long)dst);
     fflush(stdout);
   }
+  yasai_lazy::observe(src, count, dst, count);  // yasai: see memcpy_to_gpu
   host_window::copy_zero_skip_scope copy;  // yasai: zero-over-zero bytes may be skipped
   shared_devmem::exec_scope work;          // yasai: no conversion during the copy
   for (unsigned n = 0; n < count; n++) {
@@ -1049,6 +1055,7 @@ void gpgpu_t::gpu_memset(size_t dst_start_addr, int c, size_t count) {
     fflush(stdout);
   }
   unsigned char c_value = (unsigned char)c;
+  yasai_lazy::observe(0, 0, dst_start_addr, count);  // yasai: see memcpy_to_gpu
   host_window::copy_zero_skip_scope copy;  // yasai: zero-over-zero bytes may be skipped
   shared_devmem::exec_scope work;          // yasai: no conversion during the memset
   for (unsigned n = 0; n < count; n++)
@@ -3525,6 +3532,11 @@ void cuda_sim::gpgpu_ptx_sim_memcpy_symbol(const char *hostVar, const void *src,
       "GPGPU-Sim PTX: gpgpu_ptx_sim_memcpy_symbol: copying %s memory %zu bytes "
       "%s symbol %s+%zu @0x%x ...\n",
       mem_name, count, (to ? " to " : "from"), sym_name.c_str(), offset, dst);
+  // yasai: pending deferred kernels that use the variable run first (yasai_lazy.h).
+  if (to)
+    yasai_lazy::observe(0, 0, dst, count);
+  else
+    yasai_lazy::observe(dst, count, 0, 0);
   for (unsigned n = 0; n < count; n++) {
     if (to)
       mem->write(dst + n, 1, ((char *)src) + n, NULL, NULL);
@@ -3706,6 +3718,18 @@ bool yasai_interleave_kernel(const std::string &name) {
   return on;
 }
 
+}  // namespace
+
+bool yasai_func_interleaves(const std::string &name) {
+  if (yasai_env_int("YASAI_CTA_INTERLEAVE", 0) != 1) return false;
+  static const char *r = getenv("YASAI_CTA_INTERLEAVE_REGEX");
+  if (r == NULL || *r == '\0') return true;
+  static const std::regex rx(r);
+  return std::regex_search(name, rx);
+}
+
+namespace {
+
 // Real monotonic wall time in seconds (progress lines of yasai_func_run); a direct system call,
 // so a time-dilation preload does not stretch the progress period (yasai_realtime.h).
 double yasai_mono_s() {
@@ -3727,8 +3751,8 @@ bool yasai_func_run::is_exclusive(kernel_info_t &kernel) {
   return true;
 }
 
-yasai_func_run::yasai_func_run(cuda_sim *sim, kernel_info_t &kernel, bool openCL)
-    : m_sim(sim), m_kernel(kernel), m_openCL(openCL) {
+yasai_func_run::yasai_func_run(cuda_sim *sim, kernel_info_t &kernel, bool openCL, bool deferred)
+    : m_sim(sim), m_kernel(kernel), m_openCL(openCL), m_deferred(deferred) {
   gpgpu_context *gpgpu_ctx = sim->gpgpu_ctx;
   printf(
       "GPGPU-Sim: Performing Functional Simulation, executing kernel %s...\n",
@@ -4264,7 +4288,7 @@ void yasai_func_run::finish() {
   // openCL kernel simulation calls don't register the kernel so we don't
   // register its exit
   if (m_coop) yasai_func::grid_ws_give(m_kernel.yasai_grid_ws());
-  if (!m_openCL) {
+  if (!m_openCL && !m_deferred) {
     gpgpu_ctx->the_gpgpusim->g_stream_manager->register_finished_kernel(m_kernel.get_uid());
   }
   yasai_func::kernel_end(m_name, m_grid, m_block);
