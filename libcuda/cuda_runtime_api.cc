@@ -4635,33 +4635,50 @@ __host__ cudaError_t CUDARTAPI cudaEventElapsedTime(float *ms,
   CUevent_st *s = get_event(start);
   CUevent_st *e = get_event(end);
   if (s == NULL || e == NULL) return g_last_cudaError = cudaErrorUnknown;
-  // yasai: the interval is the simulated time between the two event updates when the performance
-  // model advanced its cycle count between them (cycles / core clock), else the monotonic clock
-  // between the two updates (the functional simulator models no time). The former used the
-  // events' calendar clocks in whole seconds, so every interval under 1 s was 0 ms (PyTorch
-  // Inductor's coordinate-descent tuner then divided by zero). An interval that contains a
-  // finished kernel is at least 1 ns. YASAI_EVENT_TIME_REPORT=1 prints the source per call.
+  // yasai: the interval between the two event updates, by the first source that applies:
+  //   simulated               the performance model advanced its cycle count: cycles / core clock;
+  //   monotonic               only with YASAI_EVENT_TIME_MONOTONIC=1: the host monotonic clock
+  //                           between the updates (simulator wall time, not reproducible);
+  //   functional_kernel_count otherwise (the functional simulator models no time): kernels the
+  //                           start event's stream finished between the updates (the whole
+  //                           process's when the events lie on different streams) times
+  //                           YASAI_EVENT_KERNEL_QUANTUM_NS (default 1000 ns). Reruns give the same
+  //                           value, an interval with a kernel is above 0, one without is 0, and
+  //                           every candidate of an autotuning benchmark ties.
+  // The former used the events' calendar clocks in whole seconds, so every interval under 1 s
+  // was 0 ms (PyTorch Inductor's coordinate-descent tuner then divided by zero).
+  // YASAI_EVENT_TIME_REPORT=1 prints the value and its source per call.
   if (!e->done() || !s->done()) return g_last_cudaError = cudaErrorNotReady;
   double elapsed_ms = 0.0;
-  const char *source = "monotonic";
+  const char *source = "functional_kernel_count";
   const double cycles = e->sim_cycle() - s->sim_cycle();
   gpgpu_context *ctx = GPGPU_Context();
   const double freq = ctx->the_gpgpusim->g_the_gpu_config
                           ? (double)ctx->the_gpgpusim->g_the_gpu_config->get_core_freq() : 0.0;
+  static const bool monotonic = getenv("YASAI_EVENT_TIME_MONOTONIC") &&
+                                atoi(getenv("YASAI_EVENT_TIME_MONOTONIC")) != 0;
+  const unsigned long long kernels =
+      e->stream_uid() == s->stream_uid()
+          ? e->stream_kernels_done() - s->stream_kernels_done()
+          : e->kernels_done() - s->kernels_done();
   if (cycles > 0 && freq > 0) {
     elapsed_ms = cycles / freq * 1e3;
     source = "simulated";
+  } else if (monotonic) {
+    elapsed_ms = (double)((long long)e->mono_ns() - (long long)s->mono_ns()) * 1e-6;
+    source = "monotonic";
   } else {
-    const long long dns = (long long)e->mono_ns() - (long long)s->mono_ns();
-    long long ns = dns;
-    if (e->kernels_done() > s->kernels_done() && ns < 1) ns = 1;
-    elapsed_ms = (double)ns * 1e-6;
+    static const double quantum_ns = [] {
+      const char *q = getenv("YASAI_EVENT_KERNEL_QUANTUM_NS");
+      return (q != NULL && *q != '\0') ? atof(q) : 1000.0;
+    }();
+    elapsed_ms = (double)kernels * quantum_ns * 1e-6;
   }
   *ms = (float)elapsed_ms;
   static const bool report = getenv("YASAI_EVENT_TIME_REPORT") && atoi(getenv("YASAI_EVENT_TIME_REPORT")) != 0;
   if (report)
     printf("yasai: cudaEventElapsedTime %.9f ms source=%s kernels=%llu\n", elapsed_ms, source,
-           e->kernels_done() - s->kernels_done());
+           kernels);
   return g_last_cudaError = cudaSuccess;
 }
 

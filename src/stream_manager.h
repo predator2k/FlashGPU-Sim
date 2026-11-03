@@ -29,6 +29,7 @@
 #ifndef STREAM_MANAGER_H_INCLUDED
 #define STREAM_MANAGER_H_INCLUDED
 
+#include <atomic>
 #include <pthread.h>
 #include <stdio.h>
 #include <time.h>
@@ -66,12 +67,17 @@ struct CUevent_st {
   // issues and waits, the simulation thread updates.
   //   cycle: simulated core cycles so far (gpu_tot_sim_cycle + gpu_sim_cycle; 0 in functional
   //          mode); clk: calendar seconds; mono_ns: monotonic clock in ns (the application's
-  //          clock, so a time-dilation preload applies); kernels: kernels finished so far
-  void update(double cycle, time_t clk, unsigned long long mono_ns, unsigned long long kernels) {
+  //          clock, so a time-dilation preload applies); kernels: kernels finished so far in the
+  //          process; stream_uid / stream_kernels: the recording stream and the kernels it has
+  //          finished so far
+  void update(double cycle, time_t clk, unsigned long long mono_ns, unsigned long long kernels,
+              unsigned stream_uid, unsigned long long stream_kernels) {
     m_wallclock = clk;
     m_gpu_tot_sim_cycle = cycle;
     m_mono_ns = mono_ns;
     m_kernels_done = kernels;
+    m_stream_uid = stream_uid;
+    m_stream_kernels_done = stream_kernels;
     m_done = true;
     if (m_shared) __atomic_fetch_add(&m_shared[1], 1u, __ATOMIC_ACQ_REL);
     else __atomic_fetch_add(&m_updates, 1u, __ATOMIC_ACQ_REL);
@@ -81,6 +87,9 @@ struct CUevent_st {
   double sim_cycle() const { return m_gpu_tot_sim_cycle; }
   unsigned long long mono_ns() const { return m_mono_ns; }
   unsigned long long kernels_done() const { return m_kernels_done; }
+  // yasai: the stream of the last update and the kernels that stream had finished by then.
+  unsigned stream_uid() const { return m_stream_uid; }
+  unsigned long long stream_kernels_done() const { return m_stream_kernels_done; }
   // void set_done() { assert(!m_done); m_done=true; }
   int get_uid() const { return m_uid; }
   unsigned num_updates() const {
@@ -119,6 +128,8 @@ struct CUevent_st {
   double m_gpu_tot_sim_cycle;
   unsigned long long m_mono_ns = 0;       ///< yasai: see update
   unsigned long long m_kernels_done = 0;  ///< yasai: see update
+  unsigned m_stream_uid = 0;                     ///< yasai: see update
+  unsigned long long m_stream_kernels_done = 0;  ///< yasai: see update
 
   static int m_next_event_uid;
 };
@@ -345,8 +356,15 @@ struct CUstream_st {
   void yasai_set_nonblocking(bool nb) { m_yasai_nonblocking = nb; }
   // yasai: a forked child inherits the lock in whatever state the parent's threads left it.
   void reset_lock_after_fork() { pthread_mutex_init(&m_lock, NULL); }
+  /// yasai: counts a kernel of this stream that finished (stream_manager::register_finished_kernel).
+  void yasai_note_kernel_done() { m_yasai_kernels_done.fetch_add(1, std::memory_order_acq_rel); }
+  /// yasai: kernels of this stream finished so far (cudaEventElapsedTime in functional mode).
+  unsigned long long yasai_kernels_done() const {
+    return m_yasai_kernels_done.load(std::memory_order_acquire);
+  }
 
  private:
+  std::atomic<unsigned long long> m_yasai_kernels_done{0};  // yasai: see yasai_kernels_done
   unsigned m_uid;
   static unsigned sm_next_stream_uid;
 

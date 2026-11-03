@@ -311,7 +311,8 @@ bool stream_operation::do_operation(gpgpu_sim *gpu) {
       clock_gettime(CLOCK_MONOTONIC, &ts);
       m_event->update((double)(gpu->gpu_tot_sim_cycle + gpu->gpu_sim_cycle), wallclock,
                       (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec,
-                      yasai_kernels_finished());
+                      yasai_kernels_finished(), m_stream->get_uid(),
+                      m_stream->yasai_kernels_done());
       m_stream->record_next_done();
     } break;
     case stream_wait_event:
@@ -421,7 +422,6 @@ unsigned long long yasai_kernels_finished() {
 
 bool stream_manager::register_finished_kernel(unsigned grid_uid) {
   // called by gpu simulation thread
-  if (grid_uid > 0) g_yasai_kernels_finished.fetch_add(1, std::memory_order_acq_rel);
   if (grid_uid > 0) {
     CUstream_st *stream = m_grid_id_to_stream[grid_uid];
     kernel_info_t *kernel = stream->front().get_kernel();
@@ -442,6 +442,9 @@ bool stream_manager::register_finished_kernel(unsigned grid_uid) {
       //            printf("kernel %d finishes, retires from stream %d\n",
       //            grid_uid, stream->get_uid()); kernel_stat.flush();
       //            kernel_stat.close();
+      // yasai: counted before the stream advances, so an event recorded after the kernel sees it.
+      g_yasai_kernels_finished.fetch_add(1, std::memory_order_acq_rel);
+      stream->yasai_note_kernel_done();
       stream->record_next_done();
       m_grid_id_to_stream.erase(grid_uid);
       kernel->notify_parent_finished();
