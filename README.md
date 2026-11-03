@@ -395,8 +395,14 @@ implementation details.
   resident memory grew by 10 to 13 MB at N=8, against a limit of 8 MB that holds at N=1. The
   regression therefore runs `vmm_anon` with its resident-memory check at N=1, and adds
   `vmm_anon_threads`, which checks at N=8 only that the read sums to 0.
+* **FIO windows.** The unordered FIO window model (`fio_window`, enabled by
+  `YASAI_FIO_UNORDERED_IMPORTS`) keeps its pending writes and its drainer for one simulation
+  thread. While it is enabled the process runs with N=1 whatever `YASAI_FUNC_THREADS` says, and
+  prints `yasai-fio-window: func_threads forced to 1` once when more threads were asked for. The
+  regression item `fio_window_threads` checks this. A thread-safe window is later work.
 * **Records.** Every kernel record of the fakeenv recorder carries `"func_threads":N`, which is
-  the process's `YASAI_FUNC_THREADS`, so that runs with different thread counts are told apart.
+  the thread count the process runs with: `YASAI_FUNC_THREADS`, or 1 when the FIO window model
+  forces it, so that runs with different thread counts are told apart.
 
 ### yasai: lazy kernel execution
 
