@@ -1666,7 +1666,7 @@ static bool yasai_capture_memcpy(void *dst, const void *src, size_t count, enum 
                                  cudaStream_t stream);
 static bool yasai_capture_memset(void *mem, int value, size_t count, cudaStream_t stream);
 static bool yasai_capture_host_fn(cudaStream_t stream, cudaHostFn_t fn, void *user);
-static bool yasai_capture_event_record(cudaEvent_t event, cudaStream_t stream);
+static bool yasai_capture_event_record(cudaEvent_t event, cudaStream_t stream, bool external);
 static bool yasai_capture_wait_event(cudaStream_t stream, cudaEvent_t event);
 
 // yasai: every kernel launch (cudaLaunchKernel, cudaLaunchKernelExC, cuLaunchKernel,
@@ -4215,9 +4215,13 @@ __host__ cudaError_t CUDARTAPI cudaDeviceSetGraphMemAttribute(int, enum cudaGrap
 
 __host__ cudaError_t CUDARTAPI cudaEventRecord(cudaEvent_t event, cudaStream_t stream);
 
-// yasai: see cudaDeviceGetGraphMemAttribute.
+// cudaEventRecordWithFlags: as cudaEventRecord; during a stream capture cudaEventRecordExternal
+// makes the record an event record node of the graph (replayed at every launch), as in CUDA.
+//   event, stream, flags  as in the CUDA runtime API
 __host__ cudaError_t CUDARTAPI cudaEventRecordWithFlags(cudaEvent_t event, cudaStream_t stream,
-                                                        unsigned int) {
+                                                        unsigned int flags) {
+  if (yasai_capture_event_record(event, stream, (flags & cudaEventRecordExternal) != 0))
+    return g_last_cudaError = cudaSuccess;
   return cudaEventRecord(event, stream);
 }
 
@@ -4589,7 +4593,7 @@ __host__ cudaError_t CUDARTAPI cudaEventCreate(cudaEvent_t *event) {
 __host__ cudaError_t CUDARTAPI cudaEventRecord(cudaEvent_t event,
                                                cudaStream_t stream) {
   yasai_rec::Recorder &rec = yasai_rec::Recorder::get();
-  if (yasai_capture_event_record(event, stream)) return g_last_cudaError = cudaSuccess;
+  if (yasai_capture_event_record(event, stream, false)) return g_last_cudaError = cudaSuccess;
   if (!rec.on()) return cudaEventRecordInternal(event, stream);
   const uint64_t t0 = yasai_rec::mono_ns();
   const uint32_t corr = rec.corr();
@@ -11651,8 +11655,11 @@ extern "C" CUresult CUDAAPI cuTensorMapEncodeIm2col(
 
 // ---- yasai: CUDA graphs: stream capture records operations, a graph launch replays them -----
 // Capture: while a stream is being captured, every kernel launch, cudaMemcpyAsync,
-// cudaMemsetAsync, cudaLaunchHostFunc and cudaEventRecord issued to it becomes a node of the
-// stream's graph instead of running. A stream that waits on an event recorded during the capture
+// cudaMemsetAsync, cudaLaunchHostFunc and external event record (cudaEventRecordWithFlags with
+// cudaEventRecordExternal) issued to it becomes a node of the stream's graph instead of running. A
+// plain cudaEventRecord adds no node: as in CUDA it only marks the point that streams waiting on
+// the event depend on, so the event may be destroyed before the graph is launched. A stream that
+// waits on an event recorded during the capture
 // joins the capture (fork/join of multi-stream capture, as NCCL's strong streams and PyTorch's
 // side streams do), and its operations go to the same graph. cudaStreamEndCapture on the origin
 // stream ends the capture for every joined stream.
@@ -11819,13 +11826,23 @@ static bool yasai_capture_host_fn(cudaStream_t stream, cudaHostFn_t fn, void *us
   return yasai_capture_append(stream, std::move(n));
 }
 
-static bool yasai_capture_event_record(cudaEvent_t event, cudaStream_t stream) {
+// An event record on a capturing stream. As in CUDA, a plain record (cudaEventRecord) only marks
+// the capture point for streams that wait on the event (fork/join) and adds no node, so a replay
+// does not touch the event: PyTorch's autograd records such events during a capture and destroys
+// them before the graph is replayed (torchtitan's CUDA graph wrapper; the replay used to fail
+// with cudaErrorUnknown on the destroyed event). An external record (cudaEventRecordWithFlags
+// with cudaEventRecordExternal) becomes an event record node that every launch replays.
+//   event     the event
+//   stream    the stream the record was issued to
+//   external  whether the record carries cudaEventRecordExternal
+static bool yasai_capture_event_record(cudaEvent_t event, cudaStream_t stream, bool external) {
   cudaGraph_t g = yasai_graph_of(stream);
   if (g == nullptr) return false;
   {
     std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
     g_yasai_capture_events[event] = g;
   }
+  if (!external) return true;
   CUgraphNode_st n;
   n.kind = CUgraphNode_st::EVENT_RECORD;
   n.event = event;
