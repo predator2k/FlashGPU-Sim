@@ -350,10 +350,14 @@ implementation details.
 
   Each such launch prints `yasai-func serial kernel=<name> reason=<trace|serial-regex|float-atomic>`.
 * **Determinism.** A kernel whose result does not depend on the order of its CTAs gives the
-  serial result bit for bit. The order of floating-point atomic additions varies between parallel
-  runs, so such sums can differ in the last bits from run to run and from the serial run.
-  `YASAI_FUNC_FLOAT_ATOMIC_SERIAL=1` makes those kernels serial and their results equal to the
-  serial run, which costs their parallel speedup. Integer atomics give the same final values;
+  serial result bit for bit. N>1 is not bit-reproducible for kernels whose result depends on that
+  order: floating-point atomic sums (split-K reductions, histograms) and the counters and flags
+  of NCCL and DeepEP. The regression item `func_float_atomic` measured this: 256 CTAs added
+  floats to one address and 16 bins, and two runs at N=8 gave two different results, both
+  different from the 1-thread result. `YASAI_FUNC_FLOAT_ATOMIC_SERIAL=1` makes the kernels with
+  floating-point atomics serial, which reproduced the 1-thread result in that item at the cost of
+  their parallel speedup. A cell whose acceptance needs bit-identical output, such as
+  triton-10's shard sha256, pins N=1. Integer atomics give the same final values;
   values that a kernel derives from the order of atomics (tickets, `atomicAdd` slot indices) can
   differ, as on a GPU. Device `printf` lines of different CTAs can appear in another order.
   `%smid` keeps its serial value, which is the CTA id modulo the SM count, for kernels without
