@@ -48,6 +48,9 @@
 //    unsigned m_pending_streams;
 //};
 
+/// yasai: number of kernels this process has finished (stream_manager::register_finished_kernel).
+unsigned long long yasai_kernels_finished();
+
 struct CUevent_st {
  public:
   CUevent_st(bool blocking) {
@@ -61,13 +64,23 @@ struct CUevent_st {
   }
   // yasai: the issue and update counts are read and written atomically: the application thread
   // issues and waits, the simulation thread updates.
-  void update(double cycle, time_t clk) {
-    if (m_shared) __atomic_fetch_add(&m_shared[1], 1u, __ATOMIC_ACQ_REL);
-    else __atomic_fetch_add(&m_updates, 1u, __ATOMIC_ACQ_REL);
+  //   cycle: simulated core cycles so far (gpu_tot_sim_cycle + gpu_sim_cycle; 0 in functional
+  //          mode); clk: calendar seconds; mono_ns: monotonic clock in ns (the application's
+  //          clock, so a time-dilation preload applies); kernels: kernels finished so far
+  void update(double cycle, time_t clk, unsigned long long mono_ns, unsigned long long kernels) {
     m_wallclock = clk;
     m_gpu_tot_sim_cycle = cycle;
+    m_mono_ns = mono_ns;
+    m_kernels_done = kernels;
     m_done = true;
+    if (m_shared) __atomic_fetch_add(&m_shared[1], 1u, __ATOMIC_ACQ_REL);
+    else __atomic_fetch_add(&m_updates, 1u, __ATOMIC_ACQ_REL);
   }
+  // yasai: simulated core cycles, monotonic ns and finished-kernel count at the last update
+  // (cudaEventElapsedTime).
+  double sim_cycle() const { return m_gpu_tot_sim_cycle; }
+  unsigned long long mono_ns() const { return m_mono_ns; }
+  unsigned long long kernels_done() const { return m_kernels_done; }
   // void set_done() { assert(!m_done); m_done=true; }
   int get_uid() const { return m_uid; }
   unsigned num_updates() const {
@@ -104,6 +117,8 @@ struct CUevent_st {
   unsigned int m_issued;
   time_t m_wallclock;
   double m_gpu_tot_sim_cycle;
+  unsigned long long m_mono_ns = 0;       ///< yasai: see update
+  unsigned long long m_kernels_done = 0;  ///< yasai: see update
 
   static int m_next_event_uid;
 };

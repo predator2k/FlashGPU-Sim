@@ -490,6 +490,17 @@ class gpgpu_sim_config : public power_config,
   // yasai: per-SM options of the configuration (device properties are filled from them
   // without building the GPU model).
   const shader_core_config &yasai_shader_config() const { return m_shader_config; }
+  // yasai: total L2 size in bytes of the configuration: sets x line size x associativity of one
+  // L2 slice (-gpgpu_cache:dl2 "<type>:<sets>:<line>:<assoc>,...") times the slices
+  // (-gpgpu_n_mem x -gpgpu_n_sub_partition_per_mchannel); 0 when the L2 is not configured.
+  size_t yasai_l2_bytes() const {
+    const char *c = m_memory_config.m_L2_config.m_config_string;
+    unsigned sets = 0, line = 0, assoc = 0;
+    char type = 0;
+    if (c == NULL || sscanf(c, "%c:%u:%u:%u", &type, &sets, &line, &assoc) != 4) return 0;
+    return (size_t)sets * line * assoc * m_memory_config.m_n_mem *
+           m_memory_config.m_n_sub_partition_per_memory_channel;
+  }
   // yasai: compute capability of the configuration.
   unsigned yasai_cc_major() const { return gpgpu_compute_capability_major; }
   unsigned yasai_cc_minor() const { return gpgpu_compute_capability_minor; }

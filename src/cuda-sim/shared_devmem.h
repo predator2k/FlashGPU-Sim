@@ -48,6 +48,8 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace shared_devmem {
 
@@ -205,6 +207,19 @@ bool export_needs_copy(uint64_t addr);
 /// @param bytes Length (0 counts as 1).
 /// @return True when share_range() would copy.
 bool range_needs_copy(uint64_t addr, size_t bytes);
+
+/// Discards the whole pages of [addr, addr + bytes) that lie in private anonymous device memory
+/// (a cudaMalloc allocation in host memory mode before any export, or a cuMemCreate object's
+/// first whole-object mapping), with madvise(MADV_DONTNEED): such pages read back as zeros
+/// afterwards and hold no memory. Each candidate interval is checked against /proc/self/maps
+/// first (it must lie in mappings with permissions rw-p, no file and inode 0); an interval that
+/// fails the check, memory that is a segment (MAP_SHARED memfd) and partial pages at the ends
+/// are left alone, for the caller to write. The caller holds an exec_scope, so no conversion
+/// into a segment runs meanwhile.
+/// @param addr First address.
+/// @param bytes Length in bytes.
+/// @return The discarded intervals [first, end), sorted by address.
+std::vector<std::pair<uint64_t, uint64_t>> discard_anon_pages(uint64_t addr, size_t bytes);
 
 /// Moves every anonymous cudaMalloc allocation overlapping [addr, addr + bytes) into a segment
 /// mapped at the same address, before an API that pins or shares the pages (an RDMA

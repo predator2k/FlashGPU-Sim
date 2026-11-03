@@ -3755,24 +3755,48 @@ yasai_func_run::yasai_func_run(cuda_sim *sim, kernel_info_t &kernel, bool openCL
     const std::string &pat = kernel.yasai_fill_pattern();
     const unsigned long long count = kernel.yasai_fill_count();
     const size_t esz = pat.size();
+    unsigned long long discarded = 0;
     if (esz > 0 && count > 0) {
       const size_t chunk_elems = std::max<size_t>(1, yasai_fill_chunk_bytes() / esz);
       std::string buf;
       buf.reserve(chunk_elems * esz);
       for (size_t i = 0; i < chunk_elems; ++i) buf += pat;
       gpgpu_sim *gpu = gpgpu_ctx->the_gpgpusim->g_the_gpu;
-      unsigned long long done = 0;
-      while (done < count) {
-        const unsigned long long n = std::min<unsigned long long>(chunk_elems, count - done);
-        gpu->memcpy_to_gpu((size_t)(kernel.yasai_fill_dst() + done * esz), buf.data(),
-                           (size_t)(n * esz));
-        done += n;
+      const uint64_t base = kernel.yasai_fill_dst();
+      const uint64_t total = (uint64_t)count * esz;
+      // A zero fill discards the whole pages that lie in private anonymous device memory
+      // (shared_devmem::discard_anon_pages; they read back as zeros and hold no memory) and
+      // writes the rest; the exec_scope keeps a conversion into a segment out meanwhile.
+      // YASAI_FILL_ZERO_DISCARD=0 writes every byte.
+      static const bool discard_on = !(getenv("YASAI_FILL_ZERO_DISCARD") &&
+                                       atoi(getenv("YASAI_FILL_ZERO_DISCARD")) == 0);
+      const bool zero = pat.find_first_not_of('\0') == std::string::npos;
+      shared_devmem::exec_scope work;
+      std::vector<std::pair<uint64_t, uint64_t>> skip;
+      if (zero && discard_on) skip = shared_devmem::discard_anon_pages(base, total);
+      // Writes [lo, hi) of the fill (byte offsets). Only a zero fill skips pages, so a range
+      // that does not start at 0 holds zeros only and the pattern's phase does not matter.
+      auto write_range = [&](uint64_t lo, uint64_t hi) {
+        while (lo < hi) {
+          const uint64_t n = std::min<uint64_t>(hi - lo, (uint64_t)buf.size());
+          gpu->memcpy_to_gpu((size_t)(base + lo), buf.data(), (size_t)n);
+          lo += n;
+        }
+      };
+      uint64_t at = 0;
+      for (const auto &iv : skip) {
+        const uint64_t lo = iv.first - base, hi = iv.second - base;
+        if (lo > at) write_range(at, lo);
+        discarded += hi - lo;
+        at = std::max(at, hi);
       }
+      if (at < total) write_range(at, total);
     }
     yasai_func::set_host_executed();
     kernel.set_all_ctas_issued();
-    printf("yasai: fill kernel %s written on the host: %llu elements of %zu bytes at 0x%llx\n",
-           m_name.c_str(), count, esz, kernel.yasai_fill_dst());
+    printf("yasai: fill kernel %s written on the host: %llu elements of %zu bytes at 0x%llx, "
+           "%llu bytes discarded as zero pages\n",
+           m_name.c_str(), count, esz, kernel.yasai_fill_dst(), discarded);
     finish();
     return;
   }

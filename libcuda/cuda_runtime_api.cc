@@ -302,6 +302,9 @@ struct _cuda_device_id *gpgpu_context::GPGPUSim_Init() {
 #endif
     prop->regsPerBlock = sc.gpgpu_registers_per_block;
     prop->warpSize = sc.warp_size;
+    // yasai: the configured L2 (yasai_l2_bytes); left at 0 before, so PyTorch Inductor sized its
+    // L2 flush buffer from a 256 MiB fallback instead of the device's L2.
+    prop->l2CacheSize = (int)cfg->yasai_l2_bytes();
 #if (CUDART_VERSION < 13000)
     prop->clockRate = cfg->get_core_freq() / 1000;
 #endif
@@ -2873,8 +2876,8 @@ cudaDeviceGetAttributeInternal(int *value, enum cudaDeviceAttr attr, int device,
       case 37:
         *value = 352;  // value for 1080ti
         break;
-      case 38:
-        *value = 3000000;  // value for 1080ti
+      case 38:  // CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE (yasai: the configured L2, as l2CacheSize)
+        *value = prop->l2CacheSize;
         break;
       case 39:
         *value = prop->maxThreadsPerMultiProcessor;  // yasai: no GPU model needed
@@ -4629,12 +4632,36 @@ __host__ cudaError_t CUDARTAPI cudaEventElapsedTime(float *ms,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  time_t elapsed_time;
   CUevent_st *s = get_event(start);
   CUevent_st *e = get_event(end);
   if (s == NULL || e == NULL) return g_last_cudaError = cudaErrorUnknown;
-  elapsed_time = e->clock() - s->clock();
-  *ms = 1000 * elapsed_time;
+  // yasai: the interval is the simulated time between the two event updates when the performance
+  // model advanced its cycle count between them (cycles / core clock), else the monotonic clock
+  // between the two updates (the functional simulator models no time). The former used the
+  // events' calendar clocks in whole seconds, so every interval under 1 s was 0 ms (PyTorch
+  // Inductor's coordinate-descent tuner then divided by zero). An interval that contains a
+  // finished kernel is at least 1 ns. YASAI_EVENT_TIME_REPORT=1 prints the source per call.
+  if (!e->done() || !s->done()) return g_last_cudaError = cudaErrorNotReady;
+  double elapsed_ms = 0.0;
+  const char *source = "monotonic";
+  const double cycles = e->sim_cycle() - s->sim_cycle();
+  gpgpu_context *ctx = GPGPU_Context();
+  const double freq = ctx->the_gpgpusim->g_the_gpu_config
+                          ? (double)ctx->the_gpgpusim->g_the_gpu_config->get_core_freq() : 0.0;
+  if (cycles > 0 && freq > 0) {
+    elapsed_ms = cycles / freq * 1e3;
+    source = "simulated";
+  } else {
+    const long long dns = (long long)e->mono_ns() - (long long)s->mono_ns();
+    long long ns = dns;
+    if (e->kernels_done() > s->kernels_done() && ns < 1) ns = 1;
+    elapsed_ms = (double)ns * 1e-6;
+  }
+  *ms = (float)elapsed_ms;
+  static const bool report = getenv("YASAI_EVENT_TIME_REPORT") && atoi(getenv("YASAI_EVENT_TIME_REPORT")) != 0;
+  if (report)
+    printf("yasai: cudaEventElapsedTime %.9f ms source=%s kernels=%llu\n", elapsed_ms, source,
+           e->kernels_done() - s->kernels_done());
   return g_last_cudaError = cudaSuccess;
 }
 

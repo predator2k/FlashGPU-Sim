@@ -34,6 +34,7 @@
 #include "yasai_realtime.h"
 
 #include <unistd.h>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -304,7 +305,13 @@ bool stream_operation::do_operation(gpgpu_sim *gpu) {
     case stream_event: {
       printf("event update\n");
       time_t wallclock = time((time_t *)NULL);
-      m_event->update(gpu->gpu_tot_sim_cycle, wallclock);
+      // yasai: the monotonic clock goes through libc (clock_gettime), like the calendar clock
+      // above, so the application's view of time (and a time-dilation preload) applies to it.
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      m_event->update((double)(gpu->gpu_tot_sim_cycle + gpu->gpu_sim_cycle), wallclock,
+                      (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec,
+                      yasai_kernels_finished());
       m_stream->record_next_done();
     } break;
     case stream_wait_event:
@@ -405,8 +412,16 @@ bool stream_manager::check_finished_kernel() {
   return check;
 }
 
+// yasai: kernels finished in this process (cudaEventElapsedTime: an interval between two
+// events that contains a kernel is never reported as 0).
+static std::atomic<unsigned long long> g_yasai_kernels_finished{0};
+unsigned long long yasai_kernels_finished() {
+  return g_yasai_kernels_finished.load(std::memory_order_acquire);
+}
+
 bool stream_manager::register_finished_kernel(unsigned grid_uid) {
   // called by gpu simulation thread
+  if (grid_uid > 0) g_yasai_kernels_finished.fetch_add(1, std::memory_order_acq_rel);
   if (grid_uid > 0) {
     CUstream_st *stream = m_grid_id_to_stream[grid_uid];
     kernel_info_t *kernel = stream->front().get_kernel();

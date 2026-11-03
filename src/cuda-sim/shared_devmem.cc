@@ -839,6 +839,70 @@ bool ipc_export(uint64_t addr, const read_fn &read_old, std::string *ref, uint64
 
 bool export_needs_copy(uint64_t addr) { return range_needs_copy(addr, 1); }
 
+namespace {
+
+/// Whether [lo, hi) lies entirely in private anonymous mappings of this process, read from
+/// /proc/self/maps (permissions rw-p, inode 0, no path or an anonymous label such as [heap]).
+/// @param lo First address.
+/// @param hi End address.
+bool private_anon_in_maps(uint64_t lo, uint64_t hi) {
+  FILE *f = fopen("/proc/self/maps", "r");
+  if (f == NULL) return false;
+  char line[4096];
+  uint64_t covered = lo;
+  while (covered < hi && fgets(line, sizeof(line), f) != NULL) {
+    unsigned long long a = 0, b = 0, off = 0, inode = 0;
+    char perms[8] = {0}, dev[16] = {0};
+    int n = 0;
+    if (sscanf(line, "%llx-%llx %7s %llx %15s %llu %n", &a, &b, perms, &off, dev, &inode, &n) < 6)
+      continue;
+    if (b <= covered || a > covered) continue;
+    const char *path = line + n;
+    const bool named_file = path[0] == '/';
+    if (strcmp(perms, "rw-p") != 0 || inode != 0 || named_file) break;
+    covered = b;
+  }
+  fclose(f);
+  return covered >= hi;
+}
+
+}  // namespace
+
+std::vector<std::pair<uint64_t, uint64_t>> discard_anon_pages(uint64_t addr, size_t bytes) {
+  std::vector<std::pair<uint64_t, uint64_t>> cand, out;
+  const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+  const uint64_t end = addr + bytes;
+  {
+    std::lock_guard<std::mutex> lock(st().mu);
+    state &s = st();
+    auto add = [&](uint64_t first, uint64_t size) {
+      const uint64_t lo = std::max(first, addr), hi = std::min(first + size, end);
+      const uint64_t plo = (lo + page - 1) / page * page, phi = hi / page * page;
+      if (phi > plo) cand.emplace_back(plo, phi);
+    };
+    auto it = s.allocs.upper_bound(addr);
+    if (it != s.allocs.begin()) --it;
+    for (; it != s.allocs.end() && it->first < end; ++it)
+      if (it->first + it->second.size > addr && it->second.anon) add(it->first, it->second.size);
+    auto im = s.maps.upper_bound(addr);
+    if (im != s.maps.begin()) --im;
+    for (; im != s.maps.end() && im->first < end; ++im)
+      if (im->first + im->second.size > addr && im->second.p->anon && im->second.p->anon_va == im->first)
+        add(im->first, im->second.size);
+  }
+  std::sort(cand.begin(), cand.end());
+  for (const auto &c : cand) {
+    if (!private_anon_in_maps(c.first, c.second)) {
+      fprintf(stderr, "shared_devmem: 0x%llx-0x%llx is not private anonymous memory; zero fill "
+              "writes it\n", (unsigned long long)c.first, (unsigned long long)c.second);
+      continue;
+    }
+    if (madvise(reinterpret_cast<void *>(c.first), c.second - c.first, MADV_DONTNEED) == 0)
+      out.push_back(c);
+  }
+  return out;
+}
+
 bool range_needs_copy(uint64_t addr, size_t bytes) {
   std::lock_guard<std::mutex> lock(st().mu);
   state &s = st();
