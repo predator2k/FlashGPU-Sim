@@ -785,6 +785,32 @@ bool range_of(uint64_t addr, uint64_t *base, size_t *size) {
   return false;
 }
 
+bool private_range_of(uint64_t addr, uint64_t *base, size_t *size, bool *shared) {
+  std::lock_guard<std::mutex> lock(st().mu);
+  state &s = st();
+  auto ia = s.allocs.upper_bound(addr);
+  if (ia != s.allocs.begin()) {
+    --ia;
+    if (addr < ia->first + ia->second.size) {
+      *base = ia->first;
+      *size = ia->second.size;
+      *shared = ia->second.seg != nullptr;
+      return true;
+    }
+  }
+  auto im = s.maps.upper_bound(addr);
+  if (im != s.maps.begin()) {
+    --im;
+    if (addr < im->first + im->second.size) {
+      *base = im->first;
+      *size = im->second.size;
+      *shared = !im->second.p->anon;
+      return true;
+    }
+  }
+  return false;
+}
+
 bool ipc_export(uint64_t addr, const read_fn &read_old, std::string *ref, uint64_t *base,
                 size_t *size) {
   init_once();

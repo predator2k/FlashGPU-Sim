@@ -16,6 +16,7 @@
 #include "../src/cuda-sim/host_window.h"
 #include "../src/cuda-sim/memory.h"
 #include "../src/cuda-sim/shared_devmem.h"
+#include "../src/cuda-sim/yasai_lazy.h"
 
 class CUctx_st;
 struct gpgpu_context;
@@ -329,6 +330,7 @@ int cuMemAddressReserve(unsigned long long *ptr, size_t size, size_t alignment,
 
 /// cuMemAddressFree.
 int cuMemAddressFree(unsigned long long ptr, size_t size) {
+  yasai_lazy::observe(0, 0, ptr, size);  // yasai: pending kernels that use the range run first
   shared_devmem::unreserve(ptr, round_up(size, shared_devmem::granularity()));
   return kSuccess;
 }
@@ -344,6 +346,7 @@ int cuMemMap(unsigned long long ptr, size_t size, size_t offset, unsigned long l
 
 /// cuMemUnmap.
 int cuMemUnmap(unsigned long long ptr, size_t size) {
+  yasai_lazy::observe(0, 0, ptr, size);  // yasai: pending kernels that use the range run first
   return shared_devmem::unmap(ptr, size) ? kSuccess : kInvalidValue;
 }
 
@@ -373,6 +376,7 @@ int cuMemExportToShareableHandle(void *shareable, unsigned long long handle, int
   shared_devmem::phys *p = obj(handle);
   if (!p || !shareable) return kInvalidValue;
   if (type != kHandlePosixFd) return kNotSupported;
+  yasai_lazy::observe_all("cuMem export");  // yasai: another process may read it from now on
   int fd = shared_devmem::export_fd(p);
   if (fd < 0) return kInvalidValue;
   *static_cast<int *>(shareable) = fd;
@@ -458,6 +462,7 @@ int cuMulticastBindMem(unsigned long long mc, size_t mc_offset, unsigned long lo
   (void)flags;
   shared_devmem::phys *m = obj(mc), *p = obj(mem);
   if (!m || !p) return kInvalidHandle;
+  yasai_lazy::observe_all("multicast binding");  // yasai: shared with the team from now on
   return shared_devmem::mc_bind(m, mc_offset, p, mem_offset, size) ? kSuccess : kInvalidValue;
 }
 
@@ -468,6 +473,7 @@ int cuMulticastBindAddr(unsigned long long mc, size_t mc_offset, unsigned long l
   shared_devmem::phys *m = obj(mc), *p = nullptr;
   uint64_t base = 0;
   size_t len = 0, off = 0;
+  yasai_lazy::observe_all("multicast binding");  // yasai: shared with the team from now on
   if (!m || !shared_devmem::mapping_at(memptr, &p, &base, &len, &off)) return kInvalidValue;
   return shared_devmem::mc_bind(m, mc_offset, p, off + (memptr - base), size) ? kSuccess
                                                                               : kInvalidValue;

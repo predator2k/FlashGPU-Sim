@@ -171,6 +171,7 @@ typedef enum CUoutput_mode_enum {
 #include "../src/cuda-sim/cuda-sim.h"
 #include "../src/cuda-sim/host_window.h"
 #include "../src/cuda-sim/shared_devmem.h"
+#include "../src/cuda-sim/yasai_lazy.h"
 #include "../src/cuda-sim/yasai_module_scope.h"
 #include "yasai_fatbin_units.h"
 #include "yasai_fill_kernel.h"
@@ -1651,6 +1652,11 @@ cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx
 static thread_local bool t_yasai_host_fill_launch = false;
 // yasai: the record fields of that fill (element count, dtype name, element bytes).
 static thread_local std::string t_yasai_host_fill_fields;
+// yasai: correlation id of the launch being recorded (0 without the recorder), for lazy
+// execution's deferred_exec record, and whether lazy execution deferred that launch
+// (yasai_lazy.h; set by cudaLaunchInternalImpl).
+static thread_local unsigned t_yasai_launch_corr = 0;
+static thread_local bool t_yasai_lazy_deferred = false;
 
 // yasai: stream capture (CUDA graphs; implemented at the end of this file). Each returns true
 // when the stream is being captured and the operation was recorded into its graph instead of
@@ -1676,12 +1682,15 @@ cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = N
     ctx->api->g_cuda_launch_stack.pop_back();
     return g_last_cudaError = cudaSuccess;
   }
+  t_yasai_launch_corr = 0;
   if (!rec.on() || ctx->api->g_cuda_launch_stack.empty())
     return cudaLaunchInternalImpl(hostFun, gpgpu_ctx);
   kernel_config config = ctx->api->g_cuda_launch_stack.back();
   const uint64_t t0 = yasai_rec::mono_ns();
   const uint32_t corr = rec.corr();
   t_yasai_host_fill_launch = false;
+  t_yasai_launch_corr = corr;
+  t_yasai_lazy_deferred = false;
   const cudaError_t ret = cudaLaunchInternalImpl(hostFun, gpgpu_ctx);
   const bool host_fill = t_yasai_host_fill_launch;
   const std::string host_fill_fields = host_fill ? t_yasai_host_fill_fields : std::string();
@@ -1725,7 +1734,7 @@ cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = N
             "\"local_per_thread\":0,\"graph_id\":0,\"graph_node\":0,\"launch_type\":0,"
             "\"queued\":0,\"submitted\":0,\"device_launched\":0,\"ptx_target\":\"%s\","
             "\"ptx_version\":\"%s\",\"ptx_file\":\"%s\",\"host_so\":\"%s\"%s,"
-            "\"func_threads\":%u",
+            "\"func_threads\":%u%s",
             (unsigned long long)t0, (unsigned long long)t1,
             rec.stream_id(config.get_stream()), corr, yasai_rec::esc(name.c_str()).c_str(),
             g.x, g.y, g.z, b.x, b.y, b.z, info ? info->smem : 0u, (size_t)config.shared_mem(),
@@ -1740,7 +1749,11 @@ cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = N
             // (YASAI_FUNC_THREADS, 1 = serial; a kernel that stays serial, see yasai_func_run,
             // still records the process's value), so that runs with different counts are told
             // apart.
-            yasai_func::func_threads());
+            yasai_func::func_threads(),
+            // A launch whose execution lazy execution deferred (yasai_lazy.h): its CTAs run
+            // later, when an observation needs them (a deferred_exec record with this corr
+            // follows then), or never. It is timed like any kernel; it never has time_source.
+            t_yasai_lazy_deferred ? ",\"exec_deferred\":1" : "");
   return ret;
 }
 
@@ -1899,6 +1912,11 @@ cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx
     kernel_func_info->set_pdom();
   }
   yasai_launch_lock.unlock();
+  // yasai: lazy kernel execution decides now whether the CTAs run at the launch's turn
+  // (yasai_lazy.h); the kernel record of this launch says so.
+  if (ctx->func_sim->g_ptx_sim_mode)
+    t_yasai_lazy_deferred =
+        yasai_lazy::prepare(*grid, t_yasai_launch_corr, grid->yasai_host_fill())->deferred;
   dim3 gridDim = config.grid_dim();
   dim3 blockDim = config.block_dim();
 
@@ -3689,6 +3707,14 @@ static std::mutex g_yasai_managed_mutex;
 // its segment (device addresses are not reused).
 // @param devPtr Allocation.
 static void yasai_free_now(void *devPtr) {
+  // yasai: pending deferred kernels that use the allocation run before it goes away
+  // (yasai_lazy.h).
+  {
+    uint64_t base = 0;
+    size_t size = 0;
+    if (shared_devmem::range_of(reinterpret_cast<uint64_t>(devPtr), &base, &size))
+      yasai_lazy::observe(0, 0, base, size);
+  }
   {
     std::lock_guard<std::mutex> lock(g_yasai_managed_mutex);
     if (g_yasai_managed.erase(devPtr)) {
@@ -4219,6 +4245,12 @@ __host__ cudaError_t CUDARTAPI cudaGraphConditionalHandleCreate(cudaGraphConditi
 // them during the copy. Called before an export or a pinning registration.
 //   ptr: first address; bytes: length (0 counts as 1)
 static void yasai_share_device_range(const void *ptr, size_t bytes) {
+  // yasai: memory that another process or a NIC may read from now on: the launches queued
+  // before reach their turn, then every pending deferred kernel runs (yasai_lazy.h).
+  if (yasai_lazy::enabled()) {
+    cudaDeviceSynchronizeInternal();
+    yasai_lazy::observe_all("share device memory");
+  }
   const uint64_t a = reinterpret_cast<uint64_t>(ptr);
   if (!shared_devmem::range_needs_copy(a, bytes)) return;
   cudaDeviceSynchronizeInternal();

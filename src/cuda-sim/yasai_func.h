@@ -84,6 +84,9 @@ KernelScope *scope_new();
 // Deletes a scope made by scope_new (not the selected one).
 void scope_delete(KernelScope *s);
 
+// The selected scope (to restore it with scope_set after running another kernel in between).
+KernelScope *scope_get();
+
 // Selects scope s; null selects the default scope.
 void scope_set(KernelScope *s);
 

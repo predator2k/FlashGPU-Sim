@@ -222,7 +222,9 @@ class yasai_func_run {
   /// @param sim Functional simulator of the process.
   /// @param kernel Kernel launch.
   /// @param openCL True for an OpenCL launch (its exit is not registered with the streams).
-  yasai_func_run(cuda_sim *sim, kernel_info_t &kernel, bool openCL);
+  /// @param deferred True for a launch that lazy execution runs after its stream registered it
+  /// as finished (yasai_lazy.h): its exit is not registered again.
+  yasai_func_run(cuda_sim *sim, kernel_info_t &kernel, bool openCL, bool deferred = false);
   ~yasai_func_run();
   /// Executes one round.
   /// @return True when the kernel has finished (its completion is then registered).
@@ -279,6 +281,7 @@ class yasai_func_run {
   cuda_sim *m_sim;
   kernel_info_t &m_kernel;
   bool m_openCL;
+  bool m_deferred = false;        // see the constructor
   std::string m_name;             // kernel name (the kernel object may be released at the end)
   yasai_func::Dim3 m_grid, m_block;  // extents for the statistics
   yasai_func::KernelScope *m_scope;  // per-kernel state of yasai_func
@@ -306,6 +309,11 @@ class yasai_func_run {
   double m_start_s = 0;              // monotonic wall time (s) at the kernel's start
   double m_progress_next_s = 0;      // monotonic wall time (s) of the next progress line
 };
+
+// yasai: whether a launch of the kernel named name interleaves its co-resident CTAs
+// (YASAI_CTA_INTERLEAVE and YASAI_CTA_INTERLEAVE_REGEX, as yasai_func_run decides it), without
+// printing the per-launch line.
+bool yasai_func_interleaves(const std::string &name);
 
 #define RECONVERGE_RETURN_PC ((address_type) - 2)
 #define NO_BRANCH_DIVERGENCE ((address_type) - 1)

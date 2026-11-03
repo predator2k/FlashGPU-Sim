@@ -87,6 +87,7 @@ void scope_delete(KernelScope *s) {
   if (s != nullptr && s != &g_default_scope) delete s;
 }
 void scope_set(KernelScope *s) { g_scope = s != nullptr ? s : &g_default_scope; }
+KernelScope *scope_get() { return g_scope; }
 
 // The per-kernel names below refer to the selected scope.
 #define g_counters (g_scope->counters)

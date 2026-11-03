@@ -41,6 +41,7 @@
 #include "option_parser.h"
 #include "stream_manager.h"
 #include "cuda-sim/shared_devmem.h"
+#include "cuda-sim/yasai_lazy.h"
 #include "yasai_realtime.h"
 
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
@@ -196,6 +197,7 @@ void *gpgpu_sim_thread_concurrent(void *ctx_ptr) {
   g_yasai_sim_ctx = ctx;
   g_yasai_sim_thread = pthread_self();
   g_yasai_sim_pid = getpid();
+  yasai_lazy::set_sim_thread();
   atexit(termination_callback);
   // concurrent kernel execution simulation thread
   do {
@@ -211,6 +213,14 @@ void *gpgpu_sim_thread_concurrent(void *ctx_ptr) {
       unsigned idle_us = 50;
       while (ctx->the_gpgpusim->g_stream_manager->empty_protected() &&
              !ctx->the_gpgpusim->g_sim_done) {
+        // yasai: a host thread that observes device memory waits for pending deferred kernels
+        // (yasai_lazy.h); they run here while the streams are idle.
+        if (yasai_lazy::requests_waiting()) {
+          shared_devmem::exec_scope lazy_turn;
+          yasai_lazy::serve_requests();
+          idle_us = 50;
+          continue;
+        }
         yasai_real_usleep(idle_us);
         if (idle_us < 1000) idle_us *= 2;
       }
@@ -237,6 +247,9 @@ void *gpgpu_sim_thread_concurrent(void *ctx_ptr) {
       // yasai: one turn of this loop is device work; a conversion of anonymous device memory
       // into a shared segment runs between turns (shared_devmem::exec_scope).
       shared_devmem::exec_scope turn;
+      // yasai: pending deferred kernels that host threads wait for run at the start of a turn
+      // (yasai_lazy.h).
+      if (yasai_lazy::requests_waiting()) yasai_lazy::serve_requests();
       // check if a kernel has completed
       // launch operation on device if one is pending and can be run
 
@@ -262,6 +275,15 @@ void *gpgpu_sim_thread_concurrent(void *ctx_ptr) {
           func_pending.push_back(k);
         while (!func_pending.empty()) {
           kernel_info_t *k = func_pending.front();
+          // yasai: a deferred launch is registered as finished in its stream at once and left
+          // pending; an eager one first runs the pending kernels its accesses depend on.
+          if (yasai_lazy::start(*k, ctx->the_gpgpusim->gpgpu_ctx->func_sim)) {
+            func_pending.pop_front();
+            k->set_yasai_lazy_keep(true);
+            k->set_all_ctas_issued();
+            ctx->the_gpgpusim->g_stream_manager->register_finished_kernel(k->get_uid());
+            continue;
+          }
           bool exclusive_live = false;
           for (yasai_func_run *r : func_runs) exclusive_live = exclusive_live || r->exclusive();
           if (!func_runs.empty() &&

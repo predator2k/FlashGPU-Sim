@@ -393,6 +393,57 @@ implementation details.
 * **Records.** Every kernel record of the fakeenv recorder carries `"func_threads":N`, which is
   the process's `YASAI_FUNC_THREADS`, so that runs with different thread counts are told apart.
 
+### yasai: lazy kernel execution
+
+`YASAI_LAZY_EXEC=1` (default off) records every kernel launch at launch time as before, but runs
+a kernel's CTAs only when the host observes memory that the kernel may write. The full
+description is the header comment of `src/cuda-sim/yasai_lazy.h`.
+
+* **Deferral.** A launch is deferred when the PTX analysis bounds its global accesses to the
+  allocations that its parameters point to. The simulation thread then registers the launch as
+  finished at its turn in its stream and keeps it pending.
+* **Observation points.** These run the pending kernels that an access depends on, in launch
+  order and with the earlier kernels they depend on:
+  * copies of every kind, memsets, symbol copies and host-executed fills;
+  * the start of a kernel that is not deferred;
+  * `cudaFree`, `cudaFreeAsync`, `cuMemUnmap` and `cuMemAddressFree` for their range;
+  * IPC export, cuMem export, multicast binding, RDMA pinning and stream host functions, which
+    run every pending kernel.
+* **Kernels that run eagerly.** A kernel is never deferred in these cases:
+  * an address derives from a pointer loaded from memory, or its origin is unknown;
+  * a set touches mapped, pinned or managed host memory, shared memory segments, or an unknown
+    allocation;
+  * it uses `atom`, `red`, `multimem`, ordered or volatile global accesses, or `membar` or
+    `fence` above CTA scope;
+  * it prints, calls `malloc`, launches kernels, or reads textures or surfaces;
+  * it is cooperative, a cluster launch, interleaved, or a host fill;
+  * a warp trace is written (`YASAI_TRACE_DIR`), because the traces follow the launch order;
+  * its name matches `YASAI_LAZY_EAGER_REGEX`, which is the force-eager list.
+
+  A kernel that cannot be bounded runs every pending kernel first. A deferred launch whose
+  memory became shared between its launch and its turn runs at its turn. At most
+  `YASAI_LAZY_MAX_PENDING` launches (default 20000) stay pending; beyond that the oldest runs.
+* **Events and queries.** `cudaEventSynchronize`, `cudaEventQuery`, `cudaStreamSynchronize`,
+  `cudaStreamQuery` and `cudaDeviceSynchronize` are not observation points. They see a deferred
+  kernel finish at its place in the stream. `cudaEventElapsedTime` counts it as a launched and
+  finished kernel, so functional-mode timings of events on one stream are identical with lazy
+  execution on and off. Events on different streams count the kernels that the whole process
+  finished in between, which depends on scheduling in both modes.
+* **Records.** The kernel record of a deferred launch carries `"exec_deferred":1`. When the
+  kernel runs later, a record `{"rec":"deferred_exec","corr":<corr>,"t":<ns>}` follows.
+  * `exec_deferred` without a `deferred_exec` record marks a launch that was never simulated,
+    which is a launch-only kernel.
+  * `host_executed:1` with `time_source:"none"` stays the mark of the host fill, which has no
+    simulated instruction and no simulated time.
+  * A deferred launch never carries `time_source`, so the converter times it as any other
+    kernel from its identity and launch configuration.
+  * The PTX of a launch-only kernel is extracted at load time, as before.
+  * `fakeenv_to_ir.py` does not read `exec_deferred` or `deferred_exec` yet. Both are additions
+    that a converter can ignore.
+* **Reports.** `YASAI_LAZY_REPORT=1` prints the decision for every launch and one line per
+  flush. Each process prints `yasai-lazy: summary launches=... deferred=... executed_later=...
+  never_executed=... flushes=... deferred_exec_s=... eager: [cause]=count ...` at exit.
+
 ### Inspect Statistics
 
 FlashGPU-Sim prints detailed simulation statistics to the run log. Use the
