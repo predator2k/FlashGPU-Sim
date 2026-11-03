@@ -338,7 +338,9 @@ const symbol *function_of(uint64_t value);
 // Most pool threads (the size of the per-thread tables of dyn_ptx_inst_manager and ptx-stats).
 constexpr unsigned kMaxFuncThreads = 32;
 
-// YASAI_FUNC_THREADS, clamped to [1, kMaxFuncThreads] (read once).
+// YASAI_FUNC_THREADS, clamped to [1, kMaxFuncThreads] (read once); 1 whenever the FIO window model
+// is enabled (YASAI_FIO_UNORDERED_IMPORTS set), which prints one "yasai-fio-window: func_threads
+// forced to 1" line when YASAI_FUNC_THREADS asked for more.
 unsigned func_threads();
 
 // Index of the calling thread in the per-thread tables: the pool index of a pool worker

@@ -839,6 +839,15 @@ unsigned func_threads() {
     long t = (v != nullptr && *v != '\0') ? std::strtol(v, nullptr, 10) : 1;
     if (t < 1) t = 1;
     if (t > long(kMaxFuncThreads)) t = kMaxFuncThreads;
+    // The FIO window model (fio_window, enabled by YASAI_FIO_UNORDERED_IMPORTS) keeps its pending
+    // writes and its drainer for one simulation thread: a window run executes its CTAs serially.
+    const char *fio = std::getenv("YASAI_FIO_UNORDERED_IMPORTS");
+    if (t > 1 && fio != nullptr && *fio != '\0') {
+      printf("yasai-fio-window: func_threads forced to 1 (YASAI_FUNC_THREADS=%ld, "
+             "YASAI_FIO_UNORDERED_IMPORTS=%s)\n", t, fio);
+      fflush(stdout);
+      t = 1;
+    }
     return unsigned(t);
   }();
   return n;
