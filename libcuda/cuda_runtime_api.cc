@@ -3599,6 +3599,7 @@ cudaDeviceSynchronizeInternal(gpgpu_context *gpgpu_ctx = NULL) {
   }
   // Blocks until the device has completed all preceding requested tasks
   ctx->synchronize();
+  yasai_lazy::sync_point("cudaDeviceSynchronize");  // yasai: see yasai_lazy.h
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -4535,10 +4536,15 @@ __host__ cudaError_t CUDARTAPI cudaStreamDestroy(cudaStream_t stream) {
 }
 
 __host__ cudaError_t CUDARTAPI cudaStreamSynchronize(cudaStream_t stream) {
-  if (!yasai_rec::Recorder::get().on()) return cudaStreamSynchronizeInternal(stream);
+  if (!yasai_rec::Recorder::get().on()) {
+    const cudaError_t r = cudaStreamSynchronizeInternal(stream);
+    yasai_lazy::sync_point("cudaStreamSynchronize");  // yasai: see yasai_lazy.h
+    return r;
+  }
   const uint64_t t0 = yasai_rec::mono_ns();
   const uint32_t corr = yasai_rec::Recorder::get().corr();
   const cudaError_t ret = cudaStreamSynchronizeInternal(stream);
+  yasai_lazy::sync_point("cudaStreamSynchronize");  // yasai: see yasai_lazy.h
   yasai_rec_sync("cudaStreamSynchronize", t0, corr, ret, yasai_rec::kStreamSync, stream, 0, 0);
   return ret;
 }
@@ -4643,6 +4649,7 @@ __host__ cudaError_t CUDARTAPI cudaEventSynchronize(cudaEvent_t event) {
   for (unsigned us = 20; e != NULL && !e->done(); us = us < 1000 ? 2 * us : 1000) yasai_real_usleep(us);
   printf("GPGPU-Sim API: cudaEventSynchronize ** event detected\n");
   fflush(stdout);
+  yasai_lazy::sync_point("cudaEventSynchronize");  // yasai: see yasai_lazy.h
   if (rec_on) {
     const uint64_t uid = e ? uint64_t(e->get_uid()) : 0;
     yasai_rec_sync("cudaEventSynchronize", t0, corr, cudaSuccess, yasai_rec::kEventSync, nullptr,

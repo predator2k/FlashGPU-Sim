@@ -1044,6 +1044,14 @@ void observe_all(const char *why) {
   }
 }
 
+void sync_point(const char *why) {
+  static const bool on = [] {
+    const char *v = getenv("YASAI_LAZY_SYNC_FLUSH");
+    return !(v != nullptr && v[0] == '0');
+  }();
+  if (on) observe_all(why);
+}
+
 bool requests_waiting() { return st().has_requests.load(std::memory_order_acquire); }
 
 void serve_requests() {

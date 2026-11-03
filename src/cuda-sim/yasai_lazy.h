@@ -38,13 +38,19 @@
 //   * it is cooperative, has clusters, interleaves its CTAs (YASAI_CTA_INTERLEAVE), is a
 //     host-executed fill, or its name matches YASAI_LAZY_EAGER_REGEX (std::regex_search,
 //     ECMAScript), the force-eager list.
-// Observation points are the copy and memset functions, kernel starts and the calls above.
-// cudaEventSynchronize, cudaEventQuery, cudaStreamSynchronize, cudaStreamQuery and
-// cudaDeviceSynchronize are not observation points: they report the completion that the stream
-// order gives the pending kernel (and cudaEventElapsedTime counts it), and a host read that
-// follows them goes through a copy, which is one. A host thread or another process that reads
-// device memory directly can only reach memory of the kinds above, which no deferred kernel
-// touches.
+// Observation points are the copy and memset functions, kernel starts and the calls above, and by
+// default the synchronizations: cudaDeviceSynchronize, cudaStreamSynchronize and
+// cudaEventSynchronize (and cuCtxSynchronize, cuStreamSynchronize, cuEventSynchronize) run every
+// pending kernel when they return (YASAI_LAZY_SYNC_FLUSH=1, the default; see sync_point). Device
+// memory is identity-mapped host memory in this simulator, so a host thread may read a cudaMalloc
+// buffer directly after a synchronization, and memory measurements and simulator counters read
+// after one see the kernels' effects. YASAI_LAZY_SYNC_FLUSH=0 makes synchronizations no
+// observation points (more kernels stay deferred; such direct reads then see the memory before
+// the pending kernels). cudaEventQuery and cudaStreamQuery are never observation points. Either
+// way a synchronization reports the completion that the stream order gives a pending kernel, and
+// cudaEventElapsedTime counts it as finished there. A host thread or another process that spins
+// on device memory without a synchronization can only rely on memory of the kinds above (mapped,
+// pinned, managed, shared), which no deferred kernel touches.
 //
 // Records. With YASAI_FAKEENV_OUT, the kernel record of a deferred launch carries
 // "exec_deferred":1 next to the fields of the host fill; when a deferred kernel runs, a record
@@ -112,6 +118,14 @@ void observe(uint64_t r, uint64_t rn, uint64_t w, uint64_t wn);
 /// Runs every pending kernel (an access that cannot be bounded).
 /// @param why Short cause for the report line.
 void observe_all(const char *why);
+
+/// A host synchronization returned (cudaDeviceSynchronize, cudaStreamSynchronize,
+/// cudaEventSynchronize and their driver forms): with YASAI_LAZY_SYNC_FLUSH (default 1) every
+/// pending kernel runs, so that a host thread that reads device memory directly after it (device
+/// memory is identity-mapped host memory here), a memory measurement or a simulator counter sees
+/// the kernels' effects; YASAI_LAZY_SYNC_FLUSH=0 makes synchronizations no observation points.
+/// @param why The call, for the report line.
+void sync_point(const char *why);
 
 /// Marks the calling thread as the simulation thread (gpgpu_sim_thread_concurrent).
 void set_sim_thread();

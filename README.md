@@ -408,7 +408,8 @@ description is the header comment of `src/cuda-sim/yasai_lazy.h`.
   allocations that its parameters point to. The simulation thread then registers the launch as
   finished at its turn in its stream and keeps it pending.
 * **Observation points.** These run the pending kernels that an access depends on, in launch
-  order and with the earlier kernels they depend on:
+  order and with the earlier kernels they depend on (synchronizations run all of them, see
+  below):
   * copies of every kind, memsets, symbol copies and host-executed fills;
   * the start of a kernel that is not deferred;
   * `cudaFree`, `cudaFreeAsync`, `cuMemUnmap` and `cuMemAddressFree` for their range;
@@ -428,12 +429,21 @@ description is the header comment of `src/cuda-sim/yasai_lazy.h`.
   A kernel that cannot be bounded runs every pending kernel first. A deferred launch whose
   memory became shared between its launch and its turn runs at its turn. At most
   `YASAI_LAZY_MAX_PENDING` launches (default 20000) stay pending; beyond that the oldest runs.
-* **Events and queries.** `cudaEventSynchronize`, `cudaEventQuery`, `cudaStreamSynchronize`,
-  `cudaStreamQuery` and `cudaDeviceSynchronize` are not observation points. They see a deferred
-  kernel finish at its place in the stream. `cudaEventElapsedTime` counts it as a launched and
-  finished kernel, so functional-mode timings of events on one stream are identical with lazy
-  execution on and off. Events on different streams count the kernels that the whole process
-  finished in between, which depends on scheduling in both modes.
+* **Synchronizations and queries.** `cudaDeviceSynchronize`, `cudaStreamSynchronize` and
+  `cudaEventSynchronize`, with their driver forms, are observation points by default
+  (`YASAI_LAZY_SYNC_FLUSH=1`): every pending kernel runs when they return.
+  * Device memory is identity-mapped host memory in this simulator. A host thread can therefore
+    read a `cudaMalloc` buffer directly after a synchronization, as the regression item
+    `ipc_vmm devmem` does, and memory measurements and simulator counters read after one see
+    the kernels' effects.
+  * `YASAI_LAZY_SYNC_FLUSH=0` makes synchronizations no observation points. More kernels then
+    stay deferred, and such direct reads see the memory before the pending kernels.
+  * `cudaEventQuery` and `cudaStreamQuery` are never observation points.
+  * In both modes a synchronization sees a deferred kernel finish at its place in the stream.
+  * `cudaEventElapsedTime` counts a deferred kernel as a launched and finished kernel, so
+    functional-mode timings of events on one stream are identical with lazy execution on and
+    off. Events on different streams count the kernels that the whole process finished in
+    between, which depends on scheduling in both modes.
 * **Records.** The kernel record of a deferred launch carries `"exec_deferred":1`. When the
   kernel runs later, a record `{"rec":"deferred_exec","corr":<corr>,"t":<ns>}` follows.
   * `exec_deferred` without a `deferred_exec` record marks a launch that was never simulated,
