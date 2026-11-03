@@ -780,11 +780,19 @@ void run_pending(Pending &p) {
   // The flush may run inside another run's turn (a copy in its stream, an eager kernel's
   // start): that run's kernel scope is restored afterwards.
   yasai_func::KernelScope *scope = yasai_func::scope_get();
+  // The flush can run while the GPU model is not in the functional mode (no functional kernel
+  // queued: a copy or a host request between kernels); the instructions that ask for the warp
+  // id (shfl, match, vote) need it.
+  gpgpu_sim *gpu = s.sim->gpgpu_ctx->the_gpgpusim->g_the_gpu;
+  const bool was_functional = gpu->is_functional_sim();
+  gpu->yasai_begin_functional();
+  gpu->set_cache_config(k.name());  // as at the kernel's turn (stream_operation::do_operation)
   {
     yasai_func_run run(s.sim, k, false, true);
     while (!run.step()) {
     }
   }
+  if (!was_functional) gpu->yasai_end_functional();
   yasai_func::scope_set(scope);
   s.exec_s += yasai_real_mono_s() - t0;
   s.executed_later++;
@@ -1008,6 +1016,8 @@ bool start(kernel_info_t &k, cuda_sim *sim) {
   else
     flush_locked_free({}, {}, true, "unbounded eager kernel");
   g_pending_count.store(s.pending.size(), std::memory_order_release);
+  // A kernel run by the flush set its own cache configuration; this one's applies again.
+  k.entry()->gpgpu_ctx->the_gpgpusim->g_the_gpu->set_cache_config(k.name());
   return false;
 }
 

@@ -941,6 +941,9 @@ class gpgpu_sim : public gpgpu_t {
 
  public:
   bool is_functional_sim() { return m_functional_sim; }
+  // yasai: enters the functional mode for a kernel that lazy execution runs outside the
+  // functional queue (yasai_lazy.h); yasai_end_functional() leaves it again.
+  void yasai_begin_functional() { m_functional_sim = true; }
   kernel_info_t *get_functional_kernel() { return yasai_take_functional_kernel(); }
   std::vector<kernel_info_t *> get_running_kernels() {
     return m_running_kernels;
