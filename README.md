@@ -390,6 +390,11 @@ implementation details.
   With N=1 this is the former "one CTA group at a time". A kernel that must stay strictly
   CTA-serial is named in `YASAI_FUNC_SERIAL_REGEX`. The regression keeps the 1-thread `ilv_regex`
   check (`max_active=1`). Its items `ilv_regex_threads` and `func_serial_regex` check N=8.
+* **Memory.** N CTAs are resident at once instead of one, and each keeps its threads' simulator
+  state. In the regression item `vmm_anon`, which reads 32 MiB of never-written cuMem memory, the
+  resident memory grew by 10 to 13 MB at N=8, against a limit of 8 MB that holds at N=1. The
+  regression therefore runs `vmm_anon` with its resident-memory check at N=1, and adds
+  `vmm_anon_threads`, which checks at N=8 only that the read sums to 0.
 * **Records.** Every kernel record of the fakeenv recorder carries `"func_threads":N`, which is
   the process's `YASAI_FUNC_THREADS`, so that runs with different thread counts are told apart.
 
