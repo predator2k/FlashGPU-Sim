@@ -468,6 +468,17 @@ ptx_reg_t ptx_thread_info::get_reg(const symbol *reg) {
   return regs_iter->second;
 }
 
+// yasai: the address of a shared memory symbol. A localized extern .shared array follows the
+// dynamic shared memory base of the thread's kernel, also in a function the kernel calls (its own
+// copy of the symbol is never placed by a launch, so it used to stay at address 0, on top of the
+// static shared memory: NCCL's PAT algorithms overwrote ncclShmem with their per-warp scratch).
+//   name    the symbol
+//   kernel  the kernel the thread belongs to
+static inline addr_t yasai_shared_symbol_address(const symbol *name, kernel_info_t &kernel) {
+  return name->is_yasai_dyn_smem() ? kernel.entry()->yasai_dyn_smem_base(name->get_address())
+                                   : name->get_address();
+}
+
 ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
                                              operand_info dstInfo,
                                              unsigned opType,
@@ -522,7 +533,8 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
             result.u64 = get_reg(name).u64 + op.get_addr_offset();
           else  // yasai: own rank bits in a cluster (see yasai_func::dsmem_encode)
             result.u64 =
-                (name->get_address() + op.get_addr_offset()) | yasai_func::own_rank_bits();
+                (yasai_shared_symbol_address(name, m_kernel) + op.get_addr_offset()) |
+                yasai_func::own_rank_bits();
         } else if (op.is_sstarr()) {
           const symbol *name = op.get_symbol();
           if (name->is_reg())
@@ -548,7 +560,8 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
       } else if (op.is_shared()) {
         const symbol *name = op.get_symbol();
         result.u64 = name->is_reg() ? get_reg(name).u64
-                                    : name->get_address() | yasai_func::own_rank_bits();
+                                    : yasai_shared_symbol_address(name, m_kernel) |
+                                          yasai_func::own_rank_bits();
       } else if (op.is_sstarr()) {
         const symbol *name = op.get_symbol();
         result.u64 = name->is_reg() ? get_reg(name).u64 : name->get_address();
