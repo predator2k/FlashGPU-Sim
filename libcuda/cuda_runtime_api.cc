@@ -407,6 +407,19 @@ static stream_manager *yasai_stream_manager(gpgpu_context *ctx) {
   return ctx->the_gpgpusim->g_stream_manager;
 }
 
+// yasai: waits until the kernels and copies queued on every stream before the call have run,
+// before an API removes a mapping that they may still read or write: cudaIpcCloseMemHandle,
+// cuMemUnmap and cudaHostUnregister, as cudaFree and cudaFreeHost do. A queued copy or kernel
+// that ran after the removal found no registered range at the address and read the simulator's
+// empty storage, i.e. zeros (miles weight sync through CUDA IPC, 2026-11-04: SGLang queued the
+// copy_ of every parameter, PyTorch's IPC storage deleter closed the handle at once, and 17 of 18
+// parameters became zero). With host synchronization on (CUDA_LAUNCH_BLOCKING or
+// YASAI_STREAM_ZERO_HOST_SYNC) nothing is queued and nothing is waited for.
+void yasai_wait_before_unmap() {
+  gpgpu_context *ctx = GPGPU_Context();
+  if (!yasai_stream_manager(ctx)->yasai_host_sync()) yasai_stream_manager(ctx)->yasai_wait_device();
+}
+
 // yasai: runtime functions defined further down that the driver forwards and their helpers
 // below call (C linkage, as the applications see them).
 extern "C" {
@@ -11031,6 +11044,8 @@ __host__ cudaError_t CUDARTAPI cudaIpcGetEventHandle(cudaIpcEventHandle_t *handl
 }
 
 __host__ cudaError_t CUDARTAPI cudaIpcCloseMemHandle(void *devPtr) {
+  // yasai: work queued before the close may still read or write the mapping.
+  yasai_wait_before_unmap();
   if (!yasai_vmm::ipc_close_mem_handle(reinterpret_cast<uint64_t>(devPtr)))
     return g_last_cudaError = cudaErrorInvalidValue;
   return g_last_cudaError = cudaSuccess;
@@ -11167,7 +11182,9 @@ __host__ cudaError_t CUDARTAPI cudaGetDriverEntryPointByVersion(
 }
 
 __host__ cudaError_t CUDARTAPI cudaHostUnregister(void *ptr) {
-  // yasai: undoes cudaHostRegister.
+  // yasai: undoes cudaHostRegister, after the work queued before it, which may still access the
+  // range through its device address.
+  yasai_wait_before_unmap();
   if (!host_window::remove(reinterpret_cast<uint64_t>(ptr)))
     return g_last_cudaError = cudaErrorHostMemoryNotRegistered;
   GPGPU_Context()->api->pinned_memory_size.erase(ptr);
