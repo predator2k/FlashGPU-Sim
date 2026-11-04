@@ -576,6 +576,7 @@ void function_info::recognize_dynamic_shared_mem() {
                      "memory symbol for %s\n",
                      symbol->name().c_str());
               m_local_dyn_shared_mem_symbol = m_symtab->add_symbol(*symbol);
+              m_local_dyn_shared_mem_symbol->set_yasai_dyn_smem();
             }
             // yasai: another extern .shared array of the same kernel aliases the same base
             // (it used to abort on "Multiple dynamic shared memory symbols found!").
@@ -586,6 +587,7 @@ void function_info::recognize_dynamic_shared_mem() {
                 if (a->name() == symbol->name()) local = a;
               if (!local) {
                 local = m_symtab->add_symbol(*symbol);
+                local->set_yasai_dyn_smem();
                 m_yasai_dyn_smem_aliases.push_back(local);
               }
             }
@@ -661,9 +663,17 @@ void function_info::alloc_dyn_shared_mem(int shared_mem_size) {
   } else {
     // yasai: a kernel that never names an extern .shared array may still be launched with
     // dynamic shared memory (ThunderKittens' test wrappers request it for every kernel); CUDA
-    // reserves it and nothing reads it, so the launch goes on.
+    // reserves it and nothing in the kernel itself reads it, so the launch goes on. A function
+    // it calls may name one (yasai_dyn_smem_base), so the base is recorded, with the alignment of
+    // the placed case; nothing is allocated, because no later symbol of this function follows.
     printf("GPGPU-Sim PTX: kernel '%s' has no dynamic shared memory symbol; the %d bytes "
            "requested at launch are not used\n", m_name.c_str(), shared_mem_size);
+    if (!m_yasai_dyn_smem_placed) {
+      const addr_t addr = symtab->get_shared_next();
+      const unsigned alignto = 1024;
+      m_yasai_dyn_smem_addr = addr + (alignto - (addr % alignto)) % alignto;
+      m_yasai_dyn_smem_placed = true;
+    }
   }
 }
 
