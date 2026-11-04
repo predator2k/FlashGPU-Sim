@@ -576,7 +576,7 @@ void function_info::recognize_dynamic_shared_mem() {
                      "memory symbol for %s\n",
                      symbol->name().c_str());
               m_local_dyn_shared_mem_symbol = m_symtab->add_symbol(*symbol);
-              m_local_dyn_shared_mem_symbol->set_yasai_dyn_smem();
+              m_local_dyn_shared_mem_symbol->set_yasai_dyn_smem(align > 0 ? (unsigned)align : 0);
             }
             // yasai: another extern .shared array of the same kernel aliases the same base
             // (it used to abort on "Multiple dynamic shared memory symbols found!").
@@ -587,7 +587,7 @@ void function_info::recognize_dynamic_shared_mem() {
                 if (a->name() == symbol->name()) local = a;
               if (!local) {
                 local = m_symtab->add_symbol(*symbol);
-                local->set_yasai_dyn_smem();
+                local->set_yasai_dyn_smem(align > 0 ? (unsigned)align : 0);
                 m_yasai_dyn_smem_aliases.push_back(local);
               }
             }
@@ -603,55 +603,71 @@ void function_info::recognize_dynamic_shared_mem() {
   }
 }
 
+void function_info::yasai_place_dyn_smem() {
+  if (m_yasai_dyn_smem_placed) return;
+  const addr_t addr = get_symtab()->get_shared_next();
+  // The base is 1024-byte aligned, or more when an extern array declares a larger .align. The
+  // hardware honours the declared alignment of the kernel's array (an RTX 5090 puts arrays
+  // declared 16, 128 and 1024 after 12 bytes of static shared memory at 0x410, 0x480 and 0x800),
+  // but the PTX does not always carry it: nvcc emits one module-level .extern .shared per array
+  // name with the alignment of its first declaration, so kernels that declare one name with
+  // different alignments (template instances) all read .align 16 in the PTX while their cubins
+  // keep their own alignment. A 1024-byte base satisfies every declaration. The base used to be
+  // 128-byte aligned (an extern __align__(1024) array after static variables started at 0x80).
+  // Deviation: for arrays declared with a small .align the base is more aligned than on the
+  // hardware, so shared-memory addresses (traces, bank-conflict timing, address-dependent
+  // swizzles) differ from the hardware's by up to 1008 bytes. Capacity is unaffected: the launch
+  // and occupancy checks count the static and the requested dynamic bytes, not the padded base,
+  // and the padded end stays below the 256 KB that descriptor addresses reach.
+  // The alignment covers the whole kernel, callees included: a callee may be reached through a
+  // pointer table and its body may be parsed only at its first call, so instead of the call graph
+  // it takes every extern .shared array visible from this function's symbol tables, which
+  // holds the declarations of all functions of the module (a superset of what the kernel calls).
+  unsigned alignto = 1024;
+  if (m_yasai_dyn_smem_align > alignto) alignto = m_yasai_dyn_smem_align;
+  const unsigned module_align = get_symtab()->yasai_max_extern_shared_align();
+  if (module_align > alignto) alignto = module_align;
+  m_yasai_dyn_smem_pad = (alignto - (addr % alignto)) % alignto;
+  m_yasai_dyn_smem_addr = addr + m_yasai_dyn_smem_pad;
+  m_yasai_dyn_smem_placed = true;
+  if (m_local_dyn_shared_mem_symbol) m_local_dyn_shared_mem_symbol->set_address(m_yasai_dyn_smem_addr);
+  for (symbol *a : m_yasai_dyn_smem_aliases) a->set_address(m_yasai_dyn_smem_addr);
+}
+
+void function_info::yasai_dyn_smem_fail(const symbol *sym) const {
+  printf("GPGPU-Sim PTX: ERROR ** kernel '%s': extern .shared array '%s' (.align %u): dynamic shared "
+         "memory base %s 0x%llx\n",
+         m_name.c_str(), sym->name().c_str(), sym->yasai_dyn_smem_align(),
+         m_yasai_dyn_smem_placed ? "misses the alignment at" : "was never placed; value",
+         (unsigned long long)m_yasai_dyn_smem_addr);
+  fflush(stdout);
+  abort();
+}
+
 void function_info::alloc_dyn_shared_mem(int shared_mem_size) {
   // Handle dynamic shared memory for extern shared symbols
     printf("GPGPU-Sim PTX: Setting up dynamic shared memory: size=%d bytes\n",
       shared_mem_size);
 
   symbol_table *symtab = get_symtab();
+  yasai_place_dyn_smem();
 
   if (m_local_dyn_shared_mem_symbol) {
     // yasai: the dynamic region keeps the address of the first launch; a later launch only
     // reserves more when it asks for more. Before, every launch allocated a new region after the
     // previous one, so the second launch of a kernel saw its shared memory at another address
     // (FlashMLA's SM100 decode, whose buffers then lost their 1024-byte swizzle alignment).
-    if (m_yasai_dyn_smem_placed) {
-      m_local_dyn_shared_mem_symbol->set_address(m_yasai_dyn_smem_addr);
-      for (symbol *a : m_yasai_dyn_smem_aliases) a->set_address(m_yasai_dyn_smem_addr);
-      if ((unsigned)shared_mem_size > m_yasai_dyn_smem_reserved) {
-        symtab->alloc_shared(shared_mem_size - m_yasai_dyn_smem_reserved);
-        m_yasai_dyn_smem_reserved = shared_mem_size;
-      }
-      return;
+    const unsigned need = (unsigned)shared_mem_size + m_yasai_dyn_smem_pad;
+    const bool first = m_yasai_dyn_smem_reserved == 0;
+    if (need > m_yasai_dyn_smem_reserved) {
+      symtab->alloc_shared(need - m_yasai_dyn_smem_reserved);
+      m_yasai_dyn_smem_reserved = need;
     }
-    addr_t addr = symtab->get_shared_next();
-    // yasai: the base is 1024-byte aligned, or more when an extern array declares a larger
-    // .align. The hardware honours the declared alignment of the kernel's array (an RTX 5090
-    // puts arrays declared 16, 128 and 1024 after 12 bytes of static shared memory at 0x410,
-    // 0x480 and 0x800), but the PTX does not always carry it: nvcc emits one module-level
-    // .extern .shared per array name with the alignment of its first declaration, so kernels
-    // that declare one name with different alignments (template instances) all read .align 16
-    // in the PTX while their cubins keep their own alignment. A 1024-byte base satisfies every
-    // declaration. The base used to be 128-byte aligned (an extern __align__(1024) array after
-    // static variables started at 0x80).
-    // Deviation: for arrays declared with a small .align the base is more aligned than on the
-    // hardware, so shared-memory addresses (traces, bank-conflict timing, address-dependent
-    // swizzles) differ from the hardware's by up to 1008 bytes. Capacity is unaffected: the
-    // launch and occupancy checks count the static and the requested dynamic bytes, not the
-    // padded base, and the padded end stays below the 256 KB that descriptor addresses reach.
-    unsigned alignto = 1024;
-    if (m_yasai_dyn_smem_align > alignto) alignto = m_yasai_dyn_smem_align;
-    addr_t addr_pad = alignto ? ((alignto - (addr % alignto)) % alignto) : 0;
-    m_yasai_dyn_smem_placed = true;
-    m_yasai_dyn_smem_addr = addr + addr_pad;
-    m_yasai_dyn_smem_reserved = shared_mem_size;
+    if (!first) return;
         printf("GPGPU-Sim PTX: Allocating local dyn shared mem symbol %s from "
           "0x%llx to 0x%llx (size %d)\n",
-           m_local_dyn_shared_mem_symbol->name().c_str(), addr + addr_pad,
-           addr + addr_pad + shared_mem_size, shared_mem_size);
-    m_local_dyn_shared_mem_symbol->set_address(addr + addr_pad);
-    for (symbol *a : m_yasai_dyn_smem_aliases) a->set_address(addr + addr_pad);
-    symtab->alloc_shared(shared_mem_size + addr_pad);
+           m_local_dyn_shared_mem_symbol->name().c_str(), m_yasai_dyn_smem_addr,
+           m_yasai_dyn_smem_addr + shared_mem_size, shared_mem_size);
     // Print the dynamic allocation and the resulting total shared mem for this
     // kernel. `m_kernel_info.smem` is the declared (static) smem size parsed
     // at assembly time; `shared_mem_size` is the per-launch dynamic size.
@@ -664,16 +680,9 @@ void function_info::alloc_dyn_shared_mem(int shared_mem_size) {
     // yasai: a kernel that never names an extern .shared array may still be launched with
     // dynamic shared memory (ThunderKittens' test wrappers request it for every kernel); CUDA
     // reserves it and nothing in the kernel itself reads it, so the launch goes on. A function
-    // it calls may name one (yasai_dyn_smem_base), so the base is recorded, with the alignment of
-    // the placed case; nothing is allocated, because no later symbol of this function follows.
+    // it calls may name one: those resolve to the placed base (yasai_dyn_smem_base).
     printf("GPGPU-Sim PTX: kernel '%s' has no dynamic shared memory symbol; the %d bytes "
            "requested at launch are not used\n", m_name.c_str(), shared_mem_size);
-    if (!m_yasai_dyn_smem_placed) {
-      const addr_t addr = symtab->get_shared_next();
-      const unsigned alignto = 1024;
-      m_yasai_dyn_smem_addr = addr + (alignto - (addr % alignto)) % alignto;
-      m_yasai_dyn_smem_placed = true;
-    }
   }
 }
 
