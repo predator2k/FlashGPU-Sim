@@ -1045,6 +1045,9 @@ void gpgpu_t::memcpy_from_gpu(void *dst, size_t src_start_addr, size_t count) {
   }
 }
 
+// yasai: largest piece of a device-to-device copy or a memset (memcpy_gpu_to_gpu, gpu_memset).
+static constexpr size_t kYasaiCopyChunk = size_t(1) << 20;
+
 void gpgpu_t::memcpy_gpu_to_gpu(size_t dst, size_t src, size_t count) {
   if (g_debug_execution >= 3) {
     printf("GPGPU-Sim PTX: copying %zu bytes from GPU[0x%Lx] to GPU[0x%Lx] ...",
@@ -1052,12 +1055,19 @@ void gpgpu_t::memcpy_gpu_to_gpu(size_t dst, size_t src, size_t count) {
     fflush(stdout);
   }
   yasai_lazy::observe(src, count, dst, count);  // yasai: see memcpy_to_gpu
-  host_window::copy_zero_skip_scope copy;  // yasai: zero-over-zero bytes may be skipped
+  host_window::copy_zero_skip_scope copy;  // yasai: zero-over-zero pages may be skipped
   shared_devmem::exec_scope work;          // yasai: no conversion during the copy
-  for (unsigned n = 0; n < count; n++) {
-    unsigned char tmp;
-    m_global_mem->read(src + n, 1, &tmp);
-    m_global_mem->write(dst + n, 1, &tmp, NULL, NULL);
+  // yasai: the copy goes in pieces of at most kYasaiCopyChunk bytes through one bounce buffer
+  // (it went byte by byte: 374 MB took 18 s). Each piece is one read and one write of the
+  // global space, which split an access at host_window range boundaries, so a piece may cross
+  // from one mapping into the next. The zero-store skip then works per 4 KiB page, as for
+  // memcpy_to_gpu. The counter is a size_t (an unsigned one never ended for 4 GiB or more).
+  std::vector<unsigned char> buf(std::min(count, kYasaiCopyChunk));
+  for (size_t off = 0; off < count;) {
+    const size_t n = std::min(kYasaiCopyChunk, count - off);
+    m_global_mem->read(src + off, n, buf.data());
+    m_global_mem->write(dst + off, n, buf.data(), NULL, NULL);
+    off += n;
   }
   if (g_debug_execution >= 3) {
     printf(" done.\n");
@@ -1075,10 +1085,16 @@ void gpgpu_t::gpu_memset(size_t dst_start_addr, int c, size_t count) {
   }
   unsigned char c_value = (unsigned char)c;
   yasai_lazy::observe(0, 0, dst_start_addr, count);  // yasai: see memcpy_to_gpu
-  host_window::copy_zero_skip_scope copy;  // yasai: zero-over-zero bytes may be skipped
+  host_window::copy_zero_skip_scope copy;  // yasai: zero-over-zero pages may be skipped
   shared_devmem::exec_scope work;          // yasai: no conversion during the memset
-  for (unsigned n = 0; n < count; n++)
-    m_global_mem->write(dst_start_addr + n, 1, &c_value, NULL, NULL);
+  // yasai: in pieces of at most kYasaiCopyChunk bytes from one filled buffer, as
+  // memcpy_gpu_to_gpu does (it went byte by byte, with an unsigned counter).
+  const std::vector<unsigned char> buf(std::min(count, kYasaiCopyChunk), c_value);
+  for (size_t off = 0; off < count;) {
+    const size_t n = std::min(kYasaiCopyChunk, count - off);
+    m_global_mem->write(dst_start_addr + off, n, buf.data(), NULL, NULL);
+    off += n;
+  }
   if (g_debug_execution >= 3) {
     printf(" done.\n");
     fflush(stdout);
