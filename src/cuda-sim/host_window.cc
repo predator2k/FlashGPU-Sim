@@ -2,10 +2,12 @@
 #include "host_window.h"
 #include "fio_window.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <shared_mutex>
@@ -332,13 +334,48 @@ void write(uint64_t addr, size_t bytes, const void *in) {
   std::atomic_thread_fence(std::memory_order_release);
 }
 
-bool try_read(uint64_t addr, size_t bytes, void *out) {
-  range_info r;
-  if (!lookup(addr, bytes, &r)) return false;
+access_kind split_access(uint64_t addr, size_t bytes, range_info *inside,
+                         std::vector<access_piece> *pieces) {
+  if (bytes == 0 || g_count.load(std::memory_order_acquire) == 0) return access_kind::outside;
+  std::shared_lock<std::shared_mutex> lock(ranges_mu());
+  const auto &m = ranges();
+  const uint64_t end = addr + bytes;
+  // The first range that may overlap the access: the one that starts at or before addr when it
+  // reaches past addr, else the first one that starts after addr.
+  auto it = m.upper_bound(addr);
+  if (it != m.begin()) {
+    auto prev = std::prev(it);
+    if (prev->first + prev->second.bytes > addr) it = prev;
+  }
+  if (it == m.end() || it->first >= end) return access_kind::outside;
+  auto info = [](std::map<uint64_t, entry>::const_iterator e) {
+    return range_info{e->first, e->second.bytes, e->second.kind, e->second.mc, e->second.mc_offset};
+  };
+  if (it->first <= addr && end <= it->first + it->second.bytes) {
+    if (inside) *inside = info(it);
+    return access_kind::inside;
+  }
+  // Ranges do not overlap one another (add() drops the ones a new range overlaps), so walking
+  // them in address order cuts the access into alternating runs inside and outside ranges.
+  uint64_t a = addr;
+  for (; it != m.end() && it->first < end; ++it) {
+    if (it->first > a) {
+      pieces->push_back(access_piece{a, size_t(it->first - a), false, range_info{}});
+      a = it->first;
+    }
+    const uint64_t hi = std::min(end, it->first + it->second.bytes);
+    pieces->push_back(access_piece{a, size_t(hi - a), true, info(it)});
+    a = hi;
+  }
+  if (a < end) pieces->push_back(access_piece{a, size_t(end - a), false, range_info{}});
+  return access_kind::split;
+}
+
+void read_in(const range_info &r, uint64_t addr, size_t bytes, void *out) {
   if (r.kind == range_kind::multicast) {
     if (g_mc_read) g_mc_read(r.mc, r.mc_offset + (addr - r.base), bytes, out);
     else memset(out, 0, bytes);
-    return true;
+    return;
   }
   // yasai: an unordered FIO window drains its due writes into shared memory before the read, then
   // overlays this process's own pending writes so the issuing kernel reads them in program order.
@@ -346,28 +383,38 @@ bool try_read(uint64_t addr, size_t bytes, void *out) {
   if (fio) fio_window::before_load(addr, bytes);
   read(addr, bytes, out);
   if (fio) fio_window::overlay(addr, bytes, out);
+}
+
+bool try_read(uint64_t addr, size_t bytes, void *out) {
+  range_info r;
+  if (!lookup(addr, bytes, &r)) return false;
+  read_in(r, addr, bytes, out);
   return true;
 }
 
 bool try_write(uint64_t addr, size_t bytes, const void *in, bool weak) {
   range_info r;
   if (!lookup(addr, bytes, &r)) return false;
+  write_in(r, addr, bytes, in, weak);
+  return true;
+}
+
+void write_in(const range_info &r, uint64_t addr, size_t bytes, const void *in, bool weak) {
   if (r.kind == range_kind::multicast) {
     if (g_mc_write) g_mc_write(r.mc, r.mc_offset + (addr - r.base), bytes, in);
-    return true;
+    return;
   }
   // yasai: a store into an unordered FIO window is buffered (made visible later, out of order),
   // not written now. It goes before the zero-store skip, so the window model and the FIO transport
   // record see every store, zeros over zeros included.
-  if (fio_window::any() && fio_window::on_store(addr, bytes, in)) return true;
+  if (fio_window::any() && fio_window::on_store(addr, bytes, in)) return;
   // yasai: the zero-store skip comes last, after every hook that must see the store (an
   // unordered FIO window's buffering goes before it), and only for device memory.
   if (weak && r.kind == range_kind::device && zero_elide()) {
     skip_zero_store(addr, bytes, in);
-    return true;
+    return;
   }
   write(addr, bytes, in);
-  return true;
 }
 
 bool compare_exchange(uint64_t addr, size_t bytes, uint64_t *expected, uint64_t desired) {

@@ -93,7 +93,25 @@ void memory_space_impl<BSIZE>::write_only(mem_addr_t offset, mem_addr_t index,
                                           size_t length, const void *data) {
   if (m_host_window) {
     const mem_addr_t addr = (index << m_log2_block_size) + offset;
-    if (host_window::try_write(addr, length, data)) return;
+    host_window::range_info r;
+    std::vector<host_window::access_piece> parts;
+    switch (host_window::split_access(addr, length, &r, &parts)) {
+      case host_window::access_kind::inside:
+        host_window::write_in(r, addr, length, data, false);
+        return;
+      case host_window::access_kind::split:
+        // yasai: an access across a range boundary is served part by part (split_access).
+        for (const auto &p : parts) {
+          const unsigned char *src = (const unsigned char *)data + (p.addr - addr);
+          if (p.in_range)
+            host_window::write_in(p.range, p.addr, p.bytes, src, false);
+          else
+            get_or_init_block(index).write(offset + (p.addr - addr), p.bytes, src);
+        }
+        return;
+      case host_window::access_kind::outside:
+        break;
+    }
   }
   get_or_init_block(index).write(offset, length, (const unsigned char *)data);
 }
@@ -129,11 +147,37 @@ void memory_space_impl<BSIZE>::write(mem_addr_t addr, size_t length,
              thread->get_ctaid().z, pI->get_source());
     printf("\n");
   }
-  // yasai: weak st.global, memset and copies may skip zero-over-zero stores (try_write).
-  if (m_host_window &&
-      host_window::try_write(addr, length, data,
-                             pI ? pI->is_weak_store() : host_window::in_copy_zero_skip_scope()))
-    return;
+  if (m_host_window) {
+    // yasai: weak st.global, memset and copies may skip zero-over-zero stores (write_in).
+    const bool weak = pI ? pI->is_weak_store() : host_window::in_copy_zero_skip_scope();
+    host_window::range_info r;
+    std::vector<host_window::access_piece> parts;
+    switch (host_window::split_access(addr, length, &r, &parts)) {
+      case host_window::access_kind::inside:
+        host_window::write_in(r, addr, length, data, weak);
+        return;
+      case host_window::access_kind::split:
+        // yasai: an access across a range boundary (two cuMem mappings placed back to back, or a
+        // range and storage) is served part by part; before, the whole access went to storage.
+        for (const auto &p : parts) {
+          const unsigned char *src = (const unsigned char *)data + (p.addr - addr);
+          if (p.in_range)
+            host_window::write_in(p.range, p.addr, p.bytes, src, weak);
+          else
+            write_storage(p.addr, p.bytes, src, thread, pI);
+        }
+        return;
+      case host_window::access_kind::outside:
+        break;
+    }
+  }
+  write_storage(addr, length, data, thread, pI);
+}
+
+template <unsigned BSIZE>
+void memory_space_impl<BSIZE>::write_storage(mem_addr_t addr, size_t length, const void *data,
+                                             class ptx_thread_info *thread,
+                                             const ptx_instruction *pI) {
   mem_addr_t index = addr >> m_log2_block_size;
 
   if ((addr + length) <= (index + 1) * BSIZE) {
@@ -232,7 +276,33 @@ void memory_space_impl<BSIZE>::read_single_block(mem_addr_t blk_idx,
 template <unsigned BSIZE>
 void memory_space_impl<BSIZE>::read(mem_addr_t addr, size_t length,
                                     void *data) const {
-  if (m_host_window && host_window::try_read(addr, length, data)) return;
+  if (m_host_window) {
+    host_window::range_info r;
+    std::vector<host_window::access_piece> parts;
+    switch (host_window::split_access(addr, length, &r, &parts)) {
+      case host_window::access_kind::inside:
+        host_window::read_in(r, addr, length, data);
+        return;
+      case host_window::access_kind::split:
+        // yasai: an access across a range boundary is served part by part (split_access); before,
+        // the whole access went to storage, which reads zeros where the ranges hold the data.
+        for (const auto &p : parts) {
+          unsigned char *dst = (unsigned char *)data + (p.addr - addr);
+          if (p.in_range)
+            host_window::read_in(p.range, p.addr, p.bytes, dst);
+          else
+            read_storage(p.addr, p.bytes, dst);
+        }
+        return;
+      case host_window::access_kind::outside:
+        break;
+    }
+  }
+  read_storage(addr, length, data);
+}
+
+template <unsigned BSIZE>
+void memory_space_impl<BSIZE>::read_storage(mem_addr_t addr, size_t length, void *data) const {
   mem_addr_t index = addr >> m_log2_block_size;
   if ((addr + length) <= (index + 1) * BSIZE) {
     // fast route for intra-block access

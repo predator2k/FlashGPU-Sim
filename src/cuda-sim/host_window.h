@@ -24,6 +24,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace host_window {
 
@@ -125,6 +126,52 @@ bool try_read(uint64_t addr, size_t bytes, void *out);
 /// @param weak The store may be skipped when it stores zeros over zeros.
 /// @return True when the access was served; false when no range holds it.
 bool try_write(uint64_t addr, size_t bytes, const void *in, bool weak = false);
+
+/// How an access lies relative to the registered ranges (split_access()).
+enum class access_kind : uint8_t {
+  outside,  ///< no registered range overlaps the access: the simulator's own storage serves it
+  inside,   ///< one registered range holds the whole access
+  split,    ///< the access overlaps a range, but no single range holds it: served part by part
+};
+
+/// One part of an access of kind split: a run of bytes inside one registered range, or a run
+/// outside every range.
+struct access_piece {
+  uint64_t addr;     ///< first address of the part
+  size_t bytes;      ///< length of the part in bytes
+  bool in_range;     ///< whether a registered range holds the part
+  range_info range;  ///< that range, when in_range
+};
+
+/// Classifies [addr, addr + bytes) against the registered ranges. An access that spans two
+/// adjacent ranges (two cuMem mappings placed back to back, as PyTorch's expandable segments do),
+/// or a range and memory outside every range, is cut at every range boundary. Classification and
+/// cutting take the range lock once (shared), so every part comes from one view of the ranges
+/// while other threads add or remove ranges; the parts are served after the lock is released, as
+/// try_read and try_write serve an access after their lookup.
+/// @param addr First address of the access.
+/// @param bytes Length in bytes.
+/// @param inside Receives the range for kind inside.
+/// @param pieces Receives the parts, in address order, for kind split (left untouched otherwise).
+/// @return The kind.
+access_kind split_access(uint64_t addr, size_t bytes, range_info *inside,
+                         std::vector<access_piece> *pieces);
+
+/// Serves a load of [addr, addr + bytes) that range r holds, as try_read does after its lookup.
+/// @param r The range (from lookup() or split_access()).
+/// @param addr First address.
+/// @param bytes Length in bytes.
+/// @param out Destination buffer.
+void read_in(const range_info &r, uint64_t addr, size_t bytes, void *out);
+
+/// Serves a store into [addr, addr + bytes) that range r holds, as try_write does after its
+/// lookup (the FIO window hook, then the zero-store skip for weak stores into device memory).
+/// @param r The range (from lookup() or split_access()).
+/// @param addr First address.
+/// @param bytes Length in bytes.
+/// @param in Source buffer.
+/// @param weak The store may be skipped when it stores zeros over zeros.
+void write_in(const range_info &r, uint64_t addr, size_t bytes, const void *in, bool weak);
 
 /// Marks this thread's stores as memset or copy stores while the object lives, so that
 /// memory_space_impl::write passes `weak` to try_write for stores without an instruction.
