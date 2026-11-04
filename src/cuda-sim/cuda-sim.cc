@@ -3072,6 +3072,39 @@ using flash_gpgpu_sim::wgmma_wait_group_impl;
           this);  // texture obtain its data granularity from the texture info
     }
 
+    // yasai (diagnosis only, branch yasai-fork-agll-dbg): YASAI_DEBUG_PC=<pc>[,<pc>...] prints
+    // the thread's registers after it executes an instruction at one of these PCs (decimal),
+    // at most YASAI_DEBUG_PC_MAX times (default 16) over the process; PTX_SIM_DEBUG needs level
+    // 10 for this, which also turns on the JIT configuration path that asserts in fakeenv runs.
+    {
+      static const std::vector<unsigned long long> dbg_pcs = [] {
+        std::vector<unsigned long long> v;
+        if (const char *s = getenv("YASAI_DEBUG_PC"))
+          for (const char *p = s; *p;) {
+            char *end = nullptr;
+            const unsigned long long x = strtoull(p, &end, 10);
+            if (end == p) break;
+            v.push_back(x);
+            p = (*end == ',') ? end + 1 : end;
+          }
+        return v;
+      }();
+      static const long dbg_max =
+          getenv("YASAI_DEBUG_PC_MAX") ? atol(getenv("YASAI_DEBUG_PC_MAX")) : 16;
+      static std::atomic<long> dbg_count{0};
+      if (!dbg_pcs.empty() &&
+          std::find(dbg_pcs.begin(), dbg_pcs.end(), (unsigned long long)pc) != dbg_pcs.end() &&
+          dbg_count.fetch_add(1) < dbg_max) {
+        dim3 c = get_ctaid(), t = get_tid();
+        printf("yasai-debug-pc pc=%llu ctaid=(%u,%u,%u) tid=(%u,%u,%u) %s:%u %s\n",
+               (unsigned long long)pc, c.x, c.y, c.z, t.x, t.y, t.z, pI->source_file(),
+               pI->source_line(), pI->get_source());
+        dump_regs(stdout);
+        printf("yasai-debug-pc end\n");
+        fflush(stdout);
+      }
+    }
+
     // Output register information to file and stdout
     if (config.get_ptx_inst_debug_to_file() != 0 &&
         (config.get_ptx_inst_debug_thread_uid() == 0 ||
