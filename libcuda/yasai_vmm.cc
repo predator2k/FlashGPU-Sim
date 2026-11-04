@@ -22,6 +22,8 @@ class CUctx_st;
 struct gpgpu_context;
 gpgpu_context *GPGPU_Context();
 CUctx_st *GPGPUSim_Context(gpgpu_context *ctx);
+/// Waits for the queued kernels and copies before a mapping is removed (cuda_runtime_api.cc).
+void yasai_wait_before_unmap();
 /// Simulated GPU of the current context (defined in cuda_runtime_api.cc).
 gpgpu_t *yasai_current_gpu();
 
@@ -347,6 +349,7 @@ int cuMemMap(unsigned long long ptr, size_t size, size_t offset, unsigned long l
 /// cuMemUnmap.
 int cuMemUnmap(unsigned long long ptr, size_t size) {
   yasai_lazy::observe(0, 0, ptr, size);  // yasai: pending kernels that use the range run first
+  yasai_wait_before_unmap();             // yasai: and so do the queued copies and kernels
   return shared_devmem::unmap(ptr, size) ? kSuccess : kInvalidValue;
 }
 
