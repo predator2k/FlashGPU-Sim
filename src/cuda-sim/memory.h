@@ -128,6 +128,13 @@ class memory_space_impl : public memory_space {
  private:
   void read_single_block(mem_addr_t blk_idx, mem_addr_t addr, size_t length,
                          void *data) const;
+  // yasai: the simulator's own storage part of read(): the blocks of [addr, addr + length).
+  //   addr, length  the access; data  destination buffer
+  void read_storage(mem_addr_t addr, size_t length, void *data) const;
+  // yasai: the simulator's own storage part of write(), with the watchpoints.
+  //   addr, length  the access; data  source buffer; thd, pI  the storing thread and instruction
+  void write_storage(mem_addr_t addr, size_t length, const void *data, ptx_thread_info *thd,
+                     const ptx_instruction *pI);
   std::string m_name;
   unsigned m_log2_block_size;
   // yasai: true for the "global" space; accesses inside host_window ranges go to host memory.
