@@ -1720,6 +1720,7 @@ ptx_instruction::ptx_instruction(
       case RM_OPTION:
       case RP_OPTION:
         m_rounding_mode = last_ptx_inst_option;
+        m_yasai_rnd_explicit = true;  // yasai: see has_rounding_modifier()
         break;
       case HI_OPTION:
         m_compare_op = last_ptx_inst_option;

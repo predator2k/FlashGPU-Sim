@@ -2946,6 +2946,11 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
     }
     ~ftz_scope() { t_ftz_inst = saved; }
   } ftz_ctx(pI);
+  // yasai: a contracted mul keeps its source values for the add that fuses it (yasai_contract.h).
+  if (pI->yasai_save_a() != nullptr) {
+    set_reg(pI->yasai_save_a(), get_operand_value(pI->src1(), pI->dst(), pI->get_type(), this, 1));
+    set_reg(pI->yasai_save_b(), get_operand_value(pI->src2(), pI->dst(), pI->get_type(), this, 1));
+  }
 
   set_npc(pc + pI->inst_size());
 

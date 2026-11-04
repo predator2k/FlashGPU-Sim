@@ -1381,7 +1381,11 @@ static bool yasai_packed_binop(const ptx_instruction *pI, ptx_thread_info *threa
 // yasai: mixed-precision add/sub (.f32.f16 and .f32.bf16), defined before sub_impl.
 static bool yasai_mixed_f32_binop(const ptx_instruction *pI, ptx_thread_info *thread, char op);
 
+// yasai: see yasai_fused_add (defined after yasai_fma, before mad_def).
+static void yasai_fused_add(const ptx_instruction *pI, ptx_thread_info *thread, bool is_sub);
+
 void add_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  if (pI->yasai_fuse_src()) return yasai_fused_add(pI, thread, false);  // yasai_contract.h
   if (yasai_packed_binop(pI, thread, '+')) return;
   if (yasai_mixed_f32_binop(pI, thread, '+')) return;  // yasai
   ptx_reg_t src1_data, src2_data, data;
@@ -5312,6 +5316,87 @@ static inline double f64(double a, double b, double c, unsigned rnd, bool satura
 
 }  // namespace yasai_fma
 
+
+// yasai: an add or sub that fuses a mul's product (yasai_contract.h): a * b + c rounded once (round
+// to nearest, the add's .ftz and .sat), with a and b the values the mul read and c the add's other
+// source; a sub negates the product (product second) or c (product first).
+static void yasai_fused_add(const ptx_instruction *pI, ptx_thread_info *thread, bool is_sub) {
+  const unsigned type = pI->get_type();
+  const int pos = pI->yasai_fuse_src();
+  const operand_info &dst = pI->dst();
+  const operand_info &other = pos == 1 ? pI->src2() : pI->src1();
+  const bool neg_prod = pI->yasai_fuse_neg() != (is_sub && pos == 2);
+  const bool neg_c = is_sub && pos == 1;
+  const bool sat = pI->saturation_mode();
+  const ptx_reg_t a = thread->get_reg(pI->yasai_fuse_a()), b = thread->get_reg(pI->yasai_fuse_b());
+  ptx_reg_t d;
+  d.u64 = 0;
+  switch (type) {
+    case F32_TYPE: {
+      float c = thread->get_operand_value(other, dst, type, thread, 1).f32;
+      d.f32 = yasai_fma::f32(neg_prod ? -a.f32 : a.f32, b.f32, neg_c ? -c : c, RN_OPTION,
+                             pI->is_ftz(), sat);
+      break;
+    }
+    case F64_TYPE:
+    case FF64_TYPE: {
+      double c = thread->get_operand_value(other, dst, type, thread, 1).f64;
+      d.f64 = yasai_fma::f64(neg_prod ? -a.f64 : a.f64, b.f64, neg_c ? -c : c, RN_OPTION, sat);
+      break;
+    }
+    case F32X2_TYPE: {
+      const uint64_t cv = thread->get_operand_value(other, dst, type, thread, 1).u64;
+      uint64_t r = 0;
+      for (int h = 0; h < 2; ++h) {
+        float x, y, z;
+        const uint32_t ux = uint32_t(a.u64 >> (32 * h)), uy = uint32_t(b.u64 >> (32 * h)),
+                       uz = uint32_t(cv >> (32 * h));
+        memcpy(&x, &ux, 4);
+        memcpy(&y, &uy, 4);
+        memcpy(&z, &uz, 4);
+        const float v = yasai_fma::f32(neg_prod ? -x : x, y, neg_c ? -z : z, RN_OPTION,
+                                       pI->is_ftz(), sat);
+        uint32_t uv;
+        memcpy(&uv, &v, 4);
+        r |= uint64_t(uv) << (32 * h);
+      }
+      d.u64 = r;
+      break;
+    }
+    case F16_TYPE: {
+      const half c = thread->get_operand_value(other, dst, type, thread, 1).f16;
+      const double x = double(float(a.f16)) * (neg_prod ? -1 : 1), y = double(float(b.f16));
+      const double z = double(float(c)) * (neg_c ? -1 : 1);
+      d.f16 = f16_from_double(yasai_fma::fused_odd(x, y, z, RN_OPTION), RN_OPTION);
+      if (sat) {
+        if (d.f16 < 0) d.f16 = 0;
+        else if (d.f16 > 1.0f) d.f16 = 1.0f;
+      }
+      break;
+    }
+    default: {  // BF16_TYPE and F16X2_TYPE (f16x2 or bf16x2): halves in their bit patterns
+      const bool scalar = type == BF16_TYPE;
+      const bool bf16 = scalar || pI->is_bf16x2();
+      const uint32_t cv =
+          thread->get_operand_value(other, dst, scalar ? B16_TYPE : B32_TYPE, thread, 1).u32;
+      uint32_t r = 0;
+      for (int h = 0; h < (scalar ? 1 : 2); ++h) {
+        const float x = packed_half_to_f32(uint16_t(a.u32 >> (16 * h)), bf16);
+        const float y = packed_half_to_f32(uint16_t(b.u32 >> (16 * h)), bf16);
+        const float z = packed_half_to_f32(uint16_t(cv >> (16 * h)), bf16);
+        float v = yasai_fma::to_f32_odd(
+            yasai_fma::fused_odd(neg_prod ? -x : x, y, neg_c ? -z : z, RN_OPTION));
+        if (sat) v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+        r |= uint32_t(packed_half_from_f32(v, bf16, false, RN_OPTION)) << (16 * h);
+      }
+      d.u32 = r;
+      thread->set_operand_value(dst, d, scalar ? B16_TYPE : F16X2_TYPE, thread, pI);
+      return;
+    }
+  }
+  thread->set_operand_value(dst, d, type, thread, pI);
+}
+
 void mad_def(const ptx_instruction *pI, ptx_thread_info *thread,
              bool use_carry) {
   const operand_info &dst = pI->dst();
@@ -7701,6 +7786,7 @@ static bool yasai_mixed_f32_binop(const ptx_instruction *pI, ptx_thread_info *th
 }
 
 void sub_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  if (pI->yasai_fuse_src()) return yasai_fused_add(pI, thread, true);  // yasai_contract.h
   if (yasai_packed_binop(pI, thread, '-')) return;  // yasai
   if (yasai_mixed_f32_binop(pI, thread, '-')) return;  // yasai
   ptx_reg_t data;
