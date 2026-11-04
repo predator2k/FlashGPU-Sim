@@ -25,6 +25,7 @@
 
 #include "host_window.h"
 #include "fio_window.h"
+#include "yasai_strict_addr.h"
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000  // Linux 4.17 and later
@@ -737,6 +738,7 @@ bool unmap(uint64_t va, size_t size) {
   }
   s.maps.erase(it);
   release_locked(p);
+  yasai_strict_addr::note_freed(va, len, "cuMemUnmap or cudaIpcCloseMemHandle");
   return true;
 }
 
@@ -774,6 +776,7 @@ bool forget_alloc(uint64_t base) {
     host_window::remove(base);
     munmap(reinterpret_cast<void *>(base), round_up(it->second.size, kPage));
   }
+  yasai_strict_addr::note_freed(base, it->second.size, "cudaFree");
   s.allocs.erase(it);
   return true;
 }
@@ -800,6 +803,46 @@ bool range_of(uint64_t addr, uint64_t *base, size_t *size) {
     }
   }
   return false;
+}
+
+int neighbors(uint64_t addr, uint64_t *below_base, size_t *below_size, bool *below_map,
+              uint64_t *above_base, size_t *above_size, bool *above_map) {
+  std::lock_guard<std::mutex> lock(st().mu);
+  state &s = st();
+  int got = 0;
+  // Below: the larger first address of the two candidates (allocations, mappings).
+  auto ia = s.allocs.upper_bound(addr);
+  auto im = s.maps.upper_bound(addr);
+  if (ia != s.allocs.begin()) {
+    auto p = std::prev(ia);
+    *below_base = p->first;
+    *below_size = p->second.size;
+    *below_map = false;
+    got |= 1;
+  }
+  if (im != s.maps.begin()) {
+    auto p = std::prev(im);
+    if (!(got & 1) || p->first > *below_base) {
+      *below_base = p->first;
+      *below_size = p->second.size;
+      *below_map = true;
+      got |= 1;
+    }
+  }
+  // Above: the smaller first address of the two candidates.
+  if (ia != s.allocs.end()) {
+    *above_base = ia->first;
+    *above_size = ia->second.size;
+    *above_map = false;
+    got |= 2;
+  }
+  if (im != s.maps.end() && (!(got & 2) || im->first < *above_base)) {
+    *above_base = im->first;
+    *above_size = im->second.size;
+    *above_map = true;
+    got |= 2;
+  }
+  return got;
 }
 
 bool private_range_of(uint64_t addr, uint64_t *base, size_t *size, bool *shared) {

@@ -28,6 +28,7 @@
 
 #include "memory.h"
 #include "host_window.h"
+#include "yasai_strict_addr.h"
 #include "ptx_ir.h"
 #include "ptx_sim.h"
 #include <stdlib.h>
@@ -105,11 +106,14 @@ void memory_space_impl<BSIZE>::write_only(mem_addr_t offset, mem_addr_t index,
           const unsigned char *src = (const unsigned char *)data + (p.addr - addr);
           if (p.in_range)
             host_window::write_in(p.range, p.addr, p.bytes, src, false);
-          else
+          else {
+            yasai_strict_addr::check(p.addr, p.bytes, true);
             get_or_init_block(index).write(offset + (p.addr - addr), p.bytes, src);
+          }
         }
         return;
       case host_window::access_kind::outside:
+        yasai_strict_addr::check(addr, length, true);  // yasai: storage must hold the address
         break;
     }
   }
@@ -163,11 +167,14 @@ void memory_space_impl<BSIZE>::write(mem_addr_t addr, size_t length,
           const unsigned char *src = (const unsigned char *)data + (p.addr - addr);
           if (p.in_range)
             host_window::write_in(p.range, p.addr, p.bytes, src, weak);
-          else
+          else {
+            yasai_strict_addr::check(p.addr, p.bytes, true);
             write_storage(p.addr, p.bytes, src, thread, pI);
+          }
         }
         return;
       case host_window::access_kind::outside:
+        yasai_strict_addr::check(addr, length, true);  // yasai: storage must hold the address
         break;
     }
   }
@@ -290,11 +297,14 @@ void memory_space_impl<BSIZE>::read(mem_addr_t addr, size_t length,
           unsigned char *dst = (unsigned char *)data + (p.addr - addr);
           if (p.in_range)
             host_window::read_in(p.range, p.addr, p.bytes, dst);
-          else
+          else {
+            yasai_strict_addr::check(p.addr, p.bytes, false);
             read_storage(p.addr, p.bytes, dst);
+          }
         }
         return;
       case host_window::access_kind::outside:
+        yasai_strict_addr::check(addr, length, false);  // yasai: storage must hold the address
         break;
     }
   }

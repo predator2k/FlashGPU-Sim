@@ -29,6 +29,7 @@
 #ifndef ptx_ir_INCLUDED
 #define ptx_ir_INCLUDED
 
+#include "yasai_strict_addr.h"
 #include "../abstract_hardware_model.h"
 
 #include <assert.h>
@@ -384,7 +385,11 @@ class symbol_table {
   addr_t get_tex_next() { return m_tex_next; }
   void alloc_shared(unsigned num_bytes) { m_shared_next += num_bytes; }
   void alloc_sstarr(unsigned num_bytes) { m_sstarr_next += num_bytes; }
-  void alloc_global(unsigned num_bytes) { m_global_next += num_bytes; }
+  // yasai: the end of the static region is known to the illegal-address check.
+  void alloc_global(unsigned num_bytes) {
+    m_global_next += num_bytes;
+    yasai_strict_addr::note_static_end(m_global_next);
+  }
   void alloc_local(unsigned num_bytes) { m_local_next += num_bytes; }
   void alloc_tex(unsigned num_bytes) { m_tex_next += num_bytes; }
 
