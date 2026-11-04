@@ -281,6 +281,10 @@ class symbol {
   bool is_param_kernel() const { return m_is_param_kernel; }
   bool is_tex() const { return m_is_tex; }
   bool is_func_addr() const { return m_is_func_addr; }
+  // yasai: this symbol is a function's localized copy of an extern .shared array, whose address is
+  // the dynamic shared memory base of the launching kernel (function_info::yasai_dyn_smem_base).
+  bool is_yasai_dyn_smem() const { return m_is_yasai_dyn_smem; }
+  void set_yasai_dyn_smem() { m_is_yasai_dyn_smem = true; }
   bool is_reg() const {
     if (m_type == NULL) {
       return false;
@@ -331,6 +335,7 @@ class symbol {
   bool m_is_param_kernel;
   bool m_is_tex;
   bool m_is_func_addr;
+  bool m_is_yasai_dyn_smem = false;  // see is_yasai_dyn_smem; a copied symbol starts as false
   unsigned m_reg_num;
   unsigned m_arch_reg_num;
   bool m_reg_num_valid;
@@ -1697,6 +1702,15 @@ class function_info {
     return m_local_dyn_shared_mem_symbol;
   }
   void alloc_dyn_shared_mem(int size);
+  /// yasai: where this kernel's dynamic shared memory starts, for the extern .shared arrays of
+  /// every function its threads run: the launch places the region on the entry function only, and
+  /// a called function (NCCL's ncclDevFunc_* through ncclDevFuncTable) may run under several
+  /// kernels, so its operands resolve through the thread's kernel at evaluation time.
+  /// @param unplaced Value to return while no launch has placed the region.
+  /// @return The base address in shared memory, or unplaced.
+  addr_t yasai_dyn_smem_base(addr_t unplaced) const {
+    return m_yasai_dyn_smem_placed ? m_yasai_dyn_smem_addr : unplaced;
+  }
 
   unsigned local_mem_framesize() const { return m_local_mem_framesize; }
   void set_framesize(unsigned sz) { m_local_mem_framesize = sz; }
