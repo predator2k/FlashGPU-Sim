@@ -472,10 +472,12 @@ ptx_reg_t ptx_thread_info::get_reg(const symbol *reg) {
 // dynamic shared memory base of the thread's kernel, also in a function the kernel calls (its own
 // copy of the symbol is never placed by a launch, so it used to stay at address 0, on top of the
 // static shared memory: NCCL's PAT algorithms overwrote ncclShmem with their per-warp scratch).
+// These two paths of get_operand_value are the only readers of a shared symbol's address at run
+// time. The base never changes after the kernel's creation, so pool threads read it unlocked.
 //   name    the symbol
 //   kernel  the kernel the thread belongs to
 static inline addr_t yasai_shared_symbol_address(const symbol *name, kernel_info_t &kernel) {
-  return name->is_yasai_dyn_smem() ? kernel.entry()->yasai_dyn_smem_base(name->get_address())
+  return name->is_yasai_dyn_smem() ? kernel.entry()->yasai_dyn_smem_base(name)
                                    : name->get_address();
 }
 

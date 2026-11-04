@@ -161,6 +161,18 @@ symbol *symbol_table::lookup_by_addr(addr_t addr) {
   return NULL;
 }
 
+unsigned symbol_table::yasai_max_extern_shared_align() const {
+  unsigned best = m_parent ? m_parent->yasai_max_extern_shared_align() : 0;
+  for (const auto &kv : m_symbols) {
+    const symbol *s = kv.second;
+    if (s->is_shared() && s->get_size_in_bytes() == 0 && s->type()) {
+      const int a = s->type()->get_key().get_alignment_spec();
+      if (a > 0 && (unsigned)a > best) best = (unsigned)a;
+    }
+  }
+  return best;
+}
+
 symbol *symbol_table::add_symbol(const symbol &sym) {
   // Directly add a symbol.
   std::string key = sym.name();

@@ -284,7 +284,12 @@ class symbol {
   // yasai: this symbol is a function's localized copy of an extern .shared array, whose address is
   // the dynamic shared memory base of the launching kernel (function_info::yasai_dyn_smem_base).
   bool is_yasai_dyn_smem() const { return m_is_yasai_dyn_smem; }
-  void set_yasai_dyn_smem() { m_is_yasai_dyn_smem = true; }
+  // align is the array's declared .align in bytes, 0 when it declares none.
+  void set_yasai_dyn_smem(unsigned align) {
+    m_is_yasai_dyn_smem = true;
+    m_yasai_dyn_smem_align = align;
+  }
+  unsigned yasai_dyn_smem_align() const { return m_yasai_dyn_smem_align; }
   bool is_reg() const {
     if (m_type == NULL) {
       return false;
@@ -336,6 +341,7 @@ class symbol {
   bool m_is_tex;
   bool m_is_func_addr;
   bool m_is_yasai_dyn_smem = false;  // see is_yasai_dyn_smem; a copied symbol starts as false
+  unsigned m_yasai_dyn_smem_align = 0;  // see set_yasai_dyn_smem
   unsigned m_reg_num;
   unsigned m_arch_reg_num;
   bool m_reg_num_valid;
@@ -391,6 +397,9 @@ class symbol_table {
   iterator const_iterator_end() { return m_consts.end(); }
 
   symbol_table *get_parent() { return m_parent; }
+  // yasai: the largest declared .align of the unsized .shared arrays (extern dynamic shared
+  // memory) in this table and its parents; 0 when none declares one.
+  unsigned yasai_max_extern_shared_align() const;
 
   void dump();
   void dump_until_top();
@@ -1702,15 +1711,28 @@ class function_info {
     return m_local_dyn_shared_mem_symbol;
   }
   void alloc_dyn_shared_mem(int size);
+  /// yasai: fixes where this entry function's dynamic shared memory starts: the end of its static
+  /// shared memory, aligned. Every kernel_info_t does this at creation, so a launch with no
+  /// dynamic bytes has the base too: the arrays then start at the (aligned) end of the static
+  /// region, with no bytes behind them, as on the hardware; taking their address is legal. The
+  /// value never changes afterwards, so threads read it without a lock (YASAI_FUNC_THREADS).
+  void yasai_place_dyn_smem();
   /// yasai: where this kernel's dynamic shared memory starts, for the extern .shared arrays of
-  /// every function its threads run: the launch places the region on the entry function only, and
+  /// every function its threads run: the launch sizes the region on the entry function only, and
   /// a called function (NCCL's ncclDevFunc_* through ncclDevFuncTable) may run under several
-  /// kernels, so its operands resolve through the thread's kernel at evaluation time.
-  /// @param unplaced Value to return while no launch has placed the region.
-  /// @return The base address in shared memory, or unplaced.
-  addr_t yasai_dyn_smem_base(addr_t unplaced) const {
-    return m_yasai_dyn_smem_placed ? m_yasai_dyn_smem_addr : unplaced;
+  /// kernels, so its operands resolve through the thread's kernel at evaluation time. An entry
+  /// without a placed base, or a base that misses the array's .align, stops the process
+  /// (yasai_dyn_smem_fail) rather than aliasing other shared memory.
+  /// @param sym The localized array being resolved.
+  /// @return The base address in shared memory.
+  addr_t yasai_dyn_smem_base(const symbol *sym) const {
+    const unsigned a = sym->yasai_dyn_smem_align();
+    if (!m_yasai_dyn_smem_placed || (a > 1 && m_yasai_dyn_smem_addr % a != 0))
+      yasai_dyn_smem_fail(sym);
+    return m_yasai_dyn_smem_addr;
   }
+  /// yasai: prints why yasai_dyn_smem_base cannot resolve sym and aborts.
+  [[noreturn]] void yasai_dyn_smem_fail(const symbol *sym) const;
 
   unsigned local_mem_framesize() const { return m_local_mem_framesize; }
   void set_framesize(unsigned sz) { m_local_mem_framesize = sz; }
@@ -1883,9 +1905,11 @@ class function_info {
   // among all of them (the base honours it, as on the hardware).
   std::vector<symbol *> m_yasai_dyn_smem_aliases;
   unsigned m_yasai_dyn_smem_align = 0;
-  // yasai: address and reserved size of the dynamic shared memory region (alloc_dyn_shared_mem).
+  // yasai: address, alignment padding and reserved bytes (padding included) of the dynamic shared
+  // memory region (yasai_place_dyn_smem, alloc_dyn_shared_mem).
   bool m_yasai_dyn_smem_placed = false;
   addr_t m_yasai_dyn_smem_addr = 0;
+  unsigned m_yasai_dyn_smem_pad = 0;
   unsigned m_yasai_dyn_smem_reserved = 0;
 
   // parameter size for device kernels
