@@ -481,6 +481,58 @@ static inline addr_t yasai_shared_symbol_address(const symbol *name, kernel_info
                                    : name->get_address();
 }
 
+// ---- yasai: .ftz (flush-to-zero) of f32 instructions ---------------------------------------------
+// PTX's .ftz on an f32 instruction flushes subnormal inputs and results to sign-preserving zero
+// (PTX ISA, floating-point instructions; for rcp.approx.ftz.f64 and rsqrt.approx.ftz.f64 the same
+// holds for f64). The simulator used to ignore .ftz everywhere except fma and mad. ptx_exec_inst
+// sets t_ftz_inst to the executing instruction when it carries .ftz; get_operand_value then flushes
+// a subnormal f32 source (both halves of an f32x2), and set_operand_value flushes a subnormal f32
+// result, so every instruction gets the flush without code of its own: add, sub, mul, min, max,
+// neg, abs, setp, cvt to f32, the f32x2 forms, and the inputs and results of the approximate
+// functions (ex2, rcp, rsqrt, lg2, sin, cos, div.approx), whose algorithms still differ from the
+// GPU's (a known gap). f64 values are flushed only for rcp and rsqrt, the f64 instructions with .ftz.
+thread_local const ptx_instruction *t_ftz_inst = nullptr;
+
+namespace yasai_ftz {
+
+/// x, or a zero of its sign when x is subnormal.
+static inline float f32(float x) {
+  return std::fpclassify(x) == FP_SUBNORMAL ? std::copysign(0.0f, x) : x;
+}
+static inline double f64(double x) {
+  return std::fpclassify(x) == FP_SUBNORMAL ? std::copysign(0.0, x) : x;
+}
+
+/// v flushed as a value of PTX type type under the .ftz instruction pI.
+static inline ptx_reg_t flush(ptx_reg_t v, unsigned type, const ptx_instruction *pI) {
+  switch (type) {
+    case F32_TYPE:
+      v.f32 = f32(v.f32);
+      break;
+    case F32X2_TYPE: {
+      uint32_t lo = uint32_t(v.u64), hi = uint32_t(v.u64 >> 32);
+      float flo, fhi;
+      memcpy(&flo, &lo, 4);
+      memcpy(&fhi, &hi, 4);
+      flo = f32(flo);
+      fhi = f32(fhi);
+      memcpy(&lo, &flo, 4);
+      memcpy(&hi, &fhi, 4);
+      v.u64 = (uint64_t(hi) << 32) | lo;
+      break;
+    }
+    case F64_TYPE:
+    case FF64_TYPE:
+      if (pI->get_opcode() == RCP_OP || pI->get_opcode() == RSQRT_OP) v.f64 = f64(v.f64);
+      break;
+    default:
+      break;
+  }
+  return v;
+}
+
+}  // namespace yasai_ftz
+
 ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
                                              operand_info dstInfo,
                                              unsigned opType,
@@ -733,6 +785,8 @@ ptx_reg_t ptx_thread_info::get_operand_value(const operand_info &op,
     }
   }
 
+  // yasai: a subnormal source of a .ftz instruction reads as zero (see t_ftz_inst).
+  if (t_ftz_inst != nullptr && derefFlag) finalResult = yasai_ftz::flush(finalResult, opType, t_ftz_inst);
   return finalResult;
 }
 
@@ -858,9 +912,14 @@ void ptx_thread_info::set_operand_value(const operand_info &dst,
 }
 
 void ptx_thread_info::set_operand_value(const operand_info &dst,
-                                        const ptx_reg_t &data, unsigned type,
+                                        const ptx_reg_t &data_in, unsigned type,
                                         ptx_thread_info *thread,
                                         const ptx_instruction *pI) {
+  // yasai: a subnormal result of a .ftz instruction is written as zero (see t_ftz_inst).
+  ptx_reg_t ftz_data;
+  const bool ftz = t_ftz_inst != nullptr && pI == t_ftz_inst;
+  if (ftz) ftz_data = yasai_ftz::flush(data_in, type, t_ftz_inst);
+  const ptx_reg_t &data = ftz ? ftz_data : data_in;
   ptx_reg_t dstData;
   memory_space *mem = NULL;
   size_t size;
@@ -1172,11 +1231,12 @@ void abs_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       d.s64 = my_abs(a.u64);
       break;
     case F32_TYPE:
-      d.f32 = my_abs(a.f32);
+      // yasai: the sign cleared; my_abs kept -0 as -0, where an RTX 5090 gives +0 (ftz_round).
+      d.f32 = std::fabs(a.f32);
       break;
     case F64_TYPE:
     case FF64_TYPE:
-      d.f64 = my_abs(a.f64);
+      d.f64 = std::fabs(a.f64);  // yasai: as for f32
       break;
     default:
       printf("Execution error: type mismatch with instruction\n");
@@ -5492,7 +5552,8 @@ void max_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       d.s64 = MY_MAX_I(a.s64, b.s64);
       break;
     case F32_TYPE:
-      d.f32 = MY_MAX_F(a.f32, b.f32);
+      // yasai: +0 above -0 whatever the operand order (MY_MAX_F returned the second of two zeros).
+      d = minmax_f32_pair(a, b, true);
       if (pI->get_num_operands() == 4) {
         const ptx_reg_t c =
             thread->get_operand_value(pI->src3(), dst, i_type, thread, 1);
@@ -5558,7 +5619,8 @@ void min_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       d.s64 = MY_MIN_I(a.s64, b.s64);
       break;
     case F32_TYPE:
-      d.f32 = MY_MIN_F(a.f32, b.f32);
+      // yasai: -0 below +0 whatever the operand order (MY_MIN_F returned the second of two zeros).
+      d = minmax_f32_pair(a, b, false);
       if (pI->get_num_operands() == 4) {
         const ptx_reg_t c =
             thread->get_operand_value(pI->src3(), dst, i_type, thread, 1);
@@ -6015,11 +6077,12 @@ void neg_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       data.f16 = 0.0f - src1_data.f16;
       break;  // assert(0); break;
     case F32_TYPE:
-      data.f32 = 0.0f - src1_data.f32;
+      // yasai: a sign flip; 0 - x gave +0 for x = +0, where an RTX 5090 gives -0 (ftz_round).
+      data.f32 = -src1_data.f32;
       break;
     case F64_TYPE:
     case FF64_TYPE:
-      data.f64 = 0.0f - src1_data.f64;
+      data.f64 = -src1_data.f64;  // yasai: as for f32
       break;
     default:
       assert(0);
@@ -6380,6 +6443,10 @@ void rsqrt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   unsigned i_type = pI->get_type();
   a = thread->get_operand_value(src1, dst, i_type, thread, 1);
 
+  // yasai: a zero gives an infinity of its sign (IEEE 754 rSqrt(-0) = -inf, as an RTX 5090
+  // gives for rsqrt.approx.ftz of a negative subnormal, which .ftz makes -0; this returned +inf),
+  // and the f64 form tests the f64 operand (it tested a.f32, the low half of the double, so about
+  // half of the positive inputs gave NaN; found by ftz_round 2026-11-05).
   switch (i_type) {
     case F32_TYPE:
       if (a.f32 < 0) {
@@ -6387,22 +6454,16 @@ void rsqrt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
         d.u64 = 0x7fc00000;  // NaN
       } else if (a.f32 == 0) {
         d.u64 = 0;
-        d.u32 = 0x7f800000;  // Inf
+        d.f32 = std::copysign(std::numeric_limits<float>::infinity(), a.f32);
       } else
         d.f32 = cuda_math::__internal_accurate_fdividef(1.0f, sqrtf(a.f32));
       break;
     case F64_TYPE:
     case FF64_TYPE:
-      if (a.f32 < 0) {
-        d.u64 = 0;
-        d.u32 = 0x7fc00000;  // NaN
-        float x = d.f32;
-        d.f64 = (double)x;
-      } else if (a.f32 == 0) {
-        d.u64 = 0;
-        d.u32 = 0x7f800000;  // Inf
-        float x = d.f32;
-        d.f64 = (double)x;
+      if (a.f64 < 0) {
+        d.f64 = std::numeric_limits<double>::quiet_NaN();
+      } else if (a.f64 == 0) {
+        d.f64 = std::copysign(std::numeric_limits<double>::infinity(), a.f64);
       } else
         d.f64 = 1.0 / sqrt(a.f64);
       break;
