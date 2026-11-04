@@ -24,6 +24,9 @@ kernel_info_t::kernel_info_t(dim3 gridDim, dim3 blockDim,
                              class function_info *entry,
                              unsigned long long streamID) {
   m_kernel_entry = entry;
+  // yasai: every kernel has its dynamic shared memory base before it runs (no dynamic bytes
+  // included; see function_info::yasai_place_dyn_smem).
+  m_kernel_entry->yasai_place_dyn_smem();
   m_grid_dim = gridDim;
   m_block_dim = blockDim;
   m_next_cta.x = 0;
@@ -57,6 +60,9 @@ kernel_info_t::kernel_info_t(
     std::map<std::string, const struct cudaArray *> nameToCudaArray,
     std::map<std::string, const struct textureInfo *> nameToTextureInfo) {
   m_kernel_entry = entry;
+  // yasai: every kernel has its dynamic shared memory base before it runs (no dynamic bytes
+  // included; see function_info::yasai_place_dyn_smem).
+  m_kernel_entry->yasai_place_dyn_smem();
   m_grid_dim = gridDim;
   m_block_dim = blockDim;
   m_next_cta.x = 0;
