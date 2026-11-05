@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <map>
 #include "yasai_func.h"
+#include "yasai_stall.h"
 #include <string>
 #include <vector>
 #include "../abstract_hardware_model.h"
@@ -103,7 +104,7 @@ class functionalCoreSim : public core_t {
   // yasai: live threads of the CTA.
   unsigned yasai_live_threads() const;
   // yasai: prints, for every warp with a live thread, the PTX line its first live thread is at
-  // (hang diagnosis, YASAI_HANG_ROUNDS).
+  // (stall diagnosis, yasai_stall.h).
   void yasai_dump_warps(FILE *out) const;
   // yasai: the CTA's own shared memory (before joining a cluster) and the uid of its CTA.
   memory_space *yasai_shared_memory() const;
@@ -147,6 +148,7 @@ class functionalCoreSim : public core_t {
                                              unsigned tid) {
     if (m_thread[tid] == NULL || m_thread[tid]->is_done()) {
       m_liveThreadCount[tid / m_warp_size]--;
+      yasai_stall::note();  // yasai: a finished thread is progress (yasai_stall.h)
     }
   }
 
@@ -245,7 +247,8 @@ class yasai_func_run {
   struct group {
     std::vector<functionalCoreSim *> cores;  // CTAs (cluster rank order)
     yasai_func::ClusterState state;          // cluster state (clusters only)
-    unsigned long rounds = 0;                // rounds executed (YASAI_HANG_ROUNDS)
+    yasai_stall::tracker stall;              // rounds and progress (yasai_stall.h)
+    yasai_stall::verdict verdict = yasai_stall::verdict::none;  // of the last round
   };
   /// Starts the next CTA (or cluster) in g, the group at co-resident position pos; false when
   /// none is left.
@@ -262,14 +265,16 @@ class yasai_func_run {
   /// @return True when the kernel has finished.
   bool step_parallel();
   /// Executes one round of every CTA of group g on the calling thread (the thread's executing
-  /// cluster and rank are set for the round).
-  /// @return True while a thread of the group is live.
-  bool run_round(group &g);
-  /// Stops the process when group g has run YASAI_HANG_ROUNDS rounds, or, for a CTA-sampled
-  /// kernel, YASAI_CTA_SAMPLE_HANG_ROUNDS rounds (the dumps of the serial path).
-  /// @param g The group, after its round counter was advanced.
+  /// cluster and rank are set for the round) and judges its progress (g.verdict, yasai_stall.h).
   /// @param sampled Whether the kernel is CTA-sampled.
-  void check_hang(const group &g, bool sampled);
+  /// @return True while a thread of the group is live.
+  bool run_round(group &g, bool sampled);
+  /// Stops the process with the warps' positions when the last round of group g ended in a
+  /// verdict other than none: a stall (YASAI_STALL_ROUNDS and YASAI_STALL_S), a CTA-sampled
+  /// kernel's group without progress for YASAI_CTA_SAMPLE_HANG_ROUNDS rounds, or the total cap
+  /// YASAI_GROUP_ROUNDS_MAX.
+  /// @param g The group after run_round.
+  void check_hang(const group &g);
   /// Whether the run must stay serial although YASAI_FUNC_THREADS > 1; sets reason.
   /// @param reason Receives the cause (for the "yasai-func serial" line).
   bool serial_only(const char **reason);
@@ -305,9 +310,15 @@ class yasai_func_run {
   unsigned long m_ctas_issued = 0;   // CTAs started so far (all ranks of started clusters)
   unsigned long m_ctas_skipped = 0;  // CTAs that CTA sampling skipped so far
   unsigned long m_ctas_done = 0;     // CTAs retired so far
-  unsigned m_insn_start = 0;         // process instruction count (g_ptx_sim_num_insn) at start
+  uint64_t m_insn_start = 0;         // process instruction count (g_ptx_sim_num_insn) at start
   double m_start_s = 0;              // monotonic wall time (s) at the kernel's start
   double m_progress_next_s = 0;      // monotonic wall time (s) of the next progress line
+  // yasai: YASAI_STALL_STATS maxima over the kernel's retired groups (under m_stall_mu).
+  std::mutex m_stall_mu;
+  uint64_t m_stall_max_quiet = 0;    // longest quiet stretch in rounds
+  double m_stall_max_quiet_s = 0;    // longest quiet stretch in wall seconds
+  uint64_t m_stall_max_silent = 0;   // longest stretch without store, exit or barrier events
+  uint64_t m_stall_max_rounds = 0;   // most rounds of one CTA or cluster
 };
 
 // yasai: whether a launch of the kernel named name interleaves its co-resident CTAs
@@ -390,7 +401,7 @@ class cuda_sim {
   int cp_count;
   int cp_cta_resume;
   int g_ptxinfo_error_detected;
-  unsigned g_ptx_sim_num_insn;
+  uint64_t g_ptx_sim_num_insn;  // yasai: 64 bits, a run passes 2^32 thread instructions
   char *cdp_latency_str;
   int g_ptx_kernel_count;  // used for classification stat collection purposes
   std::map<const void *, std::string>

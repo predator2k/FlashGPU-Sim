@@ -1,6 +1,7 @@
 // yasai additions to the functional simulation mode: statistics, FP value skipping and CTA
 // sampling. See yasai_func.h for the environment switches.
 #include "yasai_func.h"
+#include "yasai_stall.h"
 
 #include <shared_mutex>
 
@@ -519,6 +520,7 @@ void mbar_try_advance(MbarState &m) {
   if (m.pending <= 0 && m.tx == 0) {
     m.phase++;
     m.pending = m.expected;
+    yasai_stall::note();  // a completed mbarrier phase is progress (yasai_stall.h)
   }
 }
 
@@ -1007,11 +1009,11 @@ void pool_run(unsigned n, const std::function<void(unsigned)> &job) {
   }
 }
 
-void flush_thread_counts(ThreadCounts &c, unsigned *ptx_insn) {
+void flush_thread_counts(ThreadCounts &c, uint64_t *ptx_insn) {
   __atomic_fetch_add(&g_counters.warp_insts, c.warp_insts, __ATOMIC_RELAXED);
   __atomic_fetch_add(&g_counters.thread_insts, c.thread_insts, __ATOMIC_RELAXED);
   __atomic_fetch_add(&g_counters.skipped_fp_warp, c.skipped_fp_warp, __ATOMIC_RELAXED);
-  if (ptx_insn != nullptr) __atomic_fetch_add(ptx_insn, unsigned(c.ptx_insn), __ATOMIC_RELAXED);
+  if (ptx_insn != nullptr) __atomic_fetch_add(ptx_insn, c.ptx_insn, __ATOMIC_RELAXED);
   c = ThreadCounts();
 }
 

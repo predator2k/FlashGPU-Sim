@@ -172,6 +172,7 @@ typedef enum CUoutput_mode_enum {
 #include "../src/cuda-sim/host_window.h"
 #include "../src/cuda-sim/shared_devmem.h"
 #include "../src/cuda-sim/yasai_strict_addr.h"
+#include "../src/cuda-sim/yasai_stall.h"
 #include "../src/cuda-sim/yasai_lazy.h"
 #include "../src/cuda-sim/yasai_module_scope.h"
 #include "yasai_fatbin_units.h"
@@ -281,6 +282,8 @@ struct _cuda_device_id *gpgpu_context::GPGPUSim_Init() {
   std::lock_guard<std::recursive_mutex> lk(yasai_init_mu());
   the_device = the_gpgpusim->the_cude_device;
   if (!the_device) {
+    // yasai: checks the stall switches and prints the judgement's line once (yasai_stall.h).
+    yasai_stall::config();
     const gpgpu_sim_config *cfg = yasai_parse_gpu_config();
     const shader_core_config &sc = cfg->yasai_shader_config();
 

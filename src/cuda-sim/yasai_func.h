@@ -380,7 +380,7 @@ extern thread_local ThreadCounts *t_counts;
 
 // Adds c to the selected scope's counters and to *ptx_insn (the process instruction count), with
 // atomic additions, and clears c.
-void flush_thread_counts(ThreadCounts &c, unsigned *ptx_insn);
+void flush_thread_counts(ThreadCounts &c, uint64_t *ptx_insn);
 
 // Locks that make read-modify-write updates of memory atomic across pool threads: atom, red and
 // multimem reductions on simulator storage and on host_window memory (which also use host

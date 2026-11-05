@@ -128,6 +128,9 @@ class memory_space_impl : public memory_space {
  private:
   void read_single_block(mem_addr_t blk_idx, mem_addr_t addr, size_t length,
                          void *data) const;
+  // yasai: read() without the stall judgement's load record: host_window ranges, then storage.
+  //   addr, length  the access; data  destination buffer
+  void read_parts(mem_addr_t addr, size_t length, void *data) const;
   // yasai: the simulator's own storage part of read(): the blocks of [addr, addr + length).
   //   addr, length  the access; data  destination buffer
   void read_storage(mem_addr_t addr, size_t length, void *data) const;
@@ -139,6 +142,9 @@ class memory_space_impl : public memory_space {
   unsigned m_log2_block_size;
   // yasai: true for the "global" space; accesses inside host_window ranges go to host memory.
   bool m_host_window = false;
+  // yasai: true for the global and shared spaces, whose stores and loads are progress events of
+  // the stall judgement (yasai_stall.h); local, param and texture memory are not.
+  bool m_stall_track = false;
   using map_t = mem_map<mem_addr_t, std::unique_ptr<mem_storage<BSIZE>>>;
   map_t m_data;
 #ifdef FLASH_GPGPU_SIM_OMP
