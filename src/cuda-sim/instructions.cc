@@ -2723,8 +2723,9 @@ void brev_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       break;
     case B64_TYPE:
       msb = 63;
+      // yasai: 64-bit constants; 1 << i is an int, so every result was wrong (value sweep, key_values.cu).
       for (unsigned i = 0; i <= msb; i++) {
-        if ((src1_data.u64 & (1 << i))) data.u64 |= 1 << (msb - i);
+        if ((src1_data.u64 & (1ull << i))) data.u64 |= 1ull << (msb - i);
       }
       break;
     default:
