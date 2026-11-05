@@ -74,6 +74,14 @@ double elem_value(int t, uint64_t v) {
     memcpy(&d, &v, 8);
     return d;
   }
+  case F16_TYPE:  // yasai: mma.sync with f16 accumulators routes f16 and bf16 inputs here
+    return mma_f16_to_f32(uint16_t(v & 0xFFFF));
+  case BF16_TYPE: {
+    const uint32_t u = uint32_t(v & 0xFFFF) << 16;
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+  }
   default:
     fprintf(stderr, "yasai-mma: element type %d is not supported\n", t);
     abort();
@@ -94,6 +102,9 @@ unsigned code_bits(int t) {
     return 1;
   case F64_TYPE:
     return 64;
+  case F16_TYPE:
+  case BF16_TYPE:
+    return 16;
   default:
     return 8;
   }

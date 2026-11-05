@@ -2829,7 +2829,121 @@ void mapping(int thread, int wmma_type, int wmma_layout, int type, int index,
   }
 }
 
+
+void decode_space(memory_space_t &space, ptx_thread_info *thread, const operand_info &op,
+                  memory_space *&mem, addr_t &addr);
+// yasai: wmma with bf16 inputs, m16n16k16 (PTX ISA wmma; sm_80 and later). The fragments of a and b are those of
+// two mma.m16n8k16 (measured on a GB10 with tests/wmma_layout.cu: all 32 lanes, 4 registers, 2 halves of each of
+// a and b in row and col agree): lane l = 4g + q holds in half h of register r
+//   a: row g + 8 (r % 2), column 2q + h + 8 (r / 2);
+//   b: row (k) 2q + h + 8 (r % 2), column (n) g + 8 (r / 2).
+// The f32 accumulator fragments keep the simulator's wmma layout (mapping(), LOAD_C), which wmma.load.c and
+// wmma.store.d of every wmma use; a GPU's accumulator layout is that of the two mma tiles, so code that changes
+// accumulator elements by position would differ (none in the census).
+static void yasai_wmma_bf16_pos(bool is_a, unsigned lane, unsigned r, unsigned h, unsigned *row, unsigned *col) {
+  const unsigned g = lane / 4, q = lane % 4;
+  if (is_a) {
+    *row = g + 8 * (r % 2);
+    *col = 2 * q + h + 8 * (r / 2);
+  } else {
+    *row = 2 * q + h + 8 * (r % 2);
+    *col = g + 8 * (r / 2);
+  }
+}
+
+// yasai: wmma.load.{a,b}.sync.aligned.{row,col}.m16n16k16.{global,shared}.bf16 d, [p], ldm (see above).
+static void yasai_wmma_bf16_ld(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
+  const unsigned wmma_type = pI->get_wmma_type();
+  const bool row_major = pI->get_wmma_layout(0) == ROW;
+  const unsigned tid = (core->get_gpu()->is_functional_sim() ? inst.warp_id_func() : inst.warp_id()) *
+                       core->get_warp_size();
+  const operand_info &dst = pI->dst();
+  for (unsigned lane = 0; lane < core->get_warp_size(); lane++) {
+    ptx_thread_info *thread = core->get_thread_info()[tid + lane];
+    addr_t addr = thread->get_operand_value(pI->src1(), dst, U32_TYPE, thread, 1).u64;
+    const unsigned ldm = thread->get_operand_value(pI->src2(), dst, U32_TYPE, thread, 1).u32;
+    memory_space_t space = pI->get_space();
+    if (whichspace(addr) == shared_space) {
+      addr = generic_to_shared(thread->get_hw_sid(), addr);
+      space = shared_space;
+    }
+    memory_space *mem = NULL;
+    decode_space(space, thread, pI->src1(), mem, addr);
+    ptx_reg_t regs[4];
+    new_addr_type txn[MAX_ACCESSES_PER_INSN_PER_THREAD];
+    int ntxn = 0;
+    for (unsigned r = 0; r < 4; r++) {
+      regs[r].u64 = 0;
+      for (unsigned h = 0; h < 2; h++) {
+        unsigned row, col;
+        yasai_wmma_bf16_pos(wmma_type == LOAD_A, lane, r, h, &row, &col);
+        const addr_t off = row_major ? addr_t(row) * ldm + col : addr_t(col) * ldm + row;
+        uint16_t v = 0;
+        mem->read(addr + 2 * off, 2, &v);
+        regs[r].u32 |= uint32_t(v) << (16 * h);
+        if (h == 0 && ntxn < MAX_ACCESSES_PER_INSN_PER_THREAD) txn[ntxn++] = addr + 2 * off;
+      }
+    }
+    thread->set_vector_operand_values(dst, regs[0], regs[1], regs[2], regs[3]);
+    inst.space = space;
+    inst.set_addr(lane, txn, ntxn);
+    inst.data_size = 4;
+  }
+}
+
+// yasai: wmma.mma.sync.aligned.{row,col}.{row,col}.m16n16k16.f32.bf16.bf16.f32 d, a, b, c: a and b in the
+// fragments above, c and d in the simulator's f32 accumulator layout. Each product is exact in f32 and the sum
+// runs over k in order in f32, then c is added, as mma.sync's bf16 model does (tensor_mma_f16_impl).
+static void yasai_wmma_bf16_mma(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
+  const unsigned tid = (core->get_gpu()->is_functional_sim() ? inst.warp_id_func() : inst.warp_id()) *
+                       core->get_warp_size();
+  float A[16][16], B[16][16], C[16][16];
+  auto bf = [](uint16_t b) {
+    const uint32_t u = uint32_t(b) << 16;
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+  };
+  for (unsigned lane = 0; lane < 32; lane++) {
+    ptx_thread_info *thread = core->get_thread_info()[tid + lane];
+    ptx_reg_t a[4], b[4], c[8];
+    thread->get_vector_operand_values(pI->operand_lookup(1), a, 4);
+    thread->get_vector_operand_values(pI->operand_lookup(2), b, 4);
+    thread->get_vector_operand_values(pI->operand_lookup(3), c, 8);
+    for (unsigned r = 0; r < 4; r++)
+      for (unsigned h = 0; h < 2; h++) {
+        unsigned row, col;
+        yasai_wmma_bf16_pos(true, lane, r, h, &row, &col);
+        A[row][col] = bf(uint16_t(a[r].u32 >> (16 * h)));
+        yasai_wmma_bf16_pos(false, lane, r, h, &row, &col);
+        B[row][col] = bf(uint16_t(b[r].u32 >> (16 * h)));
+      }
+    for (int k = 0; k < 8; k++) {
+      int row, col, offset;
+      mapping(lane, LOAD_C, ROW, F32_TYPE, k, 16, row, col, offset);
+      C[row][col] = c[offset].f32;
+    }
+  }
+  for (unsigned lane = 0; lane < 32; lane++) {
+    ptx_thread_info *thread = core->get_thread_info()[tid + lane];
+    ptx_reg_t dv[8];
+    for (int k = 0; k < 8; k++) {
+      int row, col, offset;
+      mapping(lane, LOAD_C, ROW, F32_TYPE, k, 16, row, col, offset);
+      float sum = 0.0f;
+      for (int kk = 0; kk < 16; kk++) sum += A[row][kk] * B[kk][col];
+      dv[offset].u64 = 0;
+      dv[offset].f32 = sum + C[row][col];
+    }
+    thread->set_wmma_vector_operand_values(pI->dst(), dv[0], dv[1], dv[2], dv[3], dv[4], dv[5], dv[6], dv[7]);
+  }
+}
+
 void mma_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst) {
+  {  // yasai: bf16 inputs (four types: .f32.bf16.bf16.f32)
+    const std::list<int> tl = pI->get_scalar_type();
+    if (tl.size() == 4 && *std::next(tl.begin()) == BF16_TYPE) return yasai_wmma_bf16_mma(pI, core, inst);
+  }
   int i, j, k, thrd;
   int row, col, offset;
   ptx_reg_t matrix_a[16][16];
@@ -5207,6 +5321,9 @@ void mma_st_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
 }
 
 void mma_ld_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
+  if (pI->get_type() == BF16_TYPE &&
+      (pI->get_wmma_type() == LOAD_A || pI->get_wmma_type() == LOAD_B))  // yasai
+    return yasai_wmma_bf16_ld(pI, core, inst);
   size_t size;
   int t, i;
   unsigned smid;
