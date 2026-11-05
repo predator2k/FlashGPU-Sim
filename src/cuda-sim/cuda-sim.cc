@@ -4744,6 +4744,20 @@ void functionalCoreSim::yasai_emit_warp(const warp_inst_t &inst, unsigned w) {
 
 void functionalCoreSim::executeWarp(unsigned i, bool &allAtBarrier,
                                     bool &someOneLive) {
+  // yasai: after a kernel fault (yasai_func::kernel_fault) the live threads end where they are; the
+  // memory they would still write cannot be read any more (every copy returns 719).
+  if (m_liveThreadCount[i] != 0 && yasai_func::kernel_fault()) {
+    for (unsigned l = 0; l < m_warp_size; l++) {
+      ptx_thread_info *t = m_thread[i * m_warp_size + l];
+      if (t != NULL && !t->is_done()) {
+        t->set_done();
+        t->exitCore();
+        t->registerExit();
+      }
+    }
+    m_liveThreadCount[i] = 0;
+    m_warpAtBarrier[i] = false;
+  }
   if (!m_warpAtBarrier[i] && m_liveThreadCount[i] != 0) {
     warp_inst_t inst = getExecuteWarp(i);
     yasai_func::g_wait_failed = false;

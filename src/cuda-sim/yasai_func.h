@@ -207,6 +207,15 @@ bool mbar_phase_done(uint64_t cta_key, uint32_t addr, uint32_t parity);
 /// mbarrier.arrive returns, which try_wait and test_wait without .parity take as the phase to wait for.
 uint32_t mbar_phase(uint64_t cta_key, uint32_t addr);
 
+/// A kernel fault (trap, brkpt), as a GPU reports it (tests/gaps_m4.cu, on an RTX 5090 and a GB10): the launch
+/// has returned 0, the kernel stops, what it printed reaches stdout, and from then on, in the whole process,
+/// every CUDA call that touches a context returns 719 (CUDA_ERROR_LAUNCH_FAILED).
+/// raise_kernel_fault prints one yasai-kernel-fault line at the first fault (the kernel, instruction and PC) and
+/// sets the flag; kernel_fault reads it.
+void raise_kernel_fault(const char *what, const char *kernel, unsigned long long pc, unsigned ctax, unsigned ctay,
+                        unsigned ctaz, unsigned tidx, unsigned tidy, unsigned tidz, const char *source);
+bool kernel_fault();
+
 // mbarrier.inval: forget the state.
 void mbar_inval(uint64_t cta_key, uint32_t addr);
 

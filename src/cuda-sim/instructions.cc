@@ -2760,8 +2760,21 @@ void brev_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   }
   thread->set_operand_value(dst, data, i_type, thread, pI);
 }
+// yasai: a kernel fault (yasai_func::raise_kernel_fault): in the functional model the lane ends and the rest
+// of the kernel stops; the timing model stops the simulation at the fault's place.
+static void yasai_kernel_fault(const char *what, const ptx_instruction *pI, ptx_thread_info *thread) {
+  const dim3 cta = thread->get_ctaid();
+  const dim3 tid = thread->get_tid();
+  yasai_func::raise_kernel_fault(what, thread->get_kernel().name().c_str(), thread->get_pc(), cta.x, cta.y, cta.z,
+                                 tid.x, tid.y, tid.z, pI->get_source());
+  if (!thread->isInFunctionalSimulationMode()) abort();
+  thread->set_done();
+  thread->exitCore();
+  thread->registerExit();
+}
+
 void brkpt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
-  inst_not_implemented(pI);
+  yasai_kernel_fault("brkpt", pI, thread);
 }
 
 unsigned trunc(unsigned num, unsigned precision) {
@@ -8992,18 +9005,9 @@ void tex_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 void txq_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   inst_not_implemented(pI);
 }
-// yasai: trap aborts the kernel. On a GPU the launch then fails (a device assert reports
-// cudaErrorAssert) and the CUDA context is unusable, so the simulation stops here with the
-// place of the first trap rather than with "not implemented".
+// yasai: trap stops the kernel with a kernel fault (yasai_kernel_fault).
 void trap_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
-  const dim3 cta = thread->get_ctaid();
-  const dim3 tid = thread->get_tid();
-  printf("GPGPU-Sim PTX: trap (%s:%u) in kernel %s, block [%u,%u,%u], thread [%u,%u,%u]: the "
-         "kernel aborts (device assert or trap); simulation stops\n",
-         pI->source_file(), pI->source_line(), thread->get_kernel().name().c_str(), cta.x, cta.y,
-         cta.z, tid.x, tid.y, tid.z);
-  fflush(stdout);
-  abort();
+  yasai_kernel_fault("trap", pI, thread);
 }
 void vabsdiff_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   inst_not_implemented(pI);
