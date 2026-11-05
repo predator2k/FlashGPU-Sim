@@ -26,6 +26,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include "yasai_contract.h"
 #include "ptx_parser.h"
 #include "yasai_func.h"
 #include "../../libcuda/gpgpu_context.h"
@@ -214,6 +215,9 @@ void ptx_recognizer::end_function() {
   init_instruction_state();
   g_max_regs_per_thread = mymax(g_max_regs_per_thread,
                                 (g_current_symbol_table->next_reg_num() - 1));
+  // yasai: mul and add pairs that ptxas would contract into one fused multiply-add
+  // (yasai_contract.h; YASAI_FMA_CONTRACT).
+  yasai_contract::analyze(g_instructions, g_current_symbol_table, gpgpu_ctx->g_filename);
   g_func_info->add_inst(g_instructions);
   g_instructions.clear();
   gpgpu_ptx_assemble(g_func_info->get_name(), g_func_info);
