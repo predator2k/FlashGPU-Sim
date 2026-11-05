@@ -8105,9 +8105,19 @@ void tanh_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   a = thread->get_operand_value(src1, dst, i_type, thread, 1);
 
   switch (i_type) {
-    case F32_TYPE:
-      d.f32 = tanhf(a.f32);
+    case F32_TYPE: {
+      // yasai: tanh.approx as a GB10 gives it (tests/tanh_approx_probe.cu): x itself up to |x| = 2^-8 and +1 or -1 from
+      // |x| = 8. Between, the GPU's approximation has a relative error up to 1.03e-5, and its bits are not modeled:
+      // tanhf stays within 111 ulp of it.
+      const float ax = fabsf(a.f32);
+      if (ax <= 0.00390625f)
+        d.f32 = a.f32;
+      else if (ax >= 8.0f)
+        d.f32 = copysignf(1.0f, a.f32);
+      else
+        d.f32 = tanhf(a.f32);
       break;
+    }
     default:
       printf("Execution error: type mismatch with instruction\n");
       assert(0);
