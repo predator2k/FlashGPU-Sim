@@ -96,9 +96,10 @@ bool same_kind(const ptx_instruction *m, const ptx_instruction *a) {
          m->is_ftz() == a->is_ftz();
 }
 
-/// Whether the rounding modifiers allow contraction (none, or f32x2 always).
+/// Whether the rounding modifiers allow contraction (none, or .rn on f32x2).
 bool rounding_ok(const ptx_instruction *p) {
-  return !p->has_rounding_modifier() || p->get_type() == F32X2_TYPE;
+  return !p->has_rounding_modifier() ||
+         (p->get_type() == F32X2_TYPE && p->rounding_mode() == RN_OPTION);
 }
 
 /// Whether p is an add or sub that may take a contracted product of mul m.
