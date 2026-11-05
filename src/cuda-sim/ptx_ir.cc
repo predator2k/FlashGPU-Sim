@@ -1789,6 +1789,7 @@ ptx_instruction::ptx_instruction(
         m_membar_level = SYS_OPTION;
         break;
       case FTZ_OPTION:
+        m_yasai_ftz = true;  // yasai: fma and mad flush subnormals (is_ftz)
         break;
       case EXIT_OPTION:
         m_exit = true;

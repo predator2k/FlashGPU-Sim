@@ -1332,6 +1332,9 @@ class ptx_instruction : public warp_inst_t {
   bool is_hi() const { return m_hi; }
   // yasai: .relu on cvt/fma (negative results become +0, NaN becomes the canonical NaN).
   bool is_relu() const { return m_relu; }
+  // yasai: the instruction carries .ftz (subnormal inputs and results flushed to sign-preserving
+  // zero); only fma and mad model it.
+  bool is_ftz() const { return m_yasai_ftz; }
   // yasai: barrier.cluster.arrive / barrier.cluster.wait (bar_type ARRIVE / SYNC).
   bool is_cluster_barrier() const { return m_opcode == BAR_OP && m_yasai_cluster_scope; }
   // yasai: the instruction carries .cluster or .shared::cluster.
@@ -1456,6 +1459,7 @@ class ptx_instruction : public warp_inst_t {
   unsigned m_saturation_mode;
   unsigned m_clamp_mode;
   bool m_relu = false;    // yasai: see is_relu()
+  bool m_yasai_ftz = false;  // yasai: see is_ftz()
   bool m_yasai_cluster_scope = false;  // yasai: see has_cluster_scope()
   bool m_yasai_weak_store = false;     // yasai: see is_weak_store()
   bool m_bf16x2 = false;  // yasai: see is_bf16x2()

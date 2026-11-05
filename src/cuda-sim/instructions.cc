@@ -5121,6 +5121,137 @@ void mapa_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   thread->set_operand_value(dst, data, i_type, thread, pI);
 }
 
+
+// ---- yasai: fused multiply-add with one rounding (fma, and mad with a rounding modifier) -------
+// PTX defines fma.{rn,rz,rm,rp}.{f32,f64} and mad.{rnd}.{f32,f64} as a * b + c computed with
+// unbounded range and precision and rounded once in the instruction's rounding mode. The
+// simulator used to evaluate a * b + c in C++, which rounds the product and then the sum (the build
+// emits no FMA instructions), and it treated .rm and .rp of f32 as .rn and stopped on them for f64.
+// The helpers below round once:
+//   * f32 (and f16, bf16 and the f32x2 lanes): the product of two f32 values is exact in double;
+//     the sum is formed exactly as two doubles (TwoSum, which needs round-to-nearest, the mode the
+//     simulator runs in), folded into one double by rounding to odd (the double with an odd
+//     significand next to the exact value, unless the value is exact), and that double is rounded
+//     to the target format in the instruction's mode. Rounding to odd with at least two more
+//     significand bits than the target makes the second rounding equal to one rounding of the
+//     exact value, in every rounding mode (Boldo and Melquiond, "Emulation of FMA and correctly
+//     rounded sums: proved algorithms using rounding to odd", IEEE Trans. Computers 57(4), 2008).
+//   * f64: the C library's fma (correctly rounded; on these hosts the FMA3 instruction through
+//     glibc's ifunc) in the instruction's rounding mode, set with fesetround around the call. The
+//     call goes through a volatile function pointer, so that the compiler cannot move it across
+//     fesetround (it treats the builtin as a function without side effects).
+namespace yasai_fma {
+
+/// The exact sum p + c folded into one double by rounding to odd (p + c itself when exact).
+///   p, c  finite doubles
+static inline double sum_odd(double p, double c) {
+  const double s = p + c;
+  const double bb = s - p;
+  const double e = (p - (s - bb)) + (c - bb);  // TwoSum: p + c == s + e exactly
+  if (e == 0) return s;
+  uint64_t bits;
+  memcpy(&bits, &s, sizeof bits);
+  if (bits & 1) return s;
+  return std::nextafter(s, e > 0 ? HUGE_VAL : -HUGE_VAL);
+}
+
+/// d (an exact or rounded-to-odd value) rounded to f32 in the PTX rounding mode rnd.
+static inline float to_f32(double d, unsigned rnd) {
+  float f = static_cast<float>(d);  // round to nearest even
+  switch (rnd) {
+    case RZ_OPTION:
+      if (std::fabs(static_cast<double>(f)) > std::fabs(d)) f = std::nextafter(f, 0.0f);
+      break;
+    case RM_OPTION:
+      if (static_cast<double>(f) > d) f = std::nextafter(f, -HUGE_VALF);
+      break;
+    case RP_OPTION:
+      if (static_cast<double>(f) < d) f = std::nextafter(f, HUGE_VALF);
+      break;
+    default:
+      break;
+  }
+  return f;
+}
+
+/// d (an exact or rounded-to-odd value) rounded to odd in f32, for a later rounding to f16 or
+/// bf16 (24 significand bits are at least two more than either has).
+static inline float to_f32_odd(double d) {
+  float f = to_f32(d, RZ_OPTION);
+  if (static_cast<double>(f) != d && std::isfinite(f)) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof u);
+    u |= 1;
+    memcpy(&f, &u, sizeof f);
+  }
+  return f;
+}
+
+/// The exact value of a * b + c folded into one double (round to odd), with the sign of an exact
+/// zero as IEEE 754 gives it in rounding mode rnd. a, b and c are f32 values (or f16 or bf16
+/// values) held in doubles, so a * b is exact.
+static inline double fused_odd(double a, double b, double c, unsigned rnd) {
+  const double p = a * b;
+  const double s = sum_odd(p, c);
+  if (s != 0) return s;
+  // An exact zero: two zeros of one sign keep it; any other exact zero is +0, or -0 in .rm.
+  if (p == 0 && c == 0 && std::signbit(p) == std::signbit(c)) return std::copysign(0.0, c);
+  return rnd == RM_OPTION ? -0.0 : 0.0;
+}
+
+/// x, or a zero of its sign when x is subnormal (.ftz).
+static inline float flush(float x) {
+  return std::fpclassify(x) == FP_SUBNORMAL ? std::copysign(0.0f, x) : x;
+}
+
+/// .sat: the result clamped to [0, 1]; NaN and -0 give +0.
+static inline float sat(float x) { return x > 0.0f ? (x < 1.0f ? x : 1.0f) : 0.0f; }
+static inline double sat(double x) { return x > 0.0 ? (x < 1.0 ? x : 1.0) : 0.0; }
+
+/// One f32 fma: a * b + c rounded once in mode rnd, with .ftz and .sat. a and b may be f16 or
+/// bf16 values converted to float (fma.f32.f16, fma.f32.bf16), whose product is exact too.
+static inline float f32(float a, float b, float c, unsigned rnd, bool ftz, bool saturate) {
+  if (ftz) {
+    a = flush(a);
+    b = flush(b);
+    c = flush(c);
+  }
+  float r;
+  if (!std::isfinite(a) || !std::isfinite(b) || !std::isfinite(c))
+    r = static_cast<float>(static_cast<double>(a) * b + c);  // infinities and NaN, any mode
+  else
+    r = to_f32(fused_odd(a, b, c, rnd), rnd);
+  if (ftz) r = flush(r);
+  if (saturate) r = sat(r);
+  return r;
+}
+
+/// The C library's fma, called through a volatile pointer (see the section comment).
+static double (*volatile g_fma64)(double, double, double) = &::fma;
+
+/// One f64 fma: a * b + c rounded once in mode rnd, with .sat.
+static inline double f64(double a, double b, double c, unsigned rnd, bool saturate) {
+  int mode = FE_TONEAREST;
+  switch (rnd) {
+    case RZ_OPTION: mode = FE_TOWARDZERO; break;
+    case RM_OPTION: mode = FE_DOWNWARD; break;
+    case RP_OPTION: mode = FE_UPWARD; break;
+    default: break;
+  }
+  double r;
+  if (mode == FE_TONEAREST) {
+    r = g_fma64(a, b, c);
+  } else {
+    const int old = fegetround();
+    fesetround(mode);
+    r = g_fma64(a, b, c);
+    fesetround(old);
+  }
+  return saturate ? sat(r) : r;
+}
+
+}  // namespace yasai_fma
+
 void mad_def(const ptx_instruction *pI, ptx_thread_info *thread,
              bool use_carry) {
   const operand_info &dst = pI->dst();
@@ -5165,7 +5296,8 @@ void mad_def(const ptx_instruction *pI, ptx_thread_info *thread,
       const float x = packed_half_to_f32(uint16_t(a.u32 >> (16 * h)), bf16);
       const float y = packed_half_to_f32(uint16_t(b.u32 >> (16 * h)), bf16);
       const float z = packed_half_to_f32(uint16_t(c.u32 >> (16 * h)), bf16);
-      float v = std::fma(x, y, z);
+      // yasai: rounded to odd in f32 and then once to the half format (one rounding overall).
+      float v = yasai_fma::to_f32_odd(yasai_fma::fused_odd(x, y, z, rm));
       if (pI->saturation_mode()) v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
       r |= uint32_t(packed_half_from_f32(v, bf16, pI->is_relu(), rm)) << (16 * h);
     }
@@ -5247,96 +5379,47 @@ void mad_def(const ptx_instruction *pI, ptx_thread_info *thread,
       break;
     case F16_TYPE: {
       assert(use_carry == false);
-      int orig_rm = fegetround();
-      switch (rounding_mode) {
-        case RN_OPTION:
-          break;
-        case RZ_OPTION:
-          fesetround(FE_TOWARDZERO);
-          break;
-        default:
-          assert(0);
-          break;
-      }
-      d.f16 = f16_from_double(double(float(a.f16)) * double(float(b.f16)) + double(float(c.f16)),
-                              rounding_mode);  // yasai: one rounding (fused)
+      assert(rounding_mode == RN_OPTION || rounding_mode == RZ_OPTION);
+      // yasai: one rounding: the exact a * b + c folded to odd in double, then rounded to f16
+      // (the plain double sum rounded twice when c was far smaller than the product).
+      d.f16 = f16_from_double(
+          yasai_fma::fused_odd(double(float(a.f16)), double(float(b.f16)), double(float(c.f16)),
+                               rounding_mode),
+          rounding_mode);
       if (pI->saturation_mode()) {
         if (d.f16 < 0)
           d.f16 = 0;
         else if (d.f16 > 1.0f)
           d.f16 = 1.0f;
       }
-      fesetround(orig_rm);
       break;
     }
     case F32_TYPE: {
       assert(use_carry == false);
-      int orig_rm = fegetround();
-      switch (rounding_mode) {
-        case RN_OPTION:
-          break;
-        case RZ_OPTION:
-          fesetround(FE_TOWARDZERO);
-          break;
-        default:
-          break;
-      }
+      // yasai: one rounding in the instruction's mode (.rn, .rz, .rm, .rp), with .ftz and .sat
+      // (yasai_fma). fma.f32.f16 and fma.f32.bf16 take f16 or bf16 multiplicands.
+      float fa = a.f32, fb = b.f32;
       if (mul_type == F16_TYPE) {
-        d.f32 = static_cast<float>(a.f16) * static_cast<float>(b.f16) + c.f32;
+        fa = static_cast<float>(a.f16);
+        fb = static_cast<float>(b.f16);
       } else if (mul_type == BF16_TYPE) {
-        // yasai: fma.rn.f32.bf16 d, a, b, c; a and b are bf16 bit patterns (the product of two
-        // bf16 values is exact in f32, so a * b + c rounds once)
-        d.f32 = f32_from_bf16_bits(uint16_t(a.u32)) * f32_from_bf16_bits(uint16_t(b.u32)) +
-                c.f32;
-      } else {
-        d.f32 = a.f32 * b.f32 + c.f32;
+        fa = f32_from_bf16_bits(uint16_t(a.u32));
+        fb = f32_from_bf16_bits(uint16_t(b.u32));
       }
-      if (pI->saturation_mode()) {
-        if (d.f32 < 0)
-          d.f32 = 0;
-        else if (d.f32 > 1.0f)
-          d.f32 = 1.0f;
-      }
-      fesetround(orig_rm);
+      d.f32 = yasai_fma::f32(fa, fb, c.f32, rounding_mode, pI->is_ftz(), pI->saturation_mode());
       break;
     }
     case F64_TYPE:
     case FF64_TYPE: {
       assert(use_carry == false);
-      int orig_rm = fegetround();
-      switch (rounding_mode) {
-        case RN_OPTION:
-          break;
-        case RZ_OPTION:
-          fesetround(FE_TOWARDZERO);
-          break;
-        default:
-          assert(0);
-          break;
-      }
-      d.f64 = a.f64 * b.f64 + c.f64;
-      if (pI->saturation_mode()) {
-        if (d.f64 < 0)
-          d.f64 = 0;
-        else if (d.f64 > 1.0f)
-          d.f64 = 1.0;
-      }
-      fesetround(orig_rm);
+      // yasai: one rounding in the instruction's mode (.rn, .rz, .rm, .rp) (yasai_fma).
+      d.f64 = yasai_fma::f64(a.f64, b.f64, c.f64, rounding_mode, pI->saturation_mode());
       break;
     }
     case F32X2_TYPE: {
-      // packed dual-f32 FMA: lo=bits[31:0], hi=bits[63:32]
+      // packed dual-f32 FMA: lo=bits[31:0], hi=bits[63:32]; yasai: each lane rounds once in the
+      // instruction's mode, with .ftz and .sat (yasai_fma).
       assert(use_carry == false);
-      int orig_rm = fegetround();
-      switch (rounding_mode) {
-        case RN_OPTION:
-          break;
-        case RZ_OPTION:
-          fesetround(FE_TOWARDZERO);
-          break;
-        default:
-          break;
-      }
       uint32_t alo = (uint32_t)(a.u64 & 0xFFFFFFFFu);
       uint32_t ahi = (uint32_t)(a.u64 >> 32);
       uint32_t blo = (uint32_t)(b.u64 & 0xFFFFFFFFu);
@@ -5347,16 +5430,13 @@ void mad_def(const ptx_instruction *pI, ptx_thread_info *thread,
       memcpy(&fa_lo, &alo, 4); memcpy(&fa_hi, &ahi, 4);
       memcpy(&fb_lo, &blo, 4); memcpy(&fb_hi, &bhi, 4);
       memcpy(&fc_lo, &clo, 4); memcpy(&fc_hi, &chi, 4);
-      float rlo = fa_lo * fb_lo + fc_lo;
-      float rhi = fa_hi * fb_hi + fc_hi;
-      if (pI->saturation_mode()) {
-        rlo = (rlo < 0) ? 0 : (rlo > 1.0f) ? 1.0f : rlo;
-        rhi = (rhi < 0) ? 0 : (rhi > 1.0f) ? 1.0f : rhi;
-      }
+      const float rlo = yasai_fma::f32(fa_lo, fb_lo, fc_lo, rounding_mode, pI->is_ftz(),
+                                       pI->saturation_mode());
+      const float rhi = yasai_fma::f32(fa_hi, fb_hi, fc_hi, rounding_mode, pI->is_ftz(),
+                                       pI->saturation_mode());
       uint32_t rlo_b, rhi_b;
       memcpy(&rlo_b, &rlo, 4); memcpy(&rhi_b, &rhi, 4);
       d.u64 = ((uint64_t)rhi_b << 32) | (uint64_t)rlo_b;
-      fesetround(orig_rm);
       break;
     }
     default:
