@@ -6218,16 +6218,7 @@ void mul_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       break;
     case F16_TYPE: {
       int orig_rm = fegetround();
-      switch (rounding_mode) {
-        case RN_OPTION:
-          break;
-        case RZ_OPTION:
-          fesetround(FE_TOWARDZERO);
-          break;
-        default:
-          assert(0);
-          break;
-      }
+      set_fenv_rounding_mode(rounding_mode);  // yasai: .rm and .rp too
 
       d.f16 = f16_from_double(double(float(a.f16)) * double(float(b.f16)), rounding_mode);
 
@@ -6242,16 +6233,7 @@ void mul_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     }
     case F32_TYPE: {
       int orig_rm = fegetround();
-      switch (rounding_mode) {
-        case RN_OPTION:
-          break;
-        case RZ_OPTION:
-          fesetround(FE_TOWARDZERO);
-          break;
-        default:
-          assert(0);
-          break;
-      }
+      set_fenv_rounding_mode(rounding_mode);  // yasai: .rm and .rp too
 
       d.f32 = a.f32 * b.f32;
       // Preserve the original rounded product and +0 subtraction, including
@@ -6269,15 +6251,7 @@ void mul_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     }
     case F32X2_TYPE: {
       int orig_rm = fegetround();
-      switch (rounding_mode) {
-        case RN_OPTION:
-          break;
-        case RZ_OPTION:
-          fesetround(FE_TOWARDZERO);
-          break;
-        default:
-          break;
-      }
+      set_fenv_rounding_mode(rounding_mode);  // yasai: .rm and .rp too
 
       uint32_t alo = static_cast<uint32_t>(a.u64 & 0xFFFFFFFFu);
       uint32_t ahi = static_cast<uint32_t>(a.u64 >> 32);
@@ -6297,16 +6271,7 @@ void mul_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     case F64_TYPE:
     case FF64_TYPE: {
       int orig_rm = fegetround();
-      switch (rounding_mode) {
-        case RN_OPTION:
-          break;
-        case RZ_OPTION:
-          fesetround(FE_TOWARDZERO);
-          break;
-        default:
-          assert(0);
-          break;
-      }
+      set_fenv_rounding_mode(rounding_mode);  // yasai: .rm and .rp too
       d.f64 = a.f64 * b.f64;
       if (pI->saturation_mode()) {
         if (d.f64 < 0)

@@ -13,10 +13,11 @@
 // contracted when:
 //   * both are of one type among f32, f64, f16, bf16, f16x2, bf16x2 and f32x2, M is a mul without
 //     .sat, and neither carries a predicate;
-//   * neither carries a rounding modifier (.rn and so on), except f32x2: an RTX 5090 and a GB10
+//   * neither carries a rounding modifier (.rn and so on), except .rn on f32x2: an RTX 5090 and a GB10
 //     contract f32x2 even with .rn on either instruction (ptxas emits FFMA on sm_12x and FFMA2 on
 //     sm_100a, also with --fmad=false), unlike the PTX ISA text, and the simulator follows the
-//     hardware;
+//     hardware; with .rz, .rm or .rp on either instruction f32x2 is not contracted (an RTX 5090, all
+//     pairs of the modifiers, tests/contract_cases.py --directed);
 //   * .ftz is on both or on neither;
 //   * A and M are in one basic block (a label or a branch, call, return, exit or barrier between
 //     them separates them), and every use of M's result is an add or sub of that kind in the
