@@ -222,6 +222,24 @@ struct cudaArray {
 #endif /* !__dv */
 
 cudaError_t g_last_cudaError = cudaSuccess;
+// yasai: after a kernel fault every entry point that touches a context returns 719 (yasai_func.h,
+// tests/gaps_m4.cu). Measured on a GPU to keep working, and so left without these checks: cuCtxGetCurrent,
+// cuCtxGetDevice, cuCtxSetCurrent, cuCtxPushCurrent, cuCtxPopCurrent, cuCtxGetApiVersion, cuCtxGetFlags,
+// cuDriverGetVersion, cuDeviceGet, cuDeviceGetCount, cuDeviceGetName, cuDeviceGetAttribute, cuDeviceTotalMem,
+// cuDevicePrimaryCtxGetState, cuGetErrorString, cudaGetDeviceCount, cudaGetDevice, cudaGetDeviceProperties,
+// cudaSetDevice, cudaGetLastError. Not measured, kept by name because they touch no context: cuInit,
+// cuGetErrorName, cuDeviceGetUuid, cuDeviceGetLuid, cuDeviceGetPCIBusId, cuDeviceGetByPCIBusId, cuGetProcAddress,
+// cuGetExportTable, cudaDriverGetVersion, cudaRuntimeGetVersion, cudaGetDeviceFlags, cudaDeviceGetAttribute,
+// cudaDeviceCanAccessPeer, cudaPeekAtLastError.
+#define YASAI_FAULT_CU()                                                  \
+  do {                                                                    \
+    if (yasai_func::kernel_fault()) return CUDA_ERROR_LAUNCH_FAILED;      \
+  } while (0)
+#define YASAI_FAULT_RT()                                                  \
+  do {                                                                    \
+    if (yasai_func::kernel_fault())                                       \
+      return g_last_cudaError = cudaErrorLaunchFailure;                   \
+  } while (0)
 
 void register_ptx_function(const char *name, function_info *impl) {
   // no longer need this
@@ -480,6 +498,7 @@ __host__ cudaError_t CUDARTAPI cudaLaunchHostFunc(cudaStream_t stream, void (*fn
 // @param e Runtime status.
 static CUresult yasai_drv_status(cudaError_t e) {
   if (e == cudaSuccess) return CUDA_SUCCESS;
+  if (e == cudaErrorLaunchFailure) return CUDA_ERROR_LAUNCH_FAILED;  // yasai: a kernel fault
   if (e == cudaErrorNotReady) return CUDA_ERROR_NOT_READY;
   return CUDA_ERROR_INVALID_VALUE;
 }
@@ -1812,6 +1831,7 @@ cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = N
 }
 
 cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx) {
+  YASAI_FAULT_RT();
   gpgpu_context *ctx;
   if (gpgpu_ctx) {
     ctx = gpgpu_ctx;
@@ -3662,6 +3682,7 @@ cudaDeviceSynchronizeInternal(gpgpu_context *gpgpu_ctx = NULL) {
   // Blocks until the device has completed all preceding requested tasks
   ctx->synchronize();
   yasai_lazy::sync_point("cudaDeviceSynchronize");  // yasai: see yasai_lazy.h
+  YASAI_FAULT_RT();  // yasai: the kernel it waited for may have faulted
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -3739,26 +3760,31 @@ uint64_t cudaMallocSST(void **devPtr, size_t size) {
 }
 
 __host__ cudaError_t CUDARTAPI cudaMallocHostSST(void *addr, size_t size) {
+  YASAI_FAULT_RT();
   return cudaMallocHostSSTInternal(addr, size);
 }
 
 cudaError_t cudaPeekAtLastError(void) { return g_last_cudaError; }
 
 __host__ cudaError_t CUDARTAPI cudaMalloc(void **devPtr, size_t size) {
+  YASAI_FAULT_RT();
   return cudaMallocInternal(devPtr, size);
 }
 
 __host__ cudaError_t CUDARTAPI cudaMallocHost(void **ptr, size_t size) {
+  YASAI_FAULT_RT();
   return cudaMallocHostInternal(ptr, size);
 }
 __host__ cudaError_t CUDARTAPI cudaMallocPitch(void **devPtr, size_t *pitch,
                                                size_t width, size_t height) {
+  YASAI_FAULT_RT();
   return cudaMallocPitchInternal(devPtr, pitch, width, height);
 }
 
 __host__ cudaError_t CUDARTAPI cudaMallocArray(
     struct cudaArray **array, const struct cudaChannelFormatDesc *desc,
     size_t width, size_t height __dv(1)) {
+  YASAI_FAULT_RT();
   return cudaMallocArrayInternal(array, desc, width, height);
 }
 
@@ -3796,6 +3822,7 @@ static void yasai_free_now(void *devPtr) {
 static void yasai_free_stream_ordered(void *devPtr) { yasai_free_now(devPtr); }
 
 __host__ cudaError_t CUDARTAPI cudaFree(void *devPtr) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -3806,6 +3833,7 @@ __host__ cudaError_t CUDARTAPI cudaFree(void *devPtr) {
   // found no fat cubin for its kernel (fork check, 2026-10-24).
   if (devPtr == NULL) {
     GPGPUSim_Context(GPGPU_Context());
+    yasai_ctx_current() = true;  // the primary context is now current (cuCtxGetDevice returns 0 on a GPU)
     return g_last_cudaError = cudaSuccess;
   }
   // yasai: cudaFree synchronizes the device implicitly, as in CUDA: kernels and copies queued
@@ -3820,6 +3848,7 @@ __host__ cudaError_t CUDARTAPI cudaFree(void *devPtr) {
   return g_last_cudaError = cudaSuccess;
 }
 __host__ cudaError_t CUDARTAPI cudaFreeHost(void *ptr) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -3837,6 +3866,7 @@ __host__ cudaError_t CUDARTAPI cudaFreeHost(void *ptr) {
 }
 
 __host__ cudaError_t CUDARTAPI cudaFreeArray(struct cudaArray *array) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -3893,6 +3923,7 @@ void yasai_rec_sync(const char *api, uint64_t t0, uint32_t corr, cudaError_t ret
 __host__ cudaError_t CUDARTAPI cudaMemcpy(void *dst, const void *src,
                                           size_t count,
                                           enum cudaMemcpyKind kind) {
+  YASAI_FAULT_RT();
   if (!yasai_rec::Recorder::get().on()) return cudaMemcpyInternal(dst, src, count, kind);
   const uint64_t t0 = yasai_rec::mono_ns();
   const uint32_t corr = yasai_rec::Recorder::get().corr();
@@ -3905,6 +3936,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyToArray(struct cudaArray *dst,
                                                  size_t wOffset, size_t hOffset,
                                                  const void *src, size_t count,
                                                  enum cudaMemcpyKind kind) {
+  YASAI_FAULT_RT();
   return cudaMemcpyToArrayInternal(dst, wOffset, hOffset, src, count, kind);
 }
 
@@ -3913,6 +3945,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyFromArray(void *dst,
                                                    size_t wOffset,
                                                    size_t hOffset, size_t count,
                                                    enum cudaMemcpyKind kind) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -3924,6 +3957,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyArrayToArray(
     struct cudaArray *dst, size_t wOffsetDst, size_t hOffsetDst,
     const struct cudaArray *src, size_t wOffsetSrc, size_t hOffsetSrc,
     size_t count, enum cudaMemcpyKind kind __dv(cudaMemcpyDeviceToDevice)) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -3935,12 +3969,14 @@ __host__ cudaError_t CUDARTAPI cudaMemcpy2D(void *dst, size_t dpitch,
                                             const void *src, size_t spitch,
                                             size_t width, size_t height,
                                             enum cudaMemcpyKind kind) {
+  YASAI_FAULT_RT();
   return cudaMemcpy2DInternal(dst, dpitch, src, spitch, width, height, kind);
 }
 
 __host__ cudaError_t CUDARTAPI cudaMemcpy2DToArray(
     struct cudaArray *dst, size_t wOffset, size_t hOffset, const void *src,
     size_t spitch, size_t width, size_t height, enum cudaMemcpyKind kind) {
+  YASAI_FAULT_RT();
   return cudaMemcpy2DToArrayInternal(dst, wOffset, hOffset, src, spitch, width,
                                      height, kind);
 }
@@ -3948,6 +3984,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpy2DToArray(
 __host__ cudaError_t CUDARTAPI cudaMemcpy2DFromArray(
     void *dst, size_t dpitch, const struct cudaArray *src, size_t wOffset,
     size_t hOffset, size_t width, size_t height, enum cudaMemcpyKind kind) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -3960,6 +3997,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpy2DArrayToArray(
     const struct cudaArray *src, size_t wOffsetSrc, size_t hOffsetSrc,
     size_t width, size_t height,
     enum cudaMemcpyKind kind __dv(cudaMemcpyDeviceToDevice)) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -3970,16 +4008,19 @@ __host__ cudaError_t CUDARTAPI cudaMemcpy2DArrayToArray(
 __host__ cudaError_t CUDARTAPI cudaMemcpyToSymbol(
     const char *symbol, const void *src, size_t count, size_t offset __dv(0),
     enum cudaMemcpyKind kind __dv(cudaMemcpyHostToDevice)) {
+  YASAI_FAULT_RT();
   return cudaMemcpyToSymbolInternal(symbol, src, count, offset, kind);
 }
 
 __host__ cudaError_t CUDARTAPI cudaMemcpyFromSymbol(
     void *dst, const char *symbol, size_t count, size_t offset __dv(0),
     enum cudaMemcpyKind kind __dv(cudaMemcpyDeviceToHost)) {
+  YASAI_FAULT_RT();
   return cudaMemcpyFromSymbolInternal(dst, symbol, count, offset, kind);
 }
 
 __host__ cudaError_t CUDARTAPI cudaMemGetInfo(size_t *free, size_t *total) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4001,6 +4042,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyAsync(void *dst, const void *src,
                                                size_t count,
                                                enum cudaMemcpyKind kind,
                                                cudaStream_t stream) {
+  YASAI_FAULT_RT();
   if (yasai_capture_memcpy(dst, src, count, kind, stream)) return g_last_cudaError = cudaSuccess;
   if (!yasai_rec::Recorder::get().on())
     return cudaMemcpyAsyncInternal(dst, src, count, kind, stream);
@@ -4014,6 +4056,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyAsync(void *dst, const void *src,
 __host__ cudaError_t CUDARTAPI cudaMemcpyToArrayAsync(
     struct cudaArray *dst, size_t wOffset, size_t hOffset, const void *src,
     size_t count, enum cudaMemcpyKind kind, cudaStream_t stream) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4024,6 +4067,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyToArrayAsync(
 __host__ cudaError_t CUDARTAPI cudaMemcpyFromArrayAsync(
     void *dst, const struct cudaArray *src, size_t wOffset, size_t hOffset,
     size_t count, enum cudaMemcpyKind kind, cudaStream_t stream) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4036,6 +4080,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpy2DAsync(void *dst, size_t dpitch,
                                                  size_t width, size_t height,
                                                  enum cudaMemcpyKind kind,
                                                  cudaStream_t stream) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4047,6 +4092,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpy2DToArrayAsync(
     struct cudaArray *dst, size_t wOffset, size_t hOffset, const void *src,
     size_t spitch, size_t width, size_t height, enum cudaMemcpyKind kind,
     cudaStream_t stream) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4058,6 +4104,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpy2DFromArrayAsync(
     void *dst, size_t dpitch, const struct cudaArray *src, size_t wOffset,
     size_t hOffset, size_t width, size_t height, enum cudaMemcpyKind kind,
     cudaStream_t stream) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4069,6 +4116,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpy2DFromArrayAsync(
 cudaError_t CUDARTAPI cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
     int *numBlocks, const char *hostFunc, int blockSize, size_t dynamicSMemSize,
     unsigned int flags) {
+  YASAI_FAULT_RT();
   return cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlagsInternal(
       numBlocks, hostFunc, blockSize, dynamicSMemSize, flags);
 }
@@ -4082,6 +4130,7 @@ cudaError_t CUDARTAPI cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
  *******************************************************************************/
 
 __host__ cudaError_t CUDARTAPI cudaMemset(void *mem, int c, size_t count) {
+  YASAI_FAULT_RT();
   if (!yasai_rec::Recorder::get().on()) return cudaMemsetInternal(mem, c, count);
   const uint64_t t0 = yasai_rec::mono_ns();
   const uint32_t corr = yasai_rec::Recorder::get().corr();
@@ -4093,6 +4142,7 @@ __host__ cudaError_t CUDARTAPI cudaMemset(void *mem, int c, size_t count) {
 // memset operation is done but i think its not async?
 __host__ cudaError_t CUDARTAPI cudaMemsetAsync(void *mem, int c, size_t count,
                                                cudaStream_t stream = 0) {
+  YASAI_FAULT_RT();
   // yasai: the calls used to pass "stream = 0", an assignment, so every cudaMemsetAsync ran on
   // the legacy default stream. On a non-blocking stream (NCCL's deviceStream) the memset could
   // then run after copies queued behind it: NCCL's initChannel zeroes channel->devPeers and then
@@ -4109,6 +4159,7 @@ __host__ cudaError_t CUDARTAPI cudaMemsetAsync(void *mem, int c, size_t count,
 
 __host__ cudaError_t CUDARTAPI cudaMemset2D(void *mem, size_t pitch, int c,
                                             size_t width, size_t height) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4127,6 +4178,7 @@ __host__ cudaError_t CUDARTAPI cudaMemset2D(void *mem, size_t pitch, int c,
 // state (nvshmemi_device_state_d) this way.
 __host__ cudaError_t CUDARTAPI cudaGetSymbolAddress(void **devPtr,
                                                     const char *symbol) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4142,6 +4194,7 @@ __host__ cudaError_t CUDARTAPI cudaGetSymbolAddress(void **devPtr,
 // yasai: the size of a registered variable (see cudaGetSymbolAddress).
 __host__ cudaError_t CUDARTAPI cudaGetSymbolSize(size_t *size,
                                                  const char *symbol) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4176,6 +4229,7 @@ __host__ cudaError_t CUDARTAPI cudaDeviceGetAttribute(int *value,
 
 __host__ cudaError_t CUDARTAPI
 cudaChooseDevice(int *device, const struct cudaDeviceProp *prop) {
+  YASAI_FAULT_RT();
   return cudaChooseDeviceInternal(device, prop);
 }
 
@@ -4189,11 +4243,13 @@ __host__ cudaError_t CUDARTAPI cudaGetDevice(int *device) {
 
 __host__ cudaError_t CUDARTAPI cudaDeviceGetLimit(size_t *pValue,
                                                   cudaLimit limit) {
+  YASAI_FAULT_RT();
   return cudaDeviceGetLimitInternal(pValue, limit);
 }
 
 __host__ cudaError_t CUDARTAPI cudaStreamGetPriority(cudaStream_t hStream,
                                                      int *priority) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4203,6 +4259,7 @@ __host__ cudaError_t CUDARTAPI cudaStreamGetPriority(cudaStream_t hStream,
 
 __host__ cudaError_t CUDARTAPI cudaDeviceGetPCIBusId(char *pciBusId, int len,
                                                      int device) {
+  YASAI_FAULT_RT();
   // yasai: a stable made-up bus id per simulated device, bus = YASAI_PCI_BUS_BASE (default
   // 0xd0) + device. The base must not be a bus of the host, because NCCL reads the device's
   // sysfs entry when one exists (bus 1 is a real controller on the lab hosts).
@@ -4215,6 +4272,7 @@ __host__ cudaError_t CUDARTAPI cudaDeviceGetPCIBusId(char *pciBusId, int len,
 
 // yasai: inverse of cudaDeviceGetPCIBusId above (device = bus - YASAI_PCI_BUS_BASE).
 __host__ cudaError_t CUDARTAPI cudaDeviceGetByPCIBusId(int *device, const char *pciBusId) {
+  YASAI_FAULT_RT();
   unsigned dom = 0, bus = 0, dev = 0, fn = 0;
   const char *base_env = getenv("YASAI_PCI_BUS_BASE");
   const unsigned base = base_env ? unsigned(strtoul(base_env, NULL, 0)) : 0xd0u;
@@ -4238,6 +4296,7 @@ __host__ cudaError_t CUDARTAPI cudaDeviceGetByPCIBusId(int *device, const char *
 // cudaMalloc allocations.
 __host__ cudaError_t CUDARTAPI cudaMemPoolCreate(cudaMemPool_t *memPool,
                                                  const struct cudaMemPoolProps *) {
+  YASAI_FAULT_RT();
   static uintptr_t next_pool = 1;
   if (memPool == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   *memPool = reinterpret_cast<cudaMemPool_t>(next_pool++);
@@ -4246,12 +4305,14 @@ __host__ cudaError_t CUDARTAPI cudaMemPoolCreate(cudaMemPool_t *memPool,
 
 // yasai: see cudaMemPoolCreate.
 __host__ cudaError_t CUDARTAPI cudaMemPoolDestroy(cudaMemPool_t) {
+  YASAI_FAULT_RT();
   return g_last_cudaError = cudaSuccess;
 }
 
 // yasai: see cudaMemPoolCreate.
 __host__ cudaError_t CUDARTAPI cudaMallocFromPoolAsync(void **ptr, size_t size, cudaMemPool_t,
                                                        cudaStream_t) {
+  YASAI_FAULT_RT();
   return cudaMalloc(ptr, size);
 }
 
@@ -4260,6 +4321,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyBatchAsync(void *const *dsts, const voi
                                                    const size_t *sizes, size_t count,
                                                    struct cudaMemcpyAttributes *, size_t *,
                                                    size_t, cudaStream_t stream) {
+  YASAI_FAULT_RT();
   for (size_t i = 0; i < count; i++) {
     cudaError_t e = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault, stream);
     if (e != cudaSuccess) return g_last_cudaError = e;
@@ -4272,6 +4334,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyBatchAsync(void *const *dsts, const voi
 // simulator never captures; an event record with flags is an ordinary event record.
 __host__ cudaError_t CUDARTAPI cudaDeviceGetGraphMemAttribute(int, enum cudaGraphMemAttributeType,
                                                                void *value) {
+  YASAI_FAULT_RT();
   if (value) *static_cast<unsigned long long *>(value) = 0;
   return g_last_cudaError = cudaSuccess;
 }
@@ -4279,6 +4342,7 @@ __host__ cudaError_t CUDARTAPI cudaDeviceGetGraphMemAttribute(int, enum cudaGrap
 // yasai: see cudaDeviceGetGraphMemAttribute.
 __host__ cudaError_t CUDARTAPI cudaDeviceSetGraphMemAttribute(int, enum cudaGraphMemAttributeType,
                                                                void *) {
+  YASAI_FAULT_RT();
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -4289,6 +4353,7 @@ __host__ cudaError_t CUDARTAPI cudaEventRecord(cudaEvent_t event, cudaStream_t s
 //   event, stream, flags  as in the CUDA runtime API
 __host__ cudaError_t CUDARTAPI cudaEventRecordWithFlags(cudaEvent_t event, cudaStream_t stream,
                                                         unsigned int flags) {
+  YASAI_FAULT_RT();
   if (yasai_capture_event_record(event, stream, (flags & cudaEventRecordExternal) != 0))
     return g_last_cudaError = cudaSuccess;
   return cudaEventRecord(event, stream);
@@ -4298,6 +4363,7 @@ __host__ cudaError_t CUDARTAPI cudaEventRecordWithFlags(cudaEvent_t event, cudaS
 __host__ cudaError_t CUDARTAPI cudaGraphAddNode(cudaGraphNode_t *, cudaGraph_t,
                                                 const cudaGraphNode_t *, const cudaGraphEdgeData *,
                                                 size_t, struct cudaGraphNodeParams *) {
+  YASAI_FAULT_RT();
   return g_last_cudaError = cudaErrorNotSupported;
 }
 
@@ -4305,6 +4371,7 @@ __host__ cudaError_t CUDARTAPI cudaGraphAddNode(cudaGraphNode_t *, cudaGraph_t,
 __host__ cudaError_t CUDARTAPI cudaGraphConditionalHandleCreate(cudaGraphConditionalHandle *,
                                                                 cudaGraph_t, unsigned int,
                                                                 unsigned int) {
+  YASAI_FAULT_RT();
   return g_last_cudaError = cudaErrorNotSupported;
 }
 
@@ -4349,6 +4416,7 @@ extern "C" int yasai_devmem_prepare_pin(const void *addr, size_t bytes) {
 
 __host__ cudaError_t CUDARTAPI cudaIpcGetMemHandle(cudaIpcMemHandle_t *handle,
                                                    void *devPtr) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4363,6 +4431,7 @@ __host__ cudaError_t CUDARTAPI cudaIpcGetMemHandle(cudaIpcMemHandle_t *handle,
 __host__ cudaError_t cudaIpcOpenMemHandle(void **devPtr,
                                           cudaIpcMemHandle_t handle,
                                           unsigned int flags) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4376,6 +4445,7 @@ __host__ cudaError_t cudaIpcOpenMemHandle(void **devPtr,
 
 __host__ cudaError_t CUDARTAPI
 cudaDestroyTextureObject(cudaTextureObject_t texObject) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4392,6 +4462,7 @@ cudaDestroyTextureObject(cudaTextureObject_t texObject) {
 __host__ cudaError_t CUDARTAPI cudaBindTexture(
     size_t *offset, const struct textureReference *texref, const void *devPtr,
     const struct cudaChannelFormatDesc *desc, size_t size __dv(UINT_MAX)) {
+  YASAI_FAULT_RT();
   return cudaBindTextureInternal(offset, texref, devPtr, desc,
                                  size __dv(UINT_MAX));
 }
@@ -4399,16 +4470,19 @@ __host__ cudaError_t CUDARTAPI cudaBindTexture(
 __host__ cudaError_t CUDARTAPI cudaBindTextureToArray(
     const struct textureReference *texref, const struct cudaArray *array,
     const struct cudaChannelFormatDesc *desc) {
+  YASAI_FAULT_RT();
   return cudaBindTextureToArrayInternal(texref, array, desc);
 }
 
 __host__ cudaError_t CUDARTAPI
 cudaUnbindTexture(const struct textureReference *texref) {
+  YASAI_FAULT_RT();
   return cudaUnbindTextureInternal(texref);
 }
 
 __host__ cudaError_t CUDARTAPI cudaGetTextureAlignmentOffset(
     size_t *offset, const struct textureReference *texref) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4418,6 +4492,7 @@ __host__ cudaError_t CUDARTAPI cudaGetTextureAlignmentOffset(
 
 __host__ cudaError_t CUDARTAPI cudaGetTextureReference(
     const struct textureReference **texref, const char *symbol) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4427,6 +4502,7 @@ __host__ cudaError_t CUDARTAPI cudaGetTextureReference(
 
 __host__ cudaError_t CUDARTAPI cudaGetChannelDesc(
     struct cudaChannelFormatDesc *desc, const struct cudaArray *array) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4523,6 +4599,7 @@ __host__ cudaError_t CUDARTAPI cudaSetupArgumentSST(uint64_t arg,
                                                     uint8_t value[200],
                                                     size_t size,
                                                     size_t offset) {
+  YASAI_FAULT_RT();
   void *local_value;
   local_value = (void *)malloc(size);
 
@@ -4536,15 +4613,18 @@ __host__ cudaError_t CUDARTAPI cudaSetupArgumentSST(uint64_t arg,
 
 __host__ cudaError_t CUDARTAPI cudaSetupArgument(const void *arg, size_t size,
                                                  size_t offset) {
+  YASAI_FAULT_RT();
   return cudaSetupArgumentInternal(arg, size, offset);
 }
 
 // SST specific cuda apis
 __host__ cudaError_t CUDARTAPI cudaLaunchSST(uint64_t hostFun) {
+  YASAI_FAULT_RT();
   return cudaLaunchInternal((char *)hostFun);
 }
 
 __host__ cudaError_t CUDARTAPI cudaLaunch(const char *hostFun) {
+  YASAI_FAULT_RT();
   return cudaLaunchInternal(hostFun);
 }
 
@@ -4553,6 +4633,7 @@ __host__ cudaError_t CUDARTAPI cudaLaunchKernel(const char *hostFun,
                                                 const void **args,
                                                 size_t sharedMem,
                                                 cudaStream_t stream) {
+  YASAI_FAULT_RT();
   return cudaLaunchKernelInternal(hostFun, gridDim, blockDim, args, sharedMem,
                                   stream);
 }
@@ -4564,6 +4645,7 @@ __host__ cudaError_t CUDARTAPI cudaLaunchKernel(const char *hostFun,
  *******************************************************************************/
 
 __host__ cudaError_t CUDARTAPI cudaStreamCreate(cudaStream_t *stream) {
+  YASAI_FAULT_RT();
   const cudaError_t ret = cudaStreamCreateInternal(stream);
   if (ret == cudaSuccess && yasai_rec::Recorder::get().on())
     yasai_rec::Recorder::get().stream_id(*stream);  // writes stream_created
@@ -4573,6 +4655,7 @@ __host__ cudaError_t CUDARTAPI cudaStreamCreate(cudaStream_t *stream) {
 // TODO: introduce priorities
 __host__ cudaError_t CUDARTAPI cudaStreamCreateWithPriority(
     cudaStream_t *stream, unsigned int flags, int priority) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4586,6 +4669,7 @@ __host__ cudaError_t CUDARTAPI cudaStreamCreateWithPriority(
 
 __host__ cudaError_t CUDARTAPI
 cudaDeviceGetStreamPriorityRange(int *leastPriority, int *greatestPriority) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4605,24 +4689,29 @@ cudaStreamCreateWithFlags(cudaStream_t *stream, unsigned int flags) {
 }
 
 __host__ cudaError_t CUDARTAPI cudaStreamDestroy(cudaStream_t stream) {
+  YASAI_FAULT_RT();
   return cudaStreamDestroyInternal(stream);
 }
 
 __host__ cudaError_t CUDARTAPI cudaStreamSynchronize(cudaStream_t stream) {
+  YASAI_FAULT_RT();
   if (!yasai_rec::Recorder::get().on()) {
     const cudaError_t r = cudaStreamSynchronizeInternal(stream);
     yasai_lazy::sync_point("cudaStreamSynchronize");  // yasai: see yasai_lazy.h
+    YASAI_FAULT_RT();  // yasai: the kernel it waited for may have faulted
     return r;
   }
   const uint64_t t0 = yasai_rec::mono_ns();
   const uint32_t corr = yasai_rec::Recorder::get().corr();
-  const cudaError_t ret = cudaStreamSynchronizeInternal(stream);
+  cudaError_t ret = cudaStreamSynchronizeInternal(stream);
   yasai_lazy::sync_point("cudaStreamSynchronize");  // yasai: see yasai_lazy.h
+  if (yasai_func::kernel_fault()) ret = g_last_cudaError = cudaErrorLaunchFailure;  // yasai
   yasai_rec_sync("cudaStreamSynchronize", t0, corr, ret, yasai_rec::kStreamSync, stream, 0, 0);
   return ret;
 }
 
 __host__ cudaError_t CUDARTAPI cudaStreamQuery(cudaStream_t stream) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4646,6 +4735,7 @@ __host__ cudaError_t CUDARTAPI cudaStreamQuery(cudaStream_t stream) {
  *******************************************************************************/
 
 __host__ cudaError_t CUDARTAPI cudaEventCreate(cudaEvent_t *event) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4661,6 +4751,7 @@ __host__ cudaError_t CUDARTAPI cudaEventCreate(cudaEvent_t *event) {
 
 __host__ cudaError_t CUDARTAPI cudaEventRecord(cudaEvent_t event,
                                                cudaStream_t stream) {
+  YASAI_FAULT_RT();
   yasai_rec::Recorder &rec = yasai_rec::Recorder::get();
   if (yasai_capture_event_record(event, stream, false)) return g_last_cudaError = cudaSuccess;
   if (!rec.on()) return cudaEventRecordInternal(event, stream);
@@ -4679,6 +4770,7 @@ __host__ cudaError_t CUDARTAPI cudaEventRecord(cudaEvent_t event,
 __host__ cudaError_t CUDARTAPI cudaStreamWaitEvent(cudaStream_t stream,
                                                    cudaEvent_t event,
                                                    unsigned int flags) {
+  YASAI_FAULT_RT();
   yasai_rec::Recorder &rec = yasai_rec::Recorder::get();
   if (yasai_capture_wait_event(stream, event)) return g_last_cudaError = cudaSuccess;
   if (!rec.on()) return cudaStreamWaitEventInternal(stream, event, flags);
@@ -4692,6 +4784,7 @@ __host__ cudaError_t CUDARTAPI cudaStreamWaitEvent(cudaStream_t stream,
 }
 
 __host__ cudaError_t CUDARTAPI cudaEventQuery(cudaEvent_t event) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4706,6 +4799,7 @@ __host__ cudaError_t CUDARTAPI cudaEventQuery(cudaEvent_t event) {
 }
 
 __host__ cudaError_t CUDARTAPI cudaEventSynchronize(cudaEvent_t event) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4723,6 +4817,7 @@ __host__ cudaError_t CUDARTAPI cudaEventSynchronize(cudaEvent_t event) {
   printf("GPGPU-Sim API: cudaEventSynchronize ** event detected\n");
   fflush(stdout);
   yasai_lazy::sync_point("cudaEventSynchronize");  // yasai: see yasai_lazy.h
+  YASAI_FAULT_RT();  // yasai: the kernel it waited for may have faulted
   if (rec_on) {
     const uint64_t uid = e ? uint64_t(e->get_uid()) : 0;
     yasai_rec_sync("cudaEventSynchronize", t0, corr, cudaSuccess, yasai_rec::kEventSync, nullptr,
@@ -4732,6 +4827,7 @@ __host__ cudaError_t CUDARTAPI cudaEventSynchronize(cudaEvent_t event) {
 }
 
 __host__ cudaError_t CUDARTAPI cudaEventDestroy(cudaEvent_t event) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4747,6 +4843,7 @@ __host__ cudaError_t CUDARTAPI cudaEventDestroy(cudaEvent_t event) {
 __host__ cudaError_t CUDARTAPI cudaEventElapsedTime(float *ms,
                                                     cudaEvent_t start,
                                                     cudaEvent_t end) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -4807,14 +4904,17 @@ __host__ cudaError_t CUDARTAPI cudaEventElapsedTime(float *ms,
  *******************************************************************************/
 
 __host__ cudaError_t CUDARTAPI cudaThreadExit(void) {
+  YASAI_FAULT_RT();
   return cudaThreadExitInternal();
 }
 
 __host__ cudaError_t CUDARTAPI cudaThreadSynchronize(void) {
+  YASAI_FAULT_RT();
   return cudaThreadSynchronizeInternal();
 }
 
 __host__ cudaError_t CUDARTAPI cudaThreadSynchronizeSST(void) {
+  YASAI_FAULT_RT();
   // For SST, perform a one-time check and let SST_Cycle()
   // do the polling test and invoke callback to SST
   // to signal ThreadSynchonize done
@@ -4871,6 +4971,7 @@ static ExportedFunction exportTable[3] = {&dummy0, &dummy0, &dummy0};
 // a three-entry table of dummies for every UUID (exportTable above, no longer used).
 __host__ cudaError_t CUDARTAPI cudaGetExportTable(
     const void **ppExportTable, const cudaUUID_t *pExportTableId) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -6911,6 +7012,7 @@ extern void __cudaRegisterVar(
 __host__ cudaError_t CUDARTAPI cudaConfigureCall(dim3 gridDim, dim3 blockDim,
                                                  size_t sharedMem,
                                                  cudaStream_t stream) {
+  YASAI_FAULT_RT();
   return cudaConfigureCallInternal(gridDim, blockDim, sharedMem, stream);
 }
 
@@ -6921,6 +7023,7 @@ void __cudaUnregisterFatBinary(void **fatCubinHandle) {
 }
 
 cudaError_t cudaDeviceReset(void) {
+  YASAI_FAULT_RT();
   // Should reset the simulated GPU
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
@@ -6929,10 +7032,11 @@ cudaError_t cudaDeviceReset(void) {
 }
 
 cudaError_t CUDARTAPI cudaDeviceSynchronize(void) {
+  YASAI_FAULT_RT();
   if (!yasai_rec::Recorder::get().on()) return cudaDeviceSynchronizeInternal();
   const uint64_t t0 = yasai_rec::mono_ns();
   const uint32_t corr = yasai_rec::Recorder::get().corr();
-  const cudaError_t ret = cudaDeviceSynchronizeInternal();
+  const cudaError_t ret = cudaDeviceSynchronizeInternal();  // 719 after a fault while it waited (yasai)
   yasai_rec_sync("cudaDeviceSynchronize", t0, corr, ret, yasai_rec::kContextSync, nullptr, 0, 0);
   return ret;
 }
@@ -6990,6 +7094,7 @@ char __cudaInitModule(void **fatCubinHandle) {
 }
 
 cudaError_t cudaGLRegisterBufferObject(GLuint bufferObj) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -6999,14 +7104,17 @@ cudaError_t cudaGLRegisterBufferObject(GLuint bufferObj) {
 }
 
 cudaError_t cudaGLMapBufferObject(void **devPtr, GLuint bufferObj) {
+  YASAI_FAULT_RT();
   return cudaGLMapBufferObjectInternal(devPtr, bufferObj);
 }
 
 cudaError_t cudaGLUnmapBufferObject(GLuint bufferObj) {
+  YASAI_FAULT_RT();
   return cudaGLUnmapBufferObjectInternal(bufferObj);
 }
 
 cudaError_t cudaGLUnregisterBufferObject(GLuint bufferObj) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -7019,11 +7127,13 @@ cudaError_t cudaGLUnregisterBufferObject(GLuint bufferObj) {
 
 cudaError_t CUDARTAPI cudaHostAlloc(void **pHost, size_t bytes,
                                     unsigned int flags) {
+  YASAI_FAULT_RT();
   return cudaHostAllocInternal(pHost, bytes, flags);
 }
 
 cudaError_t CUDARTAPI cudaHostGetDevicePointer(void **pDevice, void *pHost,
                                                unsigned int flags) {
+  YASAI_FAULT_RT();
   return cudaHostGetDevicePointerInternal(pDevice, pHost, flags);
 }
 
@@ -7033,6 +7143,7 @@ cudaError_t CUDARTAPI cudaHostGetDevicePointer(void **pDevice, void *pHost,
 //   devPtr: receives the allocation; size: bytes; flags: cudaMemAttachGlobal or
 //   cudaMemAttachHost (both give the same mapping here)
 __host__ cudaError_t CUDARTAPI cudaMallocManaged(void **devPtr, size_t size, unsigned int flags) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -7053,6 +7164,7 @@ __host__ cudaError_t CUDARTAPI cudaMallocManaged(void **devPtr, size_t size, uns
 __host__ cudaError_t CUDARTAPI cudaMemPrefetchAsync(const void *devPtr, size_t count,
                                                     struct cudaMemLocation location,
                                                     unsigned int flags, cudaStream_t stream) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -7065,6 +7177,7 @@ __host__ cudaError_t CUDARTAPI cudaMemPrefetchAsync(const void *devPtr, size_t c
 
 __host__ cudaError_t CUDARTAPI
 cudaPointerGetAttributes(cudaPointerAttributes *attributes, const void *ptr) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -7109,6 +7222,7 @@ __host__ cudaError_t CUDARTAPI cudaDeviceCanAccessPeer(int *canAccessPeer,
 
 __host__ cudaError_t CUDARTAPI cudaDeviceEnablePeerAccess(int peerDevice,
                                                           unsigned int flags) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -7119,6 +7233,7 @@ __host__ cudaError_t CUDARTAPI cudaDeviceEnablePeerAccess(int peerDevice,
 }
 
 cudaError_t CUDARTAPI cudaSetValidDevices(int *device_arr, int len) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -7127,6 +7242,7 @@ cudaError_t CUDARTAPI cudaSetValidDevices(int *device_arr, int len) {
 }
 
 cudaError_t CUDARTAPI cudaSetDeviceFlags(int flags) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -7142,10 +7258,12 @@ cudaError_t CUDARTAPI cudaSetDeviceFlags(int flags) {
 
 cudaError_t CUDARTAPI cudaFuncGetAttributes(struct cudaFuncAttributes *attr,
                                             const char *hostFun) {
+  YASAI_FAULT_RT();
   return cudaFuncGetAttributesInternal(attr, hostFun);
 }
 
 cudaError_t CUDARTAPI cudaEventCreateWithFlags(cudaEvent_t *event, int flags) {
+  YASAI_FAULT_RT();
   CUevent_st *e = new CUevent_st((flags & cudaEventBlockingSync) != 0);
   // yasai: an interprocess event keeps its counters in shared memory (cudaIpcGetEventHandle).
   if (flags & cudaEventInterprocess) {
@@ -7185,12 +7303,14 @@ cudaError_t CUDARTAPI cudaRuntimeGetVersion(int *runtimeVersion) {
 #if CUDART_VERSION >= 3000
 __host__ cudaError_t CUDARTAPI
 cudaFuncSetCacheConfig(const char *func, enum cudaFuncCache cacheConfig) {
+  YASAI_FAULT_RT();
   return cudaFuncSetCacheConfigInternal(func, cacheConfig);
 }
 
 // Jin: hack for cdp
 __host__ cudaError_t CUDARTAPI cudaDeviceSetLimit(enum cudaLimit limit,
                                                   size_t value) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -7263,6 +7383,7 @@ static bool max_dynamic_shared_memory_fits(
 cudaError_t CUDARTAPI cudaFuncSetAttribute(const void *func,
                                            enum cudaFuncAttribute attr,
                                            int value) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -7324,6 +7445,7 @@ cudaError_t CUDARTAPI cudaLibraryLoadData(
     void **jitOptionsValues, unsigned int numJitOptions,
     cudaLibraryOption *libraryOptions, void **libraryOptionValues,
     unsigned int numLibraryOptions) {
+  YASAI_FAULT_RT();
   (void)code;
   (void)jitOptions;
   (void)jitOptionsValues;
@@ -7348,6 +7470,7 @@ cudaError_t CUDARTAPI cudaLibraryLoadData(
 }
 
 cudaError_t CUDARTAPI cudaLibraryUnload(cudaLibrary_t library) {
+  YASAI_FAULT_RT();
   (void)library;
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
@@ -7358,6 +7481,7 @@ cudaError_t CUDARTAPI cudaLibraryUnload(cudaLibrary_t library) {
 cudaError_t CUDARTAPI cudaLibraryGetKernel(cudaKernel_t *pKernel,
                                            cudaLibrary_t library,
                                            const char *name) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -7375,6 +7499,7 @@ cudaError_t CUDARTAPI cudaLibraryGetKernel(cudaKernel_t *pKernel,
 
 cudaError_t CUDARTAPI cudaKernelSetAttributeForDevice(
     cudaKernel_t kernel, enum cudaFuncAttribute attr, int value, int device) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -7429,6 +7554,7 @@ extern "C" cudaError_t CUDARTAPI _cudaSetDevice(int device) {
 }
 
 cudaError_t CUDARTAPI cudaGLSetGLDevice(int device) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -7440,6 +7566,7 @@ cudaError_t CUDARTAPI cudaGLSetGLDevice(int device) {
 typedef void *HGPUNV;
 
 cudaError_t CUDARTAPI cudaWGLGetDevice(int *device, HGPUNV hGpu) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -7724,6 +7851,7 @@ extern "C" CUresult CUDAAPI cuTensorMapEncodeTiled(
     const cuuint32_t *boxDim, const cuuint32_t *elementStrides,
     CUtensorMapInterleave interleave, CUtensorMapSwizzle swizzle,
     CUtensorMapL2promotion l2Promotion, CUtensorMapFloatOOBfill oobFill) {
+  YASAI_FAULT_CU();
 
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
@@ -7930,6 +8058,7 @@ CUresult CUDAAPI cuDeviceGetAttribute(int *pi, CUdevice_attribute attrib,
 }
 #endif
 CUresult CUDAAPI cuDeviceGetProperties(CUdevprop *prop, CUdevice dev) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -7939,6 +8068,7 @@ CUresult CUDAAPI cuDeviceGetProperties(CUdevprop *prop, CUdevice dev) {
 
 CUresult CUDAAPI cuDeviceComputeCapability(int *major, int *minor,
                                            CUdevice dev) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -7950,6 +8080,7 @@ CUresult CUDAAPI cuDeviceComputeCapability(int *major, int *minor,
 
 // yasai: the one context of the simulated device (see cuCtxGetCurrent).
 CUresult CUDAAPI cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev) {
+  YASAI_FAULT_CU();
   (void)dev;
   if (pctx == NULL) return CUDA_ERROR_INVALID_VALUE;
   *pctx = (CUcontext)GPGPUSim_Context(GPGPU_Context());
@@ -7957,6 +8088,7 @@ CUresult CUDAAPI cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev) {
 }
 
 CUresult CUDAAPI cuDevicePrimaryCtxRelease(CUdevice dev) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -7965,6 +8097,7 @@ CUresult CUDAAPI cuDevicePrimaryCtxRelease(CUdevice dev) {
 }
 
 CUresult CUDAAPI cuDevicePrimaryCtxSetFlags(CUdevice dev, unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -7990,6 +8123,7 @@ CUresult CUDAAPI cuDevicePrimaryCtxGetState(CUdevice dev, unsigned int *flags,
 // looks it up through cudaGetDriverEntryPoint.
 //   hStream: stream; pctx: receives the context
 extern "C" CUresult CUDAAPI cuStreamGetCtx(CUstream hStream, CUcontext *pctx) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8004,11 +8138,13 @@ extern "C" CUresult CUDAAPI cuStreamGetCtx(CUstream hStream, CUcontext *pctx) {
 //   hStream: stream; pCtx: receives the context; pGreenCtx: receives NULL
 extern "C" CUresult CUDAAPI cuStreamGetCtx_v2(CUstream hStream, CUcontext *pCtx,
                                              void **pGreenCtx) {
+  YASAI_FAULT_CU();
   if (pGreenCtx) *pGreenCtx = NULL;
   return cuStreamGetCtx(hStream, pCtx);
 }
 
 CUresult CUDAAPI cuDevicePrimaryCtxReset(CUdevice dev) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8022,6 +8158,7 @@ CUresult CUDAAPI cuDevicePrimaryCtxReset(CUdevice dev) {
 // yasai: the one context of the simulated device, made current (see yasai_ctx_current).
 CUresult CUDAAPI cuCtxCreate(CUcontext *pctx, unsigned int flags,
                              CUdevice dev) {
+  YASAI_FAULT_CU();
   (void)flags;
   (void)dev;
   if (pctx == NULL) return CUDA_ERROR_INVALID_VALUE;
@@ -8033,6 +8170,7 @@ CUresult CUDAAPI cuCtxCreate(CUcontext *pctx, unsigned int flags,
 extern "C" CUresult CUDAAPI cuCtxCreate_v3(CUcontext *pctx, void *paramsArray,
                                            int numParams, unsigned int flags,
                                            CUdevice dev) {
+  YASAI_FAULT_CU();
   (void)paramsArray;
   (void)numParams;
   return cuCtxCreate(pctx, flags, dev);
@@ -8041,6 +8179,7 @@ extern "C" CUresult CUDAAPI cuCtxCreate_v3(CUcontext *pctx, void *paramsArray,
 extern "C" CUresult CUDAAPI cuCtxCreate_v4(CUcontext *pctx,
                                            void *ctxCreateParams,
                                            unsigned int flags, CUdevice dev) {
+  YASAI_FAULT_CU();
   (void)ctxCreateParams;
   return cuCtxCreate(pctx, flags, dev);
 }
@@ -8048,6 +8187,7 @@ extern "C" CUresult CUDAAPI cuCtxCreate_v4(CUcontext *pctx,
 
 #if CUDART_VERSION >= 4000
 CUresult CUDAAPI cuCtxDestroy(CUcontext ctx) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8125,6 +8265,7 @@ CUresult CUDAAPI cuCtxGetFlags(unsigned int *flags) {
 // yasai: stores the flags (see yasai_ctx_flags); the functional model has no behaviour that
 // depends on them (CU_CTX_SYNC_MEMOPS: memory operations are synchronous already).
 extern "C" CUresult CUDAAPI cuCtxSetFlags(unsigned int flags) {
+  YASAI_FAULT_CU();
   yasai_ctx_flags() = flags;
   return CUDA_SUCCESS;
 }
@@ -8133,11 +8274,15 @@ extern "C" CUresult CUDAAPI cuCtxSetFlags(unsigned int flags) {
 // yasai: waits for the device (cudaDeviceSynchronize); without a current context the driver
 // reports CUDA_ERROR_INVALID_CONTEXT.
 CUresult CUDAAPI cuCtxSynchronize(void) {
+  YASAI_FAULT_CU();
   if (!yasai_ctx_current()) return CUDA_ERROR_INVALID_CONTEXT;
-  return cudaDeviceSynchronize() == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_UNKNOWN;
+  const cudaError_t sync_status = cudaDeviceSynchronize();
+  YASAI_FAULT_CU();  // yasai: the kernel it waited for may have faulted
+  return sync_status == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_UNKNOWN;
 }
 
 CUresult CUDAAPI cuCtxSetLimit(CUlimit limit, size_t value) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8146,6 +8291,7 @@ CUresult CUDAAPI cuCtxSetLimit(CUlimit limit, size_t value) {
 }
 
 CUresult CUDAAPI cuCtxGetLimit(size_t *pvalue, CUlimit limit) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8154,6 +8300,7 @@ CUresult CUDAAPI cuCtxGetLimit(size_t *pvalue, CUlimit limit) {
 }
 
 CUresult CUDAAPI cuCtxGetCacheConfig(CUfunc_cache *pconfig) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8162,6 +8309,7 @@ CUresult CUDAAPI cuCtxGetCacheConfig(CUfunc_cache *pconfig) {
 }
 
 CUresult CUDAAPI cuCtxSetCacheConfig(CUfunc_cache config) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8171,6 +8319,7 @@ CUresult CUDAAPI cuCtxSetCacheConfig(CUfunc_cache config) {
 
 #if CUDART_VERSION >= 4020
 CUresult CUDAAPI cuCtxGetSharedMemConfig(CUsharedconfig *pConfig) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8179,6 +8328,7 @@ CUresult CUDAAPI cuCtxGetSharedMemConfig(CUsharedconfig *pConfig) {
 }
 
 CUresult CUDAAPI cuCtxSetSharedMemConfig(CUsharedconfig config) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8197,6 +8347,7 @@ CUresult CUDAAPI cuCtxGetApiVersion(CUcontext ctx, unsigned int *version) {
 
 CUresult CUDAAPI cuCtxGetStreamPriorityRange(int *leastPriority,
                                              int *greatestPriority) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8205,6 +8356,7 @@ CUresult CUDAAPI cuCtxGetStreamPriorityRange(int *leastPriority,
 }
 
 CUresult CUDAAPI cuCtxAttach(CUcontext *pctx, unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8213,6 +8365,7 @@ CUresult CUDAAPI cuCtxAttach(CUcontext *pctx, unsigned int flags) {
 }
 
 CUresult CUDAAPI cuCtxDetach(CUcontext ctx) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8221,6 +8374,7 @@ CUresult CUDAAPI cuCtxDetach(CUcontext ctx) {
 }
 
 CUresult CUDAAPI cuModuleLoad(CUmodule *module, const char *fname) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8269,6 +8423,7 @@ CUresult CUDAAPI cuModuleLoad(CUmodule *module, const char *fname) {
 }
 
 CUresult CUDAAPI cuModuleLoadData(CUmodule *module, const void *image) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8279,6 +8434,7 @@ CUresult CUDAAPI cuModuleLoadDataEx(CUmodule *module, const void *image,
                                     unsigned int numOptions,
                                     CUjit_option *options,
                                     void **optionValues) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8289,6 +8445,7 @@ CUresult CUDAAPI cuModuleLoadDataEx(CUmodule *module, const void *image,
 }
 
 CUresult CUDAAPI cuModuleLoadFatBinary(CUmodule *module, const void *fatCubin) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8297,6 +8454,7 @@ CUresult CUDAAPI cuModuleLoadFatBinary(CUmodule *module, const void *fatCubin) {
 }
 
 CUresult CUDAAPI cuModuleUnload(CUmodule hmod) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8306,6 +8464,7 @@ CUresult CUDAAPI cuModuleUnload(CUmodule hmod) {
 
 CUresult CUDAAPI cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod,
                                      const char *name) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8365,6 +8524,7 @@ CUresult CUDAAPI cuModuleGetFunction(CUfunction *hfunc, CUmodule hmod,
 #if CUDART_VERSION >= 3020
 CUresult CUDAAPI cuModuleGetGlobal(CUdeviceptr *dptr, size_t *bytes,
                                    CUmodule hmod, const char *name) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8375,6 +8535,7 @@ CUresult CUDAAPI cuModuleGetGlobal(CUdeviceptr *dptr, size_t *bytes,
 
 CUresult CUDAAPI cuModuleGetTexRef(CUtexref *pTexRef, CUmodule hmod,
                                    const char *name) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8384,6 +8545,7 @@ CUresult CUDAAPI cuModuleGetTexRef(CUtexref *pTexRef, CUmodule hmod,
 
 CUresult CUDAAPI cuModuleGetSurfRef(CUsurfref *pSurfRef, CUmodule hmod,
                                     const char *name) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8395,6 +8557,7 @@ CUresult CUDAAPI cuModuleGetSurfRef(CUsurfref *pSurfRef, CUmodule hmod,
 
 CUresult CUDAAPI cuLinkCreate(unsigned int numOptions, CUjit_option *options,
                               void **optionValues, CUlinkState *stateOut) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8406,6 +8569,7 @@ CUresult CUDAAPI cuLinkAddData(CUlinkState state, CUjitInputType type,
                                void *data, size_t size, const char *name,
                                unsigned int numOptions, CUjit_option *options,
                                void **optionValues) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8417,6 +8581,7 @@ CUresult CUDAAPI cuLinkAddData(CUlinkState state, CUjitInputType type,
 CUresult CUDAAPI cuLinkAddFile(CUlinkState state, CUjitInputType type,
                                const char *path, unsigned int numOptions,
                                CUjit_option *options, void **optionValues) {
+  YASAI_FAULT_CU();
   return cuLinkAddFileInternal(state, type, path, numOptions, options,
                                optionValues);
 }
@@ -8426,6 +8591,7 @@ CUresult CUDAAPI cuLinkAddFile(CUlinkState state, CUjitInputType type,
 
 CUresult CUDAAPI cuLinkComplete(CUlinkState state, void **cubinOut,
                                 size_t *sizeOut) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8435,6 +8601,7 @@ CUresult CUDAAPI cuLinkComplete(CUlinkState state, void **cubinOut,
 }
 
 CUresult CUDAAPI cuLinkDestroy(CUlinkState state) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8446,6 +8613,7 @@ CUresult CUDAAPI cuLinkDestroy(CUlinkState state) {
 
 #if CUDART_VERSION >= 3020
 CUresult CUDAAPI cuMemGetInfo(size_t *free, size_t *total) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8458,6 +8626,7 @@ CUresult CUDAAPI cuMemGetInfo(size_t *free, size_t *total) {
 }
 
 CUresult CUDAAPI cuMemAlloc(CUdeviceptr *dptr, size_t bytesize) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8471,6 +8640,7 @@ CUresult CUDAAPI cuMemAlloc(CUdeviceptr *dptr, size_t bytesize) {
 CUresult CUDAAPI cuMemAllocPitch(CUdeviceptr *dptr, size_t *pPitch,
                                  size_t WidthInBytes, size_t Height,
                                  unsigned int ElementSizeBytes) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8479,6 +8649,7 @@ CUresult CUDAAPI cuMemAllocPitch(CUdeviceptr *dptr, size_t *pPitch,
 }
 
 CUresult CUDAAPI cuMemFree(CUdeviceptr dptr) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8488,6 +8659,7 @@ CUresult CUDAAPI cuMemFree(CUdeviceptr dptr) {
 
 CUresult CUDAAPI cuMemGetAddressRange(CUdeviceptr *pbase, size_t *psize,
                                       CUdeviceptr dptr) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8501,18 +8673,21 @@ CUresult CUDAAPI cuMemGetAddressRange(CUdeviceptr *pbase, size_t *psize,
 }
 
 CUresult CUDAAPI cuMemAllocHost(void **pp, size_t bytesize) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMallocHost(pp, bytesize));
 }
 #endif /* CUDART_VERSION >= 3020 */
 
 CUresult CUDAAPI cuMemFreeHost(void *p) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaFreeHost(p));
 }
 
 CUresult CUDAAPI cuMemHostAlloc(void **pp, size_t bytesize,
                                 unsigned int Flags) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaHostAlloc(pp, bytesize, Flags));
 }
@@ -8520,6 +8695,7 @@ CUresult CUDAAPI cuMemHostAlloc(void **pp, size_t bytesize,
 #if CUDART_VERSION >= 3020
 CUresult CUDAAPI cuMemHostGetDevicePointer(CUdeviceptr *pdptr, void *p,
                                            unsigned int Flags) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   void *d = NULL;
   if (pdptr == NULL) return CUDA_ERROR_INVALID_VALUE;
@@ -8530,6 +8706,7 @@ CUresult CUDAAPI cuMemHostGetDevicePointer(CUdeviceptr *pdptr, void *p,
 #endif /* CUDART_VERSION >= 3020 */
 
 CUresult CUDAAPI cuMemHostGetFlags(unsigned int *pFlags, void *p) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   if (pFlags == NULL) return CUDA_ERROR_INVALID_VALUE;
   *pFlags = 0;  // host allocation flags are not kept
@@ -8541,6 +8718,7 @@ CUresult CUDAAPI cuMemHostGetFlags(unsigned int *pFlags, void *p) {
 
 CUresult CUDAAPI cuMemAllocManaged(CUdeviceptr *dptr, size_t bytesize,
                                    unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8567,6 +8745,7 @@ CUresult CUDAAPI cuDeviceGetPCIBusId(char *pciBusId, int len, CUdevice dev) {
 }
 
 CUresult CUDAAPI cuIpcGetEventHandle(CUipcEventHandle *pHandle, CUevent event) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8579,6 +8758,7 @@ CUresult CUDAAPI cuIpcGetEventHandle(CUipcEventHandle *pHandle, CUevent event) {
 
 CUresult CUDAAPI cuIpcOpenEventHandle(CUevent *phEvent,
                                       CUipcEventHandle handle) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8591,6 +8771,7 @@ CUresult CUDAAPI cuIpcOpenEventHandle(CUevent *phEvent,
 }
 
 CUresult CUDAAPI cuIpcGetMemHandle(CUipcMemHandle *pHandle, CUdeviceptr dptr) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8603,6 +8784,7 @@ CUresult CUDAAPI cuIpcGetMemHandle(CUipcMemHandle *pHandle, CUdeviceptr dptr) {
 
 CUresult CUDAAPI cuIpcOpenMemHandle(CUdeviceptr *pdptr, CUipcMemHandle handle,
                                     unsigned int Flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8616,6 +8798,7 @@ CUresult CUDAAPI cuIpcOpenMemHandle(CUdeviceptr *pdptr, CUipcMemHandle handle,
 }
 
 CUresult CUDAAPI cuIpcCloseMemHandle(CUdeviceptr dptr) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8630,11 +8813,13 @@ CUresult CUDAAPI cuIpcCloseMemHandle(CUdeviceptr dptr) {
 #if CUDART_VERSION >= 6050
 CUresult CUDAAPI cuMemHostRegister(void *p, size_t bytesize,
                                    unsigned int Flags) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaHostRegister(p, bytesize, Flags));
 }
 extern "C" __host__ cudaError_t CUDARTAPI cudaHostRegister(void *ptr, size_t size,
                                       unsigned int flags) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8648,6 +8833,7 @@ extern "C" __host__ cudaError_t CUDARTAPI cudaHostRegister(void *ptr, size_t siz
 }
 
 extern "C" __host__ cudaError_t cudaProfilerStart() {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8656,6 +8842,7 @@ extern "C" __host__ cudaError_t cudaProfilerStart() {
 }
 
 extern "C" __host__ cudaError_t cudaProfilerStop() {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8667,11 +8854,13 @@ extern "C" __host__ cudaError_t cudaProfilerStop() {
 #if CUDART_VERSION >= 4000
 
 CUresult CUDAAPI cuMemHostUnregister(void *p) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaHostUnregister(p));
 }
 
 CUresult CUDAAPI cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemcpy(reinterpret_cast<void *>(dst), reinterpret_cast<void *>(src), ByteCount, cudaMemcpyDefault));
 }
@@ -8679,6 +8868,7 @@ CUresult CUDAAPI cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount) {
 CUresult CUDAAPI cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext,
                               CUdeviceptr srcDevice, CUcontext srcContext,
                               size_t ByteCount) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   (void)dstContext;
   (void)srcContext;  // one simulated GPU per process
@@ -8691,18 +8881,21 @@ CUresult CUDAAPI cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext,
 #if CUDART_VERSION >= 3020
 CUresult CUDAAPI cuMemcpyHtoD(CUdeviceptr dstDevice, const void *srcHost,
                               size_t ByteCount) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemcpy(reinterpret_cast<void *>(dstDevice), srcHost, ByteCount, cudaMemcpyHostToDevice));
 }
 
 CUresult CUDAAPI cuMemcpyDtoH(void *dstHost, CUdeviceptr srcDevice,
                               size_t ByteCount) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemcpy(dstHost, reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToHost));
 }
 
 CUresult CUDAAPI cuMemcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
                               size_t ByteCount) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(
       cudaMemcpy(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToDevice));
@@ -8710,6 +8903,7 @@ CUresult CUDAAPI cuMemcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
 
 CUresult CUDAAPI cuMemcpyDtoA(CUarray dstArray, size_t dstOffset,
                               CUdeviceptr srcDevice, size_t ByteCount) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8719,6 +8913,7 @@ CUresult CUDAAPI cuMemcpyDtoA(CUarray dstArray, size_t dstOffset,
 
 CUresult CUDAAPI cuMemcpyAtoD(CUdeviceptr dstDevice, CUarray srcArray,
                               size_t srcOffset, size_t ByteCount) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8728,6 +8923,7 @@ CUresult CUDAAPI cuMemcpyAtoD(CUdeviceptr dstDevice, CUarray srcArray,
 
 CUresult CUDAAPI cuMemcpyHtoA(CUarray dstArray, size_t dstOffset,
                               const void *srcHost, size_t ByteCount) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8737,6 +8933,7 @@ CUresult CUDAAPI cuMemcpyHtoA(CUarray dstArray, size_t dstOffset,
 
 CUresult CUDAAPI cuMemcpyAtoH(void *dstHost, CUarray srcArray, size_t srcOffset,
                               size_t ByteCount) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8747,6 +8944,7 @@ CUresult CUDAAPI cuMemcpyAtoH(void *dstHost, CUarray srcArray, size_t srcOffset,
 CUresult CUDAAPI cuMemcpyAtoA(CUarray dstArray, size_t dstOffset,
                               CUarray srcArray, size_t srcOffset,
                               size_t ByteCount) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8755,6 +8953,7 @@ CUresult CUDAAPI cuMemcpyAtoA(CUarray dstArray, size_t dstOffset,
 }
 
 CUresult CUDAAPI cuMemcpy2D(const CUDA_MEMCPY2D *pCopy) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8763,6 +8962,7 @@ CUresult CUDAAPI cuMemcpy2D(const CUDA_MEMCPY2D *pCopy) {
 }
 
 CUresult CUDAAPI cuMemcpy2DUnaligned(const CUDA_MEMCPY2D *pCopy) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8771,6 +8971,7 @@ CUresult CUDAAPI cuMemcpy2DUnaligned(const CUDA_MEMCPY2D *pCopy) {
 }
 
 CUresult CUDAAPI cuMemcpy3D(const CUDA_MEMCPY3D *pCopy) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8781,6 +8982,7 @@ CUresult CUDAAPI cuMemcpy3D(const CUDA_MEMCPY3D *pCopy) {
 
 #if CUDART_VERSION >= 4000
 CUresult CUDAAPI cuMemcpy3DPeer(const CUDA_MEMCPY3D_PEER *pCopy) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8790,6 +8992,7 @@ CUresult CUDAAPI cuMemcpy3DPeer(const CUDA_MEMCPY3D_PEER *pCopy) {
 
 CUresult CUDAAPI cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src,
                                size_t ByteCount, CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(
       cudaMemcpyAsync(reinterpret_cast<void *>(dst), reinterpret_cast<void *>(src), ByteCount, cudaMemcpyDefault, reinterpret_cast<cudaStream_t>(hStream)));
@@ -8798,6 +9001,7 @@ CUresult CUDAAPI cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src,
 CUresult CUDAAPI cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext,
                                    CUdeviceptr srcDevice, CUcontext srcContext,
                                    size_t ByteCount, CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   (void)dstContext;
   (void)srcContext;  // one simulated GPU per process
@@ -8809,6 +9013,7 @@ CUresult CUDAAPI cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext,
 #if CUDART_VERSION >= 3020
 CUresult CUDAAPI cuMemcpyHtoDAsync(CUdeviceptr dstDevice, const void *srcHost,
                                    size_t ByteCount, CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(
       cudaMemcpyAsync(reinterpret_cast<void *>(dstDevice), srcHost, ByteCount, cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(hStream)));
@@ -8816,6 +9021,7 @@ CUresult CUDAAPI cuMemcpyHtoDAsync(CUdeviceptr dstDevice, const void *srcHost,
 
 CUresult CUDAAPI cuMemcpyDtoHAsync(void *dstHost, CUdeviceptr srcDevice,
                                    size_t ByteCount, CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(
       cudaMemcpyAsync(dstHost, reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToHost, reinterpret_cast<cudaStream_t>(hStream)));
@@ -8823,6 +9029,7 @@ CUresult CUDAAPI cuMemcpyDtoHAsync(void *dstHost, CUdeviceptr srcDevice,
 
 CUresult CUDAAPI cuMemcpyDtoDAsync(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
                                    size_t ByteCount, CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemcpyAsync(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount,
                                           cudaMemcpyDeviceToDevice, reinterpret_cast<cudaStream_t>(hStream)));
@@ -8831,6 +9038,7 @@ CUresult CUDAAPI cuMemcpyDtoDAsync(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
 CUresult CUDAAPI cuMemcpyHtoAAsync(CUarray dstArray, size_t dstOffset,
                                    const void *srcHost, size_t ByteCount,
                                    CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8841,6 +9049,7 @@ CUresult CUDAAPI cuMemcpyHtoAAsync(CUarray dstArray, size_t dstOffset,
 CUresult CUDAAPI cuMemcpyAtoHAsync(void *dstHost, CUarray srcArray,
                                    size_t srcOffset, size_t ByteCount,
                                    CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8849,6 +9058,7 @@ CUresult CUDAAPI cuMemcpyAtoHAsync(void *dstHost, CUarray srcArray,
 }
 
 CUresult CUDAAPI cuMemcpy2DAsync(const CUDA_MEMCPY2D *pCopy, CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8857,6 +9067,7 @@ CUresult CUDAAPI cuMemcpy2DAsync(const CUDA_MEMCPY2D *pCopy, CUstream hStream) {
 }
 
 CUresult CUDAAPI cuMemcpy3DAsync(const CUDA_MEMCPY3D *pCopy, CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8868,6 +9079,7 @@ CUresult CUDAAPI cuMemcpy3DAsync(const CUDA_MEMCPY3D *pCopy, CUstream hStream) {
 #if CUDART_VERSION >= 4000
 CUresult CUDAAPI cuMemcpy3DPeerAsync(const CUDA_MEMCPY3D_PEER *pCopy,
                                      CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8878,23 +9090,27 @@ CUresult CUDAAPI cuMemcpy3DPeerAsync(const CUDA_MEMCPY3D_PEER *pCopy,
 
 #if CUDART_VERSION >= 3020
 CUresult CUDAAPI cuMemsetD8(CUdeviceptr dstDevice, unsigned char uc, size_t N) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemset(reinterpret_cast<void *>(dstDevice), int(uc), size_t(N)));
 }
 
 CUresult CUDAAPI cuMemsetD16(CUdeviceptr dstDevice, unsigned short us,
                              size_t N) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_memset_elems(uint64_t(dstDevice), us, 2, size_t(N), NULL, false);
 }
 
 CUresult CUDAAPI cuMemsetD32(CUdeviceptr dstDevice, unsigned int ui, size_t N) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_memset_elems(uint64_t(dstDevice), ui, 4, size_t(N), NULL, false);
 }
 
 CUresult CUDAAPI cuMemsetD2D8(CUdeviceptr dstDevice, size_t dstPitch,
                               unsigned char uc, size_t Width, size_t Height) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8904,6 +9120,7 @@ CUresult CUDAAPI cuMemsetD2D8(CUdeviceptr dstDevice, size_t dstPitch,
 
 CUresult CUDAAPI cuMemsetD2D16(CUdeviceptr dstDevice, size_t dstPitch,
                                unsigned short us, size_t Width, size_t Height) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8913,6 +9130,7 @@ CUresult CUDAAPI cuMemsetD2D16(CUdeviceptr dstDevice, size_t dstPitch,
 
 CUresult CUDAAPI cuMemsetD2D32(CUdeviceptr dstDevice, size_t dstPitch,
                                unsigned int ui, size_t Width, size_t Height) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8922,18 +9140,21 @@ CUresult CUDAAPI cuMemsetD2D32(CUdeviceptr dstDevice, size_t dstPitch,
 
 CUresult CUDAAPI cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc,
                                  size_t N, CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemsetAsync(reinterpret_cast<void *>(dstDevice), int(uc), size_t(N), reinterpret_cast<cudaStream_t>(hStream)));
 }
 
 CUresult CUDAAPI cuMemsetD16Async(CUdeviceptr dstDevice, unsigned short us,
                                   size_t N, CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_memset_elems(uint64_t(dstDevice), us, 2, size_t(N), reinterpret_cast<cudaStream_t>(hStream), true);
 }
 
 CUresult CUDAAPI cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int ui,
                                   size_t N, CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_memset_elems(uint64_t(dstDevice), ui, 4, size_t(N), reinterpret_cast<cudaStream_t>(hStream), true);
 }
@@ -8941,6 +9162,7 @@ CUresult CUDAAPI cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int ui,
 CUresult CUDAAPI cuMemsetD2D8Async(CUdeviceptr dstDevice, size_t dstPitch,
                                    unsigned char uc, size_t Width,
                                    size_t Height, CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8951,6 +9173,7 @@ CUresult CUDAAPI cuMemsetD2D8Async(CUdeviceptr dstDevice, size_t dstPitch,
 CUresult CUDAAPI cuMemsetD2D16Async(CUdeviceptr dstDevice, size_t dstPitch,
                                     unsigned short us, size_t Width,
                                     size_t Height, CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8961,6 +9184,7 @@ CUresult CUDAAPI cuMemsetD2D16Async(CUdeviceptr dstDevice, size_t dstPitch,
 CUresult CUDAAPI cuMemsetD2D32Async(CUdeviceptr dstDevice, size_t dstPitch,
                                     unsigned int ui, size_t Width,
                                     size_t Height, CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8970,6 +9194,7 @@ CUresult CUDAAPI cuMemsetD2D32Async(CUdeviceptr dstDevice, size_t dstPitch,
 
 CUresult CUDAAPI cuArrayCreate(CUarray *pHandle,
                                const CUDA_ARRAY_DESCRIPTOR *pAllocateArray) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8979,6 +9204,7 @@ CUresult CUDAAPI cuArrayCreate(CUarray *pHandle,
 
 CUresult CUDAAPI cuArrayGetDescriptor(CUDA_ARRAY_DESCRIPTOR *pArrayDescriptor,
                                       CUarray hArray) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8988,6 +9214,7 @@ CUresult CUDAAPI cuArrayGetDescriptor(CUDA_ARRAY_DESCRIPTOR *pArrayDescriptor,
 #endif /* CUDART_VERSION >= 3020 */
 
 CUresult CUDAAPI cuArrayDestroy(CUarray hArray) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -8998,6 +9225,7 @@ CUresult CUDAAPI cuArrayDestroy(CUarray hArray) {
 #if CUDART_VERSION >= 3020
 CUresult CUDAAPI cuArray3DCreate(
     CUarray *pHandle, const CUDA_ARRAY3D_DESCRIPTOR *pAllocateArray) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9007,6 +9235,7 @@ CUresult CUDAAPI cuArray3DCreate(
 
 CUresult CUDAAPI cuArray3DGetDescriptor(
     CUDA_ARRAY3D_DESCRIPTOR *pArrayDescriptor, CUarray hArray) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9021,6 +9250,7 @@ CUresult CUDAAPI
 cuMipmappedArrayCreate(CUmipmappedArray *pHandle,
                        const CUDA_ARRAY3D_DESCRIPTOR *pMipmappedArrayDesc,
                        unsigned int numMipmapLevels) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9031,6 +9261,7 @@ cuMipmappedArrayCreate(CUmipmappedArray *pHandle,
 CUresult CUDAAPI cuMipmappedArrayGetLevel(CUarray *pLevelArray,
                                           CUmipmappedArray hMipmappedArray,
                                           unsigned int level) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9039,6 +9270,7 @@ CUresult CUDAAPI cuMipmappedArrayGetLevel(CUarray *pLevelArray,
 }
 
 CUresult CUDAAPI cuMipmappedArrayDestroy(CUmipmappedArray hMipmappedArray) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9054,6 +9286,7 @@ CUresult CUDAAPI cuMipmappedArrayDestroy(CUmipmappedArray hMipmappedArray) {
 CUresult CUDAAPI cuPointerGetAttribute(void *data,
                                        CUpointer_attribute attribute,
                                        CUdeviceptr ptr) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9067,6 +9300,7 @@ CUresult CUDAAPI cuPointerGetAttribute(void *data,
 __host__ cudaError_t CUDARTAPI cudaCreateTextureObject(
     cudaTextureObject_t *pTexObject, const cudaResourceDesc *pResDesc,
     const cudaTextureDesc *pTexDesc, const cudaResourceViewDesc *pResViewDesc) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9076,6 +9310,7 @@ __host__ cudaError_t CUDARTAPI cudaCreateTextureObject(
 
 CUresult CUDAAPI cuMemPrefetchAsync(CUdeviceptr devPtr, size_t count,
                                     CUdevice dstDevice, CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9085,6 +9320,7 @@ CUresult CUDAAPI cuMemPrefetchAsync(CUdeviceptr devPtr, size_t count,
 
 CUresult CUDAAPI cuMemAdvise(CUdeviceptr devPtr, size_t count,
                              CUmem_advise advice, CUdevice device) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9095,6 +9331,7 @@ CUresult CUDAAPI cuMemAdvise(CUdeviceptr devPtr, size_t count,
 CUresult CUDAAPI cuMemRangeGetAttribute(void *data, size_t dataSize,
                                         CUmem_range_attribute attribute,
                                         CUdeviceptr devPtr, size_t count) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9106,6 +9343,7 @@ CUresult CUDAAPI cuMemRangeGetAttributes(void **data, size_t *dataSizes,
                                          CUmem_range_attribute *attributes,
                                          size_t numAttributes,
                                          CUdeviceptr devPtr, size_t count) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9118,6 +9356,7 @@ CUresult CUDAAPI cuMemRangeGetAttributes(void **data, size_t *dataSizes,
 CUresult CUDAAPI cuPointerSetAttribute(const void *value,
                                        CUpointer_attribute attribute,
                                        CUdeviceptr ptr) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9137,6 +9376,7 @@ CUresult CUDAAPI cuPointerSetAttribute(const void *value,
 CUresult CUDAAPI cuPointerGetAttributes(unsigned int numAttributes,
                                         CUpointer_attribute *attributes,
                                         void **data, CUdeviceptr ptr) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9152,18 +9392,21 @@ CUresult CUDAAPI cuPointerGetAttributes(unsigned int numAttributes,
 /** @} */ /* END CUDA_UNIFIED */
 
 CUresult CUDAAPI cuStreamCreate(CUstream *phStream, unsigned int Flags) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaStreamCreateWithFlags(reinterpret_cast<cudaStream_t *>(phStream), Flags));
 }
 
 CUresult CUDAAPI cuStreamCreateWithPriority(CUstream *phStream,
                                             unsigned int flags, int priority) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(
       cudaStreamCreateWithPriority(reinterpret_cast<cudaStream_t *>(phStream), flags, priority));
 }
 
 CUresult CUDAAPI cuStreamGetPriority(CUstream hStream, int *priority) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   if (priority == NULL) return CUDA_ERROR_INVALID_VALUE;
   *priority = 0;  // priorities are not modelled
@@ -9171,6 +9414,7 @@ CUresult CUDAAPI cuStreamGetPriority(CUstream hStream, int *priority) {
 }
 
 CUresult CUDAAPI cuStreamGetFlags(CUstream hStream, unsigned int *flags) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   if (flags == NULL) return CUDA_ERROR_INVALID_VALUE;
   CUstream_st *s = yasai_stream_manager(GPGPU_Context())->yasai_resolve(reinterpret_cast<CUstream_st *>(hStream));
@@ -9180,6 +9424,7 @@ CUresult CUDAAPI cuStreamGetFlags(CUstream hStream, unsigned int *flags) {
 
 CUresult CUDAAPI cuStreamWaitEvent(CUstream hStream, CUevent hEvent,
                                    unsigned int Flags) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(
       cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(hStream), reinterpret_cast<cudaEvent_t>(hEvent), Flags));
@@ -9188,6 +9433,7 @@ CUresult CUDAAPI cuStreamWaitEvent(CUstream hStream, CUevent hEvent,
 CUresult CUDAAPI cuStreamAddCallback(CUstream hStream,
                                      CUstreamCallback callback, void *userData,
                                      unsigned int flags) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   // The callback runs in stream order on the host-callback thread, with CUDA_SUCCESS.
   (void)flags;
@@ -9208,6 +9454,7 @@ CUresult CUDAAPI cuStreamAddCallback(CUstream hStream,
 
 CUresult CUDAAPI cuStreamAttachMemAsync(CUstream hStream, CUdeviceptr dptr,
                                         size_t length, unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9218,17 +9465,20 @@ CUresult CUDAAPI cuStreamAttachMemAsync(CUstream hStream, CUdeviceptr dptr,
 #endif /* CUDART_VERSION >= 6000 */
 
 CUresult CUDAAPI cuStreamQuery(CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaStreamQuery(reinterpret_cast<cudaStream_t>(hStream)));
 }
 
 CUresult CUDAAPI cuStreamSynchronize(CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(hStream)));
 }
 
 #if CUDART_VERSION >= 4000
 CUresult CUDAAPI cuStreamDestroy(CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaStreamDestroy(reinterpret_cast<cudaStream_t>(hStream)));
 }
@@ -9237,27 +9487,32 @@ CUresult CUDAAPI cuStreamDestroy(CUstream hStream) {
 /** @} */ /* END CUDA_STREAM */
 
 CUresult CUDAAPI cuEventCreate(CUevent *phEvent, unsigned int Flags) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaEventCreateWithFlags(reinterpret_cast<cudaEvent_t *>(phEvent), Flags));
 }
 
 CUresult CUDAAPI cuEventRecord(CUevent hEvent, CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaEventRecord(reinterpret_cast<cudaEvent_t>(hEvent), reinterpret_cast<cudaStream_t>(hStream)));
 }
 
 CUresult CUDAAPI cuEventQuery(CUevent hEvent) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaEventQuery(reinterpret_cast<cudaEvent_t>(hEvent)));
 }
 
 CUresult CUDAAPI cuEventSynchronize(CUevent hEvent) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(hEvent)));
 }
 
 #if CUDART_VERSION >= 4000
 CUresult CUDAAPI cuEventDestroy(CUevent hEvent) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaEventDestroy(reinterpret_cast<cudaEvent_t>(hEvent)));
 }
@@ -9265,6 +9520,7 @@ CUresult CUDAAPI cuEventDestroy(CUevent hEvent) {
 
 CUresult CUDAAPI cuEventElapsedTime(float *pMilliseconds, CUevent hStart,
                                     CUevent hEnd) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaEventElapsedTime(pMilliseconds, reinterpret_cast<cudaEvent_t>(hStart),
                                                reinterpret_cast<cudaEvent_t>(hEnd)));
@@ -9273,6 +9529,7 @@ CUresult CUDAAPI cuEventElapsedTime(float *pMilliseconds, CUevent hStart,
 #if CUDART_VERSION >= 8000
 CUresult CUDAAPI cuStreamWaitValue32(CUstream stream, CUdeviceptr addr,
                                      cuuint32_t value, unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9282,6 +9539,7 @@ CUresult CUDAAPI cuStreamWaitValue32(CUstream stream, CUdeviceptr addr,
 
 CUresult CUDAAPI cuStreamWriteValue32(CUstream stream, CUdeviceptr addr,
                                       cuuint32_t value, unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9292,6 +9550,7 @@ CUresult CUDAAPI cuStreamWriteValue32(CUstream stream, CUdeviceptr addr,
 CUresult CUDAAPI cuStreamBatchMemOp(CUstream stream, unsigned int count,
                                     CUstreamBatchMemOpParams *paramArray,
                                     unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9309,6 +9568,7 @@ CUresult CUDAAPI cuStreamBatchMemOp(CUstream stream, unsigned int count,
 //   pi: receives the value; attrib: attribute; hfunc: function
 CUresult CUDAAPI cuFuncGetAttribute(int *pi, CUfunction_attribute attrib,
                                     CUfunction hfunc) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9354,6 +9614,7 @@ CUresult CUDAAPI cuFuncGetAttribute(int *pi, CUfunction_attribute attrib,
 
 CUresult CUDAAPI cuKernelGetAttribute(int *pi, CUfunction_attribute attrib,
                                       CUkernel kernel, CUdevice dev) {
+  YASAI_FAULT_CU();
   (void)dev;
   return cuFuncGetAttribute(pi, attrib, (CUfunction)kernel);
 }
@@ -9365,6 +9626,7 @@ extern "C" CUresult CUDAAPI _cuKernelGetAttribute(
 
 CUresult CUDAAPI cuFuncSetAttribute(CUfunction hfunc,
                                     CUfunction_attribute attrib, int value) {
+  YASAI_FAULT_CU();
 
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
@@ -9426,6 +9688,7 @@ CUresult CUDAAPI cuFuncSetAttribute(CUfunction hfunc,
 }
 
 CUresult CUDAAPI cuFuncSetCacheConfig(CUfunction hfunc, CUfunc_cache config) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9436,6 +9699,7 @@ CUresult CUDAAPI cuFuncSetCacheConfig(CUfunction hfunc, CUfunc_cache config) {
 #if CUDART_VERSION >= 4020
 CUresult CUDAAPI cuFuncSetSharedMemConfig(CUfunction hfunc,
                                           CUsharedconfig config) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9451,6 +9715,7 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX,
                                 unsigned int blockDimZ,
                                 unsigned int sharedMemBytes, CUstream hStream,
                                 void **kernelParams, void **extra) {
+  YASAI_FAULT_CU();
   return cuLaunchKernelInternal(f, gridDimX, gridDimY, gridDimZ, blockDimX,
                                 blockDimY, blockDimZ, sharedMemBytes, hStream,
                                 kernelParams, extra);
@@ -9460,6 +9725,7 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX,
 /** @} */ /* END CUDA_EXEC */
 
 CUresult CUDAAPI cuFuncSetBlockShape(CUfunction hfunc, int x, int y, int z) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9468,6 +9734,7 @@ CUresult CUDAAPI cuFuncSetBlockShape(CUfunction hfunc, int x, int y, int z) {
 }
 
 CUresult CUDAAPI cuFuncSetSharedSize(CUfunction hfunc, unsigned int bytes) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9476,6 +9743,7 @@ CUresult CUDAAPI cuFuncSetSharedSize(CUfunction hfunc, unsigned int bytes) {
 }
 
 CUresult CUDAAPI cuParamSetSize(CUfunction hfunc, unsigned int numbytes) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9484,6 +9752,7 @@ CUresult CUDAAPI cuParamSetSize(CUfunction hfunc, unsigned int numbytes) {
 }
 
 CUresult CUDAAPI cuParamSeti(CUfunction hfunc, int offset, unsigned int value) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9492,6 +9761,7 @@ CUresult CUDAAPI cuParamSeti(CUfunction hfunc, int offset, unsigned int value) {
 }
 
 CUresult CUDAAPI cuParamSetf(CUfunction hfunc, int offset, float value) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9501,6 +9771,7 @@ CUresult CUDAAPI cuParamSetf(CUfunction hfunc, int offset, float value) {
 
 CUresult CUDAAPI cuParamSetv(CUfunction hfunc, int offset, void *ptr,
                              unsigned int numbytes) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9509,6 +9780,7 @@ CUresult CUDAAPI cuParamSetv(CUfunction hfunc, int offset, void *ptr,
 }
 
 CUresult CUDAAPI cuLaunch(CUfunction f) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9517,6 +9789,7 @@ CUresult CUDAAPI cuLaunch(CUfunction f) {
 }
 
 CUresult CUDAAPI cuLaunchGrid(CUfunction f, int grid_width, int grid_height) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9526,6 +9799,7 @@ CUresult CUDAAPI cuLaunchGrid(CUfunction f, int grid_width, int grid_height) {
 
 CUresult CUDAAPI cuLaunchGridAsync(CUfunction f, int grid_width,
                                    int grid_height, CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9535,6 +9809,7 @@ CUresult CUDAAPI cuLaunchGridAsync(CUfunction f, int grid_width,
 
 CUresult CUDAAPI cuParamSetTexRef(CUfunction hfunc, int texunit,
                                   CUtexref hTexRef) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9555,6 +9830,7 @@ CUresult CUDAAPI cuParamSetTexRef(CUfunction hfunc, int texunit,
 CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
     int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize,
     unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9582,6 +9858,7 @@ CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
 extern "C" CUresult CUDAAPI cuOccupancyAvailableDynamicSMemPerBlock(size_t *dynamicSmemSize,
                                                                     CUfunction func, int numBlocks,
                                                                     int blockSize) {
+  YASAI_FAULT_CU();
   if (dynamicSmemSize == NULL || func == NULL || numBlocks <= 0 || blockSize <= 0)
     return CUDA_ERROR_INVALID_VALUE;
   function_info *entry = reinterpret_cast<function_info *>(func);
@@ -9598,6 +9875,7 @@ extern "C" CUresult CUDAAPI cuOccupancyAvailableDynamicSMemPerBlock(size_t *dyna
 //   dynamicSmemSize, numBlocks, blockSize: as there; func: host function of the kernel
 extern "C" cudaError_t CUDARTAPI cudaOccupancyAvailableDynamicSMemPerBlock(
     size_t *dynamicSmemSize, const void *func, int numBlocks, int blockSize) {
+  YASAI_FAULT_RT();
   function_info *entry = GPGPUSim_Context(GPGPU_Context())->get_kernel((const char *)func);
   if (entry == NULL) return g_last_cudaError = cudaErrorInvalidDeviceFunction;
   return g_last_cudaError = cuOccupancyAvailableDynamicSMemPerBlock(
@@ -9611,6 +9889,7 @@ extern "C" cudaError_t CUDARTAPI cudaOccupancyAvailableDynamicSMemPerBlock(
 //   numBlocks, func, blockSize, dynamicSMemSize: as there
 CUresult CUDAAPI cuOccupancyMaxActiveBlocksPerMultiprocessor(
     int *numBlocks, CUfunction func, int blockSize, size_t dynamicSMemSize) {
+  YASAI_FAULT_CU();
   return cuOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(numBlocks, func, blockSize,
                                                               dynamicSMemSize, 0);
 }
@@ -9619,6 +9898,7 @@ CUresult CUDAAPI cuOccupancyMaxPotentialBlockSize(
     int *minGridSize, int *blockSize, CUfunction func,
     CUoccupancyB2DSize blockSizeToDynamicSMemSize, size_t dynamicSMemSize,
     int blockSizeLimit) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9630,6 +9910,7 @@ CUresult CUDAAPI cuOccupancyMaxPotentialBlockSizeWithFlags(
     int *minGridSize, int *blockSize, CUfunction func,
     CUoccupancyB2DSize blockSizeToDynamicSMemSize, size_t dynamicSMemSize,
     int blockSizeLimit, unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9642,6 +9923,7 @@ CUresult CUDAAPI cuOccupancyMaxPotentialBlockSizeWithFlags(
 
 CUresult CUDAAPI cuTexRefSetArray(CUtexref hTexRef, CUarray hArray,
                                   unsigned int Flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9652,6 +9934,7 @@ CUresult CUDAAPI cuTexRefSetArray(CUtexref hTexRef, CUarray hArray,
 CUresult CUDAAPI cuTexRefSetMipmappedArray(CUtexref hTexRef,
                                            CUmipmappedArray hMipmappedArray,
                                            unsigned int Flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9662,6 +9945,7 @@ CUresult CUDAAPI cuTexRefSetMipmappedArray(CUtexref hTexRef,
 #if CUDART_VERSION >= 3020
 CUresult CUDAAPI cuTexRefSetAddress(size_t *ByteOffset, CUtexref hTexRef,
                                     CUdeviceptr dptr, size_t bytes) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9672,6 +9956,7 @@ CUresult CUDAAPI cuTexRefSetAddress(size_t *ByteOffset, CUtexref hTexRef,
 CUresult CUDAAPI cuTexRefSetAddress2D(CUtexref hTexRef,
                                       const CUDA_ARRAY_DESCRIPTOR *desc,
                                       CUdeviceptr dptr, size_t Pitch) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9682,6 +9967,7 @@ CUresult CUDAAPI cuTexRefSetAddress2D(CUtexref hTexRef,
 
 CUresult CUDAAPI cuTexRefSetFormat(CUtexref hTexRef, CUarray_format fmt,
                                    int NumPackedComponents) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9691,6 +9977,7 @@ CUresult CUDAAPI cuTexRefSetFormat(CUtexref hTexRef, CUarray_format fmt,
 
 CUresult CUDAAPI cuTexRefSetAddressMode(CUtexref hTexRef, int dim,
                                         CUaddress_mode am) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9699,6 +9986,7 @@ CUresult CUDAAPI cuTexRefSetAddressMode(CUtexref hTexRef, int dim,
 }
 
 CUresult CUDAAPI cuTexRefSetFilterMode(CUtexref hTexRef, CUfilter_mode fm) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9708,6 +9996,7 @@ CUresult CUDAAPI cuTexRefSetFilterMode(CUtexref hTexRef, CUfilter_mode fm) {
 
 CUresult CUDAAPI cuTexRefSetMipmapFilterMode(CUtexref hTexRef,
                                              CUfilter_mode fm) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9716,6 +10005,7 @@ CUresult CUDAAPI cuTexRefSetMipmapFilterMode(CUtexref hTexRef,
 }
 
 CUresult CUDAAPI cuTexRefSetMipmapLevelBias(CUtexref hTexRef, float bias) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9726,6 +10016,7 @@ CUresult CUDAAPI cuTexRefSetMipmapLevelBias(CUtexref hTexRef, float bias) {
 CUresult CUDAAPI cuTexRefSetMipmapLevelClamp(CUtexref hTexRef,
                                              float minMipmapLevelClamp,
                                              float maxMipmapLevelClamp) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9735,6 +10026,7 @@ CUresult CUDAAPI cuTexRefSetMipmapLevelClamp(CUtexref hTexRef,
 
 CUresult CUDAAPI cuTexRefSetMaxAnisotropy(CUtexref hTexRef,
                                           unsigned int maxAniso) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9743,6 +10035,7 @@ CUresult CUDAAPI cuTexRefSetMaxAnisotropy(CUtexref hTexRef,
 }
 
 CUresult CUDAAPI cuTexRefSetBorderColor(CUtexref hTexRef, float *pBorderColor) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9751,6 +10044,7 @@ CUresult CUDAAPI cuTexRefSetBorderColor(CUtexref hTexRef, float *pBorderColor) {
 }
 
 CUresult CUDAAPI cuTexRefSetFlags(CUtexref hTexRef, unsigned int Flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9760,6 +10054,7 @@ CUresult CUDAAPI cuTexRefSetFlags(CUtexref hTexRef, unsigned int Flags) {
 
 #if CUDART_VERSION >= 3020
 CUresult CUDAAPI cuTexRefGetAddress(CUdeviceptr *pdptr, CUtexref hTexRef) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9769,6 +10064,7 @@ CUresult CUDAAPI cuTexRefGetAddress(CUdeviceptr *pdptr, CUtexref hTexRef) {
 #endif /* CUDART_VERSION >= 3020 */
 
 CUresult CUDAAPI cuTexRefGetArray(CUarray *phArray, CUtexref hTexRef) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9778,6 +10074,7 @@ CUresult CUDAAPI cuTexRefGetArray(CUarray *phArray, CUtexref hTexRef) {
 
 CUresult CUDAAPI cuTexRefGetMipmappedArray(CUmipmappedArray *phMipmappedArray,
                                            CUtexref hTexRef) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9787,6 +10084,7 @@ CUresult CUDAAPI cuTexRefGetMipmappedArray(CUmipmappedArray *phMipmappedArray,
 
 CUresult CUDAAPI cuTexRefGetAddressMode(CUaddress_mode *pam, CUtexref hTexRef,
                                         int dim) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9795,6 +10093,7 @@ CUresult CUDAAPI cuTexRefGetAddressMode(CUaddress_mode *pam, CUtexref hTexRef,
 }
 
 CUresult CUDAAPI cuTexRefGetFilterMode(CUfilter_mode *pfm, CUtexref hTexRef) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9804,6 +10103,7 @@ CUresult CUDAAPI cuTexRefGetFilterMode(CUfilter_mode *pfm, CUtexref hTexRef) {
 
 CUresult CUDAAPI cuTexRefGetFormat(CUarray_format *pFormat, int *pNumChannels,
                                    CUtexref hTexRef) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9813,6 +10113,7 @@ CUresult CUDAAPI cuTexRefGetFormat(CUarray_format *pFormat, int *pNumChannels,
 
 CUresult CUDAAPI cuTexRefGetMipmapFilterMode(CUfilter_mode *pfm,
                                              CUtexref hTexRef) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9821,6 +10122,7 @@ CUresult CUDAAPI cuTexRefGetMipmapFilterMode(CUfilter_mode *pfm,
 }
 
 CUresult CUDAAPI cuTexRefGetMipmapLevelBias(float *pbias, CUtexref hTexRef) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9831,6 +10133,7 @@ CUresult CUDAAPI cuTexRefGetMipmapLevelBias(float *pbias, CUtexref hTexRef) {
 CUresult CUDAAPI cuTexRefGetMipmapLevelClamp(float *pminMipmapLevelClamp,
                                              float *pmaxMipmapLevelClamp,
                                              CUtexref hTexRef) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9839,6 +10142,7 @@ CUresult CUDAAPI cuTexRefGetMipmapLevelClamp(float *pminMipmapLevelClamp,
 }
 
 CUresult CUDAAPI cuTexRefGetMaxAnisotropy(int *pmaxAniso, CUtexref hTexRef) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9847,6 +10151,7 @@ CUresult CUDAAPI cuTexRefGetMaxAnisotropy(int *pmaxAniso, CUtexref hTexRef) {
 }
 
 CUresult CUDAAPI cuTexRefGetBorderColor(float *pBorderColor, CUtexref hTexRef) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9855,6 +10160,7 @@ CUresult CUDAAPI cuTexRefGetBorderColor(float *pBorderColor, CUtexref hTexRef) {
 }
 
 CUresult CUDAAPI cuTexRefGetFlags(unsigned int *pFlags, CUtexref hTexRef) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9863,6 +10169,7 @@ CUresult CUDAAPI cuTexRefGetFlags(unsigned int *pFlags, CUtexref hTexRef) {
 }
 
 CUresult CUDAAPI cuTexRefCreate(CUtexref *pTexRef) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9871,6 +10178,7 @@ CUresult CUDAAPI cuTexRefCreate(CUtexref *pTexRef) {
 }
 
 CUresult CUDAAPI cuTexRefDestroy(CUtexref hTexRef) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9880,6 +10188,7 @@ CUresult CUDAAPI cuTexRefDestroy(CUtexref hTexRef) {
 
 CUresult CUDAAPI cuSurfRefSetArray(CUsurfref hSurfRef, CUarray hArray,
                                    unsigned int Flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9888,6 +10197,7 @@ CUresult CUDAAPI cuSurfRefSetArray(CUsurfref hSurfRef, CUarray hArray,
 }
 
 CUresult CUDAAPI cuSurfRefGetArray(CUarray *phArray, CUsurfref hSurfRef) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9902,6 +10212,7 @@ CUresult CUDAAPI
 cuTexObjectCreate(CUtexObject *pTexObject, const CUDA_RESOURCE_DESC *pResDesc,
                   const CUDA_TEXTURE_DESC *pTexDesc,
                   const CUDA_RESOURCE_VIEW_DESC *pResViewDesc) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9910,6 +10221,7 @@ cuTexObjectCreate(CUtexObject *pTexObject, const CUDA_RESOURCE_DESC *pResDesc,
 }
 
 CUresult CUDAAPI cuTexObjectDestroy(CUtexObject texObject) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9919,6 +10231,7 @@ CUresult CUDAAPI cuTexObjectDestroy(CUtexObject texObject) {
 
 CUresult CUDAAPI cuTexObjectGetResourceDesc(CUDA_RESOURCE_DESC *pResDesc,
                                             CUtexObject texObject) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9928,6 +10241,7 @@ CUresult CUDAAPI cuTexObjectGetResourceDesc(CUDA_RESOURCE_DESC *pResDesc,
 
 CUresult CUDAAPI cuTexObjectGetTextureDesc(CUDA_TEXTURE_DESC *pTexDesc,
                                            CUtexObject texObject) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9937,6 +10251,7 @@ CUresult CUDAAPI cuTexObjectGetTextureDesc(CUDA_TEXTURE_DESC *pTexDesc,
 
 CUresult CUDAAPI cuTexObjectGetResourceViewDesc(
     CUDA_RESOURCE_VIEW_DESC *pResViewDesc, CUtexObject texObject) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9948,6 +10263,7 @@ CUresult CUDAAPI cuTexObjectGetResourceViewDesc(
 
 CUresult CUDAAPI cuSurfObjectCreate(CUsurfObject *pSurfObject,
                                     const CUDA_RESOURCE_DESC *pResDesc) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9956,6 +10272,7 @@ CUresult CUDAAPI cuSurfObjectCreate(CUsurfObject *pSurfObject,
 }
 
 CUresult CUDAAPI cuSurfObjectDestroy(CUsurfObject surfObject) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9965,6 +10282,7 @@ CUresult CUDAAPI cuSurfObjectDestroy(CUsurfObject surfObject) {
 
 CUresult CUDAAPI cuSurfObjectGetResourceDesc(CUDA_RESOURCE_DESC *pResDesc,
                                              CUsurfObject surfObject) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -9978,6 +10296,7 @@ CUresult CUDAAPI cuSurfObjectGetResourceDesc(CUDA_RESOURCE_DESC *pResDesc,
 // yasai: the driver form of cudaDeviceCanAccessPeer.
 CUresult CUDAAPI cuDeviceCanAccessPeer(int *canAccessPeer, CUdevice dev,
                                        CUdevice peerDev) {
+  YASAI_FAULT_CU();
   return cudaDeviceCanAccessPeer(canAccessPeer, int(dev), int(peerDev)) == cudaSuccess
              ? CUDA_SUCCESS
              : CUDA_ERROR_INVALID_VALUE;
@@ -9991,6 +10310,7 @@ CUresult CUDAAPI cuDeviceGetP2PAttribute(int *value,
                                          CUdevice_P2PAttribute attrib,
                                          CUdevice srcDevice,
                                          CUdevice dstDevice) {
+  YASAI_FAULT_CU();
   if (value == NULL) return CUDA_ERROR_INVALID_VALUE;
   int access = 0;
   cudaDeviceCanAccessPeer(&access, int(srcDevice), int(dstDevice));
@@ -10014,6 +10334,7 @@ CUresult CUDAAPI cuDeviceGetP2PAttribute(int *value,
 extern "C" __host__ cudaError_t CUDARTAPI cudaDeviceGetP2PAttribute(int *value,
                                                                    enum cudaDeviceP2PAttr attr,
                                                                    int srcDevice, int dstDevice) {
+  YASAI_FAULT_RT();
   return cuDeviceGetP2PAttribute(value, (CUdevice_P2PAttribute)attr, srcDevice, dstDevice) ==
                  CUDA_SUCCESS
              ? (g_last_cudaError = cudaSuccess)
@@ -10022,6 +10343,7 @@ extern "C" __host__ cudaError_t CUDARTAPI cudaDeviceGetP2PAttribute(int *value,
 
 CUresult CUDAAPI cuCtxEnablePeerAccess(CUcontext peerContext,
                                        unsigned int Flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10030,6 +10352,7 @@ CUresult CUDAAPI cuCtxEnablePeerAccess(CUcontext peerContext,
 }
 
 CUresult CUDAAPI cuCtxDisablePeerAccess(CUcontext peerContext) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10041,6 +10364,7 @@ CUresult CUDAAPI cuCtxDisablePeerAccess(CUcontext peerContext) {
 #endif    /* CUDART_VERSION >= 4000 */
 
 CUresult CUDAAPI cuGraphicsUnregisterResource(CUgraphicsResource resource) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10051,6 +10375,7 @@ CUresult CUDAAPI cuGraphicsUnregisterResource(CUgraphicsResource resource) {
 CUresult CUDAAPI cuGraphicsSubResourceGetMappedArray(
     CUarray *pArray, CUgraphicsResource resource, unsigned int arrayIndex,
     unsigned int mipLevel) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10062,6 +10387,7 @@ CUresult CUDAAPI cuGraphicsSubResourceGetMappedArray(
 
 CUresult CUDAAPI cuGraphicsResourceGetMappedMipmappedArray(
     CUmipmappedArray *pMipmappedArray, CUgraphicsResource resource) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10074,6 +10400,7 @@ CUresult CUDAAPI cuGraphicsResourceGetMappedMipmappedArray(
 #if CUDART_VERSION >= 3020
 CUresult CUDAAPI cuGraphicsResourceGetMappedPointer(
     CUdeviceptr *pDevPtr, size_t *pSize, CUgraphicsResource resource) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10084,6 +10411,7 @@ CUresult CUDAAPI cuGraphicsResourceGetMappedPointer(
 
 CUresult CUDAAPI cuGraphicsResourceSetMapFlags(CUgraphicsResource resource,
                                                unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10094,6 +10422,7 @@ CUresult CUDAAPI cuGraphicsResourceSetMapFlags(CUgraphicsResource resource,
 CUresult CUDAAPI cuGraphicsMapResources(unsigned int count,
                                         CUgraphicsResource *resources,
                                         CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10104,6 +10433,7 @@ CUresult CUDAAPI cuGraphicsMapResources(unsigned int count,
 CUresult CUDAAPI cuGraphicsUnmapResources(unsigned int count,
                                           CUgraphicsResource *resources,
                                           CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10126,6 +10456,7 @@ CUresult CUDAAPI cuGetExportTable(const void **ppExportTable,
     (CUDART_VERSION >= 4000 && CUDART_VERSION < 6050)
 CUresult CUDAAPI cuMemHostRegister(void *p, size_t bytesize,
                                    unsigned int Flags) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaHostRegister(p, bytesize, Flags));
 }
@@ -10136,6 +10467,7 @@ CUresult CUDAAPI cuMemHostRegister(void *p, size_t bytesize,
     (CUDART_VERSION >= 5050 && CUDART_VERSION < 6050)
 CUresult CUDAAPI cuLinkCreate(unsigned int numOptions, CUjit_option *options,
                               void **optionValues, CUlinkState *stateOut) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10146,6 +10478,7 @@ CUresult CUDAAPI cuLinkAddData(CUlinkState state, CUjitInputType type,
                                void *data, size_t size, const char *name,
                                unsigned int numOptions, CUjit_option *options,
                                void **optionValues) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10155,6 +10488,7 @@ CUresult CUDAAPI cuLinkAddData(CUlinkState state, CUjitInputType type,
 CUresult CUDAAPI cuLinkAddFile(CUlinkState state, CUjitInputType type,
                                const char *path, unsigned int numOptions,
                                CUjit_option *options, void **optionValues) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10169,6 +10503,7 @@ CUresult CUDAAPI cuLinkAddFile(CUlinkState state, CUjitInputType type,
 CUresult CUDAAPI cuTexRefSetAddress2D_v2(CUtexref hTexRef,
                                          const CUDA_ARRAY_DESCRIPTOR *desc,
                                          CUdeviceptr dptr, size_t Pitch) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10180,6 +10515,7 @@ CUresult CUDAAPI cuTexRefSetAddress2D_v2(CUtexref hTexRef,
 
 #if defined(CUDART_VERSION_INTERNAL) || CUDART_VERSION < 4000
 CUresult CUDAAPI cuCtxDestroy(CUcontext ctx) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10207,10 +10543,12 @@ CUresult CUDAAPI cuCtxPushCurrent(CUcontext ctx) {
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuStreamDestroy(CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaStreamDestroy(reinterpret_cast<cudaStream_t>(hStream)));
 }
 CUresult CUDAAPI cuEventDestroy(CUevent hEvent) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaEventDestroy(reinterpret_cast<cudaEvent_t>(hEvent)));
 }
@@ -10219,22 +10557,26 @@ CUresult CUDAAPI cuEventDestroy(CUevent hEvent) {
 #if defined(CUDART_VERSION_INTERNAL)
 CUresult CUDAAPI cuMemcpyHtoD_v2(CUdeviceptr dstDevice, const void *srcHost,
                                  size_t ByteCount) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemcpy(reinterpret_cast<void *>(dstDevice), srcHost, ByteCount, cudaMemcpyHostToDevice));
 }
 CUresult CUDAAPI cuMemcpyDtoH_v2(void *dstHost, CUdeviceptr srcDevice,
                                  size_t ByteCount) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemcpy(dstHost, reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToHost));
 }
 CUresult CUDAAPI cuMemcpyDtoD_v2(CUdeviceptr dstDevice, CUdeviceptr srcDevice,
                                  size_t ByteCount) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(
       cudaMemcpy(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToDevice));
 }
 CUresult CUDAAPI cuMemcpyDtoA_v2(CUarray dstArray, size_t dstOffset,
                                  CUdeviceptr srcDevice, size_t ByteCount) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10243,6 +10585,7 @@ CUresult CUDAAPI cuMemcpyDtoA_v2(CUarray dstArray, size_t dstOffset,
 }
 CUresult CUDAAPI cuMemcpyAtoD_v2(CUdeviceptr dstDevice, CUarray srcArray,
                                  size_t srcOffset, size_t ByteCount) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10251,6 +10594,7 @@ CUresult CUDAAPI cuMemcpyAtoD_v2(CUdeviceptr dstDevice, CUarray srcArray,
 }
 CUresult CUDAAPI cuMemcpyHtoA_v2(CUarray dstArray, size_t dstOffset,
                                  const void *srcHost, size_t ByteCount) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10259,6 +10603,7 @@ CUresult CUDAAPI cuMemcpyHtoA_v2(CUarray dstArray, size_t dstOffset,
 }
 CUresult CUDAAPI cuMemcpyAtoH_v2(void *dstHost, CUarray srcArray,
                                  size_t srcOffset, size_t ByteCount) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10268,6 +10613,7 @@ CUresult CUDAAPI cuMemcpyAtoH_v2(void *dstHost, CUarray srcArray,
 CUresult CUDAAPI cuMemcpyAtoA_v2(CUarray dstArray, size_t dstOffset,
                                  CUarray srcArray, size_t srcOffset,
                                  size_t ByteCount) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10277,6 +10623,7 @@ CUresult CUDAAPI cuMemcpyAtoA_v2(CUarray dstArray, size_t dstOffset,
 CUresult CUDAAPI cuMemcpyHtoAAsync_v2(CUarray dstArray, size_t dstOffset,
                                       const void *srcHost, size_t ByteCount,
                                       CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10286,6 +10633,7 @@ CUresult CUDAAPI cuMemcpyHtoAAsync_v2(CUarray dstArray, size_t dstOffset,
 CUresult CUDAAPI cuMemcpyAtoHAsync_v2(void *dstHost, CUarray srcArray,
                                       size_t srcOffset, size_t ByteCount,
                                       CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10293,6 +10641,7 @@ CUresult CUDAAPI cuMemcpyAtoHAsync_v2(void *dstHost, CUarray srcArray,
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuMemcpy2D_v2(const CUDA_MEMCPY2D *pCopy) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10300,6 +10649,7 @@ CUresult CUDAAPI cuMemcpy2D_v2(const CUDA_MEMCPY2D *pCopy) {
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuMemcpy2DUnaligned_v2(const CUDA_MEMCPY2D *pCopy) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10307,6 +10657,7 @@ CUresult CUDAAPI cuMemcpy2DUnaligned_v2(const CUDA_MEMCPY2D *pCopy) {
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuMemcpy3D_v2(const CUDA_MEMCPY3D *pCopy) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10316,12 +10667,14 @@ CUresult CUDAAPI cuMemcpy3D_v2(const CUDA_MEMCPY3D *pCopy) {
 CUresult CUDAAPI cuMemcpyHtoDAsync_v2(CUdeviceptr dstDevice,
                                       const void *srcHost, size_t ByteCount,
                                       CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(
       cudaMemcpyAsync(reinterpret_cast<void *>(dstDevice), srcHost, ByteCount, cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(hStream)));
 }
 CUresult CUDAAPI cuMemcpyDtoHAsync_v2(void *dstHost, CUdeviceptr srcDevice,
                                       size_t ByteCount, CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(
       cudaMemcpyAsync(dstHost, reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToHost, reinterpret_cast<cudaStream_t>(hStream)));
@@ -10329,12 +10682,14 @@ CUresult CUDAAPI cuMemcpyDtoHAsync_v2(void *dstHost, CUdeviceptr srcDevice,
 CUresult CUDAAPI cuMemcpyDtoDAsync_v2(CUdeviceptr dstDevice,
                                       CUdeviceptr srcDevice, size_t ByteCount,
                                       CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemcpyAsync(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount,
                                           cudaMemcpyDeviceToDevice, reinterpret_cast<cudaStream_t>(hStream)));
 }
 CUresult CUDAAPI cuMemcpy2DAsync_v2(const CUDA_MEMCPY2D *pCopy,
                                     CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10343,6 +10698,7 @@ CUresult CUDAAPI cuMemcpy2DAsync_v2(const CUDA_MEMCPY2D *pCopy,
 }
 CUresult CUDAAPI cuMemcpy3DAsync_v2(const CUDA_MEMCPY3D *pCopy,
                                     CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10351,22 +10707,26 @@ CUresult CUDAAPI cuMemcpy3DAsync_v2(const CUDA_MEMCPY3D *pCopy,
 }
 CUresult CUDAAPI cuMemsetD8_v2(CUdeviceptr dstDevice, unsigned char uc,
                                size_t N) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemset(reinterpret_cast<void *>(dstDevice), int(uc), size_t(N)));
 }
 CUresult CUDAAPI cuMemsetD16_v2(CUdeviceptr dstDevice, unsigned short us,
                                 size_t N) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_memset_elems(uint64_t(dstDevice), us, 2, size_t(N), NULL, false);
 }
 CUresult CUDAAPI cuMemsetD32_v2(CUdeviceptr dstDevice, unsigned int ui,
                                 size_t N) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_memset_elems(uint64_t(dstDevice), ui, 4, size_t(N), NULL, false);
 }
 CUresult CUDAAPI cuMemsetD2D8_v2(CUdeviceptr dstDevice, size_t dstPitch,
                                  unsigned char uc, size_t Width,
                                  size_t Height) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10376,6 +10736,7 @@ CUresult CUDAAPI cuMemsetD2D8_v2(CUdeviceptr dstDevice, size_t dstPitch,
 CUresult CUDAAPI cuMemsetD2D16_v2(CUdeviceptr dstDevice, size_t dstPitch,
                                   unsigned short us, size_t Width,
                                   size_t Height) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10385,6 +10746,7 @@ CUresult CUDAAPI cuMemsetD2D16_v2(CUdeviceptr dstDevice, size_t dstPitch,
 CUresult CUDAAPI cuMemsetD2D32_v2(CUdeviceptr dstDevice, size_t dstPitch,
                                   unsigned int ui, size_t Width,
                                   size_t Height) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10392,11 +10754,13 @@ CUresult CUDAAPI cuMemsetD2D32_v2(CUdeviceptr dstDevice, size_t dstPitch,
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuMemcpy(CUdeviceptr dst, CUdeviceptr src, size_t ByteCount) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemcpy(reinterpret_cast<void *>(dst), reinterpret_cast<void *>(src), ByteCount, cudaMemcpyDefault));
 }
 CUresult CUDAAPI cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src,
                                size_t ByteCount, CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(
       cudaMemcpyAsync(reinterpret_cast<void *>(dst), reinterpret_cast<void *>(src), ByteCount, cudaMemcpyDefault, reinterpret_cast<cudaStream_t>(hStream)));
@@ -10404,6 +10768,7 @@ CUresult CUDAAPI cuMemcpyAsync(CUdeviceptr dst, CUdeviceptr src,
 CUresult CUDAAPI cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext,
                               CUdeviceptr srcDevice, CUcontext srcContext,
                               size_t ByteCount) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   (void)dstContext;
   (void)srcContext;  // one simulated GPU per process
@@ -10413,6 +10778,7 @@ CUresult CUDAAPI cuMemcpyPeer(CUdeviceptr dstDevice, CUcontext dstContext,
 CUresult CUDAAPI cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext,
                                    CUdeviceptr srcDevice, CUcontext srcContext,
                                    size_t ByteCount, CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   (void)dstContext;
   (void)srcContext;  // one simulated GPU per process
@@ -10420,6 +10786,7 @@ CUresult CUDAAPI cuMemcpyPeerAsync(CUdeviceptr dstDevice, CUcontext dstContext,
       cudaMemcpyAsync(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDefault, reinterpret_cast<cudaStream_t>(hStream)));
 }
 CUresult CUDAAPI cuMemcpy3DPeer(const CUDA_MEMCPY3D_PEER *pCopy) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10428,6 +10795,7 @@ CUresult CUDAAPI cuMemcpy3DPeer(const CUDA_MEMCPY3D_PEER *pCopy) {
 }
 CUresult CUDAAPI cuMemcpy3DPeerAsync(const CUDA_MEMCPY3D_PEER *pCopy,
                                      CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10437,22 +10805,26 @@ CUresult CUDAAPI cuMemcpy3DPeerAsync(const CUDA_MEMCPY3D_PEER *pCopy,
 
 CUresult CUDAAPI cuMemsetD8Async(CUdeviceptr dstDevice, unsigned char uc,
                                  size_t N, CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemsetAsync(reinterpret_cast<void *>(dstDevice), int(uc), size_t(N), reinterpret_cast<cudaStream_t>(hStream)));
 }
 CUresult CUDAAPI cuMemsetD16Async(CUdeviceptr dstDevice, unsigned short us,
                                   size_t N, CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_memset_elems(uint64_t(dstDevice), us, 2, size_t(N), reinterpret_cast<cudaStream_t>(hStream), true);
 }
 CUresult CUDAAPI cuMemsetD32Async(CUdeviceptr dstDevice, unsigned int ui,
                                   size_t N, CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_memset_elems(uint64_t(dstDevice), ui, 4, size_t(N), reinterpret_cast<cudaStream_t>(hStream), true);
 }
 CUresult CUDAAPI cuMemsetD2D8Async(CUdeviceptr dstDevice, size_t dstPitch,
                                    unsigned char uc, size_t Width,
                                    size_t Height, CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10462,6 +10834,7 @@ CUresult CUDAAPI cuMemsetD2D8Async(CUdeviceptr dstDevice, size_t dstPitch,
 CUresult CUDAAPI cuMemsetD2D16Async(CUdeviceptr dstDevice, size_t dstPitch,
                                     unsigned short us, size_t Width,
                                     size_t Height, CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10471,6 +10844,7 @@ CUresult CUDAAPI cuMemsetD2D16Async(CUdeviceptr dstDevice, size_t dstPitch,
 CUresult CUDAAPI cuMemsetD2D32Async(CUdeviceptr dstDevice, size_t dstPitch,
                                     unsigned int ui, size_t Width,
                                     size_t Height, CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10479,12 +10853,14 @@ CUresult CUDAAPI cuMemsetD2D32Async(CUdeviceptr dstDevice, size_t dstPitch,
 }
 
 CUresult CUDAAPI cuStreamGetPriority(CUstream hStream, int *priority) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   if (priority == NULL) return CUDA_ERROR_INVALID_VALUE;
   *priority = 0;  // priorities are not modelled
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuStreamGetFlags(CUstream hStream, unsigned int *flags) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   if (flags == NULL) return CUDA_ERROR_INVALID_VALUE;
   CUstream_st *s = yasai_stream_manager(GPGPU_Context())->yasai_resolve(reinterpret_cast<CUstream_st *>(hStream));
@@ -10493,6 +10869,7 @@ CUresult CUDAAPI cuStreamGetFlags(CUstream hStream, unsigned int *flags) {
 }
 CUresult CUDAAPI cuStreamWaitEvent(CUstream hStream, CUevent hEvent,
                                    unsigned int Flags) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(
       cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(hStream), reinterpret_cast<cudaEvent_t>(hEvent), Flags));
@@ -10500,6 +10877,7 @@ CUresult CUDAAPI cuStreamWaitEvent(CUstream hStream, CUevent hEvent,
 CUresult CUDAAPI cuStreamAddCallback(CUstream hStream,
                                      CUstreamCallback callback, void *userData,
                                      unsigned int flags) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   // The callback runs in stream order on the host-callback thread, with CUDA_SUCCESS.
   (void)flags;
@@ -10517,6 +10895,7 @@ CUresult CUDAAPI cuStreamAddCallback(CUstream hStream,
 }
 CUresult CUDAAPI cuStreamAttachMemAsync(CUstream hStream, CUdeviceptr dptr,
                                         size_t length, unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10524,14 +10903,17 @@ CUresult CUDAAPI cuStreamAttachMemAsync(CUstream hStream, CUdeviceptr dptr,
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuStreamQuery(CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaStreamQuery(reinterpret_cast<cudaStream_t>(hStream)));
 }
 CUresult CUDAAPI cuStreamSynchronize(CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(hStream)));
 }
 CUresult CUDAAPI cuEventRecord(CUevent hEvent, CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaEventRecord(reinterpret_cast<cudaEvent_t>(hEvent), reinterpret_cast<cudaStream_t>(hStream)));
 }
@@ -10541,6 +10923,7 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX,
                                 unsigned int blockDimZ,
                                 unsigned int sharedMemBytes, CUstream hStream,
                                 void **kernelParams, void **extra) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10550,6 +10933,7 @@ CUresult CUDAAPI cuLaunchKernel(CUfunction f, unsigned int gridDimX,
 CUresult CUDAAPI cuGraphicsMapResources(unsigned int count,
                                         CUgraphicsResource *resources,
                                         CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10559,6 +10943,7 @@ CUresult CUDAAPI cuGraphicsMapResources(unsigned int count,
 CUresult CUDAAPI cuGraphicsUnmapResources(unsigned int count,
                                           CUgraphicsResource *resources,
                                           CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10567,6 +10952,7 @@ CUresult CUDAAPI cuGraphicsUnmapResources(unsigned int count,
 }
 CUresult CUDAAPI cuMemPrefetchAsync(CUdeviceptr devPtr, size_t count,
                                     CUdevice dstDevice, CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10575,6 +10961,7 @@ CUresult CUDAAPI cuMemPrefetchAsync(CUdeviceptr devPtr, size_t count,
 }
 CUresult CUDAAPI cuStreamWriteValue32(CUstream stream, CUdeviceptr addr,
                                       cuuint32_t value, unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10583,6 +10970,7 @@ CUresult CUDAAPI cuStreamWriteValue32(CUstream stream, CUdeviceptr addr,
 }
 CUresult CUDAAPI cuStreamWaitValue32(CUstream stream, CUdeviceptr addr,
                                      cuuint32_t value, unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10592,6 +10980,7 @@ CUresult CUDAAPI cuStreamWaitValue32(CUstream stream, CUdeviceptr addr,
 CUresult CUDAAPI cuStreamBatchMemOp(CUstream stream, unsigned int count,
                                     CUstreamBatchMemOpParams *paramArray,
                                     unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10627,6 +11016,7 @@ CUresult cuProfilerStop(void) {
 
 extern "C" CUresult CUDAAPI cuMemcpy_ptds(CUdeviceptr dst, CUdeviceptr src,
                                           size_t ByteCount) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemcpy(reinterpret_cast<void *>(dst), reinterpret_cast<void *>(src), ByteCount, cudaMemcpyDefault));
 }
@@ -10636,6 +11026,7 @@ extern "C" CUresult CUDAAPI cuMemcpyPeer_ptds(CUdeviceptr dstDevice,
                                               CUdeviceptr srcDevice,
                                               CUcontext srcContext,
                                               size_t ByteCount) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   (void)dstContext;
   (void)srcContext;  // one simulated GPU per process
@@ -10646,24 +11037,28 @@ extern "C" CUresult CUDAAPI cuMemcpyPeer_ptds(CUdeviceptr dstDevice,
 extern "C" CUresult CUDAAPI cuMemcpyHtoD_v2_ptds(CUdeviceptr dstDevice,
                                                  const void *srcHost,
                                                  size_t ByteCount) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemcpy(reinterpret_cast<void *>(dstDevice), srcHost, ByteCount, cudaMemcpyHostToDevice));
 }
 extern "C" CUresult CUDAAPI cuMemcpyDtoH_v2_ptds(void *dstHost,
                                                  CUdeviceptr srcDevice,
                                                  size_t ByteCount) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemcpy(dstHost, reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToHost));
 }
 extern "C" CUresult CUDAAPI cuMemcpyDtoD_v2_ptds(CUdeviceptr dstDevice,
                                                  CUdeviceptr srcDevice,
                                                  size_t ByteCount) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(
       cudaMemcpy(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToDevice));
 }
 extern "C" CUresult CUDAAPI
 cuMemcpy2DUnaligned_v2_ptds(const CUDA_MEMCPY2D *pCopy) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10671,6 +11066,7 @@ cuMemcpy2DUnaligned_v2_ptds(const CUDA_MEMCPY2D *pCopy) {
   return CUDA_SUCCESS;
 }
 extern "C" CUresult CUDAAPI cuMemcpy3D_v2_ptds(const CUDA_MEMCPY3D *pCopy) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10679,6 +11075,7 @@ extern "C" CUresult CUDAAPI cuMemcpy3D_v2_ptds(const CUDA_MEMCPY3D *pCopy) {
 }
 extern "C" CUresult CUDAAPI
 cuMemcpy3DPeer_ptds(const CUDA_MEMCPY3D_PEER *pCopy) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10688,18 +11085,21 @@ cuMemcpy3DPeer_ptds(const CUDA_MEMCPY3D_PEER *pCopy) {
 extern "C" CUresult CUDAAPI cuMemsetD8_v2_ptds(CUdeviceptr dstDevice,
                                                unsigned char uc,
                                                unsigned int N) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemset(reinterpret_cast<void *>(dstDevice), int(uc), size_t(N)));
 }
 extern "C" CUresult CUDAAPI cuMemsetD16_v2_ptds(CUdeviceptr dstDevice,
                                                 unsigned short us,
                                                 unsigned int N) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_memset_elems(uint64_t(dstDevice), us, 2, size_t(N), NULL, false);
 }
 extern "C" CUresult CUDAAPI cuMemsetD32_v2_ptds(CUdeviceptr dstDevice,
                                                 unsigned int ui,
                                                 unsigned int N) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_memset_elems(uint64_t(dstDevice), ui, 4, size_t(N), NULL, false);
 }
@@ -10708,6 +11108,7 @@ extern "C" CUresult CUDAAPI cuMemsetD2D8_v2_ptds(CUdeviceptr dstDevice,
                                                  unsigned char uc,
                                                  unsigned int Width,
                                                  unsigned int Height) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10719,6 +11120,7 @@ extern "C" CUresult CUDAAPI cuMemsetD2D16_v2_ptds(CUdeviceptr dstDevice,
                                                   unsigned short us,
                                                   unsigned int Width,
                                                   unsigned int Height) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10730,6 +11132,7 @@ extern "C" CUresult CUDAAPI cuMemsetD2D32_v2_ptds(CUdeviceptr dstDevice,
                                                   unsigned int ui,
                                                   unsigned int Width,
                                                   unsigned int Height) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10740,6 +11143,7 @@ extern "C" CUresult CUDAAPI cuMemsetD2D32_v2_ptds(CUdeviceptr dstDevice,
 //_ptsz
 extern "C" CUresult CUDAAPI
 cuMemcpy3DPeer_ptsz(const CUDA_MEMCPY3D_PEER *pCopy) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10750,6 +11154,7 @@ cuMemcpy3DPeer_ptsz(const CUDA_MEMCPY3D_PEER *pCopy) {
 extern "C" CUresult CUDAAPI cuMemcpyAsync_ptsz(CUdeviceptr dst, CUdeviceptr src,
                                                size_t ByteCount,
                                                CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(
       cudaMemcpyAsync(reinterpret_cast<void *>(dst), reinterpret_cast<void *>(src), ByteCount, cudaMemcpyDefault, reinterpret_cast<cudaStream_t>(hStream)));
@@ -10758,6 +11163,7 @@ extern "C" CUresult CUDAAPI cuMemcpyAsync_ptsz(CUdeviceptr dst, CUdeviceptr src,
 extern "C" CUresult CUDAAPI cuMemcpyPeerAsync_ptsz(
     CUdeviceptr dstDevice, CUcontext dstContext, CUdeviceptr srcDevice,
     CUcontext srcContext, size_t ByteCount, CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   (void)dstContext;
   (void)srcContext;  // one simulated GPU per process
@@ -10769,6 +11175,7 @@ extern "C" CUresult CUDAAPI cuMemcpyHtoAAsync_v2_ptsz(CUarray dstArray,
                                                       const void *srcHost,
                                                       size_t ByteCount,
                                                       CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10780,6 +11187,7 @@ extern "C" CUresult CUDAAPI cuMemcpyAtoHAsync_v2_ptsz(void *dstHost,
                                                       size_t srcOffset,
                                                       size_t ByteCount,
                                                       CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10790,6 +11198,7 @@ extern "C" CUresult CUDAAPI cuMemcpyHtoDAsync_v2_ptsz(CUdeviceptr dstDevice,
                                                       const void *srcHost,
                                                       size_t ByteCount,
                                                       CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(
       cudaMemcpyAsync(reinterpret_cast<void *>(dstDevice), srcHost, ByteCount, cudaMemcpyHostToDevice, reinterpret_cast<cudaStream_t>(hStream)));
@@ -10798,6 +11207,7 @@ extern "C" CUresult CUDAAPI cuMemcpyDtoHAsync_v2_ptsz(void *dstHost,
                                                       CUdeviceptr srcDevice,
                                                       size_t ByteCount,
                                                       CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(
       cudaMemcpyAsync(dstHost, reinterpret_cast<void *>(srcDevice), ByteCount, cudaMemcpyDeviceToHost, reinterpret_cast<cudaStream_t>(hStream)));
@@ -10806,12 +11216,14 @@ extern "C" CUresult CUDAAPI cuMemcpyDtoDAsync_v2_ptsz(CUdeviceptr dstDevice,
                                                       CUdeviceptr srcDevice,
                                                       size_t ByteCount,
                                                       CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemcpyAsync(reinterpret_cast<void *>(dstDevice), reinterpret_cast<void *>(srcDevice), ByteCount,
                                           cudaMemcpyDeviceToDevice, reinterpret_cast<cudaStream_t>(hStream)));
 }
 extern "C" CUresult CUDAAPI cuMemcpy2DAsync_v2_ptsz(const CUDA_MEMCPY2D *pCopy,
                                                     CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10820,6 +11232,7 @@ extern "C" CUresult CUDAAPI cuMemcpy2DAsync_v2_ptsz(const CUDA_MEMCPY2D *pCopy,
 }
 extern "C" CUresult CUDAAPI cuMemcpy3DAsync_v2_ptsz(const CUDA_MEMCPY3D *pCopy,
                                                     CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10828,6 +11241,7 @@ extern "C" CUresult CUDAAPI cuMemcpy3DAsync_v2_ptsz(const CUDA_MEMCPY3D *pCopy,
 }
 extern "C" CUresult CUDAAPI
 cuMemcpy3DPeerAsync_ptsz(const CUDA_MEMCPY3D_PEER *pCopy, CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10838,6 +11252,7 @@ cuMemcpy3DPeerAsync_ptsz(const CUDA_MEMCPY3D_PEER *pCopy, CUstream hStream) {
 extern "C" CUresult CUDAAPI cuMemsetD8Async_ptsz(CUdeviceptr dstDevice,
                                                  unsigned char uc, size_t N,
                                                  CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaMemsetAsync(reinterpret_cast<void *>(dstDevice), int(uc), size_t(N), reinterpret_cast<cudaStream_t>(hStream)));
 }
@@ -10846,6 +11261,7 @@ extern "C" CUresult CUDAAPI cuMemsetD2D8Async_ptsz(CUdeviceptr dstDevice,
                                                    unsigned char uc,
                                                    size_t Width, size_t Height,
                                                    CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10857,6 +11273,7 @@ extern "C" CUresult CUDAAPI cuLaunchKernel_ptsz(
     unsigned int gridDimZ, unsigned int blockDimX, unsigned int blockDimY,
     unsigned int blockDimZ, unsigned int sharedMemBytes, CUstream hStream,
     void **kernelParams, void **extra) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10865,6 +11282,7 @@ extern "C" CUresult CUDAAPI cuLaunchKernel_ptsz(
 }
 extern "C" CUresult CUDAAPI cuEventRecord_ptsz(CUevent hEvent,
                                                CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaEventRecord(reinterpret_cast<cudaEvent_t>(hEvent), reinterpret_cast<cudaStream_t>(hStream)));
 }
@@ -10872,6 +11290,7 @@ extern "C" CUresult CUDAAPI cuStreamWriteValue32_ptsz(CUstream stream,
                                                       CUdeviceptr addr,
                                                       cuuint32_t value,
                                                       unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10882,6 +11301,7 @@ extern "C" CUresult CUDAAPI cuStreamWaitValue32_ptsz(CUstream stream,
                                                      CUdeviceptr addr,
                                                      cuuint32_t value,
                                                      unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10891,6 +11311,7 @@ extern "C" CUresult CUDAAPI cuStreamWaitValue32_ptsz(CUstream stream,
 extern "C" CUresult CUDAAPI cuStreamBatchMemOp_ptsz(
     CUstream stream, unsigned int count, CUstreamBatchMemOpParams *paramArray,
     unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10899,6 +11320,7 @@ extern "C" CUresult CUDAAPI cuStreamBatchMemOp_ptsz(
 }
 extern "C" CUresult CUDAAPI cuStreamGetPriority_ptsz(CUstream hStream,
                                                      int *priority) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   if (priority == NULL) return CUDA_ERROR_INVALID_VALUE;
   *priority = 0;  // priorities are not modelled
@@ -10906,6 +11328,7 @@ extern "C" CUresult CUDAAPI cuStreamGetPriority_ptsz(CUstream hStream,
 }
 extern "C" CUresult CUDAAPI cuStreamGetFlags_ptsz(CUstream hStream,
                                                   unsigned int *flags) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   if (flags == NULL) return CUDA_ERROR_INVALID_VALUE;
   CUstream_st *s = yasai_stream_manager(GPGPU_Context())->yasai_resolve(reinterpret_cast<CUstream_st *>(hStream));
@@ -10916,6 +11339,7 @@ extern "C" CUresult CUDAAPI cuStreamGetFlags_ptsz(CUstream hStream,
 extern "C" CUresult CUDAAPI cuStreamWaitEvent_ptsz(CUstream hStream,
                                                    CUevent hEvent,
                                                    unsigned int Flags) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(
       cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(hStream), reinterpret_cast<cudaEvent_t>(hEvent), Flags));
@@ -10925,6 +11349,7 @@ extern "C" CUresult CUDAAPI cuStreamAddCallback_ptsz(CUstream hStream,
                                                      CUstreamCallback callback,
                                                      void *userData,
                                                      unsigned int flags) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   // The callback runs in stream order on the host-callback thread, with CUDA_SUCCESS.
   (void)flags;
@@ -10942,11 +11367,13 @@ extern "C" CUresult CUDAAPI cuStreamAddCallback_ptsz(CUstream hStream,
 }
 
 extern "C" CUresult CUDAAPI cuStreamSynchronize_ptsz(CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(hStream)));
 }
 
 extern "C" CUresult CUDAAPI cuStreamQuery_ptsz(CUstream hStream) {
+  YASAI_FAULT_CU();
   // yasai: forwards to the runtime function.
   return yasai_drv_status(cudaStreamQuery(reinterpret_cast<cudaStream_t>(hStream)));
 }
@@ -10954,6 +11381,7 @@ extern "C" CUresult CUDAAPI cuStreamAttachMemAsync_ptsz(CUstream hStream,
                                                         CUdeviceptr dptr,
                                                         size_t length,
                                                         unsigned int flags) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10963,6 +11391,7 @@ extern "C" CUresult CUDAAPI cuStreamAttachMemAsync_ptsz(CUstream hStream,
 
 extern "C" CUresult CUDAAPI cuGraphicsMapResources_ptsz(
     unsigned int count, CUgraphicsResource *resources, CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10972,6 +11401,7 @@ extern "C" CUresult CUDAAPI cuGraphicsMapResources_ptsz(
 
 extern "C" CUresult CUDAAPI cuGraphicsUnmapResources_ptsz(
     unsigned int count, CUgraphicsResource *resources, CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -10983,6 +11413,7 @@ extern "C" CUresult CUDAAPI cuMemPrefetchAsync_ptsz(CUdeviceptr devPtr,
                                                     size_t count,
                                                     CUdevice dstDevice,
                                                     CUstream hStream) {
+  YASAI_FAULT_CU();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -11001,6 +11432,7 @@ extern "C" {
   return cudaSuccess;
 
 __host__ cudaError_t CUDARTAPI cudaThreadExchangeStreamCaptureMode(enum cudaStreamCaptureMode *mode) {
+  YASAI_FAULT_RT();
   // yasai: stream capture is not simulated; keep a per-thread mode so swap pairs round-trip.
   static thread_local enum cudaStreamCaptureMode t_mode = cudaStreamCaptureModeGlobal;
   if (mode == NULL) return g_last_cudaError = cudaErrorInvalidValue;
@@ -11011,6 +11443,7 @@ __host__ cudaError_t CUDARTAPI cudaThreadExchangeStreamCaptureMode(enum cudaStre
 }
 
 __host__ cudaError_t CUDARTAPI cudaDeviceGetDefaultMemPool(cudaMemPool_t *memPool, int device) {
+  YASAI_FAULT_RT();
   // yasai: pools are tokens (see cudaMemPoolCreate); the default pool is token 0x1000 + device.
   if (memPool == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   *memPool = reinterpret_cast<cudaMemPool_t>(uintptr_t(0x1000 + device));
@@ -11018,6 +11451,7 @@ __host__ cudaError_t CUDARTAPI cudaDeviceGetDefaultMemPool(cudaMemPool_t *memPoo
 }
 
 __host__ cudaError_t CUDARTAPI cudaMemPoolGetAttribute(cudaMemPool_t memPool, enum cudaMemPoolAttr attr, void *value ) {
+  YASAI_FAULT_RT();
   // yasai: pool attributes are not modeled; every attribute reads as zero.
   (void)memPool;
   if (value == NULL) return g_last_cudaError = cudaErrorInvalidValue;
@@ -11030,6 +11464,7 @@ __host__ cudaError_t CUDARTAPI cudaMemPoolGetAttribute(cudaMemPool_t memPool, en
 }
 
 __host__ cudaError_t CUDARTAPI cudaMemPoolSetAttribute(cudaMemPool_t memPool, enum cudaMemPoolAttr attr, void *value ) {
+  YASAI_FAULT_RT();
   // yasai: pool attributes are not modeled; setting one is accepted and has no effect.
   (void)memPool;
   (void)attr;
@@ -11038,6 +11473,7 @@ __host__ cudaError_t CUDARTAPI cudaMemPoolSetAttribute(cudaMemPool_t memPool, en
 }
 
 __host__ cudaError_t CUDARTAPI cudaMemPoolSetAccess(cudaMemPool_t memPool, const struct cudaMemAccessDesc *descList, size_t count) {
+  YASAI_FAULT_RT();
   // yasai: every allocation is accessible from the single simulated device.
   (void)memPool;
   (void)descList;
@@ -11046,6 +11482,7 @@ __host__ cudaError_t CUDARTAPI cudaMemPoolSetAccess(cudaMemPool_t memPool, const
 }
 
 __host__ cudaError_t CUDARTAPI cudaMemPoolTrimTo(cudaMemPool_t memPool, size_t minBytesToKeep) {
+  YASAI_FAULT_RT();
   // yasai: pools hold no cached memory, so there is nothing to trim.
   (void)memPool;
   (void)minBytesToKeep;
@@ -11054,16 +11491,19 @@ __host__ cudaError_t CUDARTAPI cudaMemPoolTrimTo(cudaMemPool_t memPool, size_t m
 
 
 __host__ cudaError_t CUDARTAPI cudaMallocAsync(void **devPtr, size_t size, cudaStream_t hStream) {
+  YASAI_FAULT_RT();
   // yasai: stream-ordered allocation is an ordinary allocation.
   (void)hStream;
   return cudaMalloc(devPtr, size);
 }
 
 __host__ cudaError_t CUDARTAPI cudaMemcpyPeerAsync(void *dst, int dstDevice, const void *src, int srcDevice, size_t count, cudaStream_t stream __dv(0)) {
+  YASAI_FAULT_RT();
   cuda_error_not_impl;
 }
 
 __host__ cudaError_t CUDARTAPI cudaFreeAsync(void *devPtr, cudaStream_t hStream) {
+  YASAI_FAULT_RT();
   // yasai: a stream-ordered free: the allocation is released when the stream reaches the free
   // (a host-function stream operation), after the work queued before it on the stream. With
   // YASAI_STREAM_ZERO_HOST_SYNC=1 it is released at the call, as before.
@@ -11081,6 +11521,7 @@ __host__ cudaError_t CUDARTAPI cudaFreeAsync(void *devPtr, cudaStream_t hStream)
 // yasai: an opened IPC event shares the exporter's counters, so cudaStreamWaitEvent and
 // cudaEventSynchronize in this process wait for records made in the other.
 __host__ cudaError_t CUDARTAPI cudaIpcOpenEventHandle(cudaEvent_t *event, cudaIpcEventHandle_t handle) {
+  YASAI_FAULT_RT();
   unsigned int *counters = nullptr;
   char ref[64];
   if (!event || !yasai_vmm::ipc_event_open(&handle, &counters, ref))
@@ -11093,6 +11534,7 @@ __host__ cudaError_t CUDARTAPI cudaIpcOpenEventHandle(cudaEvent_t *event, cudaIp
 }
 
 __host__ cudaError_t CUDARTAPI cudaIpcGetEventHandle(cudaIpcEventHandle_t *handle, cudaEvent_t event) {
+  YASAI_FAULT_RT();
   CUevent_st *e = get_event(event);
   if (!handle || !e || !e->shared_name()[0]) return g_last_cudaError = cudaErrorInvalidResourceHandle;
   yasai_vmm::ipc_event_handle(handle, e->shared_name());
@@ -11100,6 +11542,7 @@ __host__ cudaError_t CUDARTAPI cudaIpcGetEventHandle(cudaIpcEventHandle_t *handl
 }
 
 __host__ cudaError_t CUDARTAPI cudaIpcCloseMemHandle(void *devPtr) {
+  YASAI_FAULT_RT();
   // yasai: work queued before the close may still read or write the mapping.
   {
     shared_devmem::phys *mp = nullptr;
@@ -11130,6 +11573,7 @@ typedef void (CUDART_CB *cudaStreamCallback_t)(cudaStream_t stream, cudaError_t 
 
 __host__ cudaError_t CUDARTAPI cudaStreamAddCallback(cudaStream_t stream,
         cudaStreamCallback_t callback, void *userData, unsigned int flags) {
+  YASAI_FAULT_RT();
   // yasai: the callback runs in stream order on the host-callback thread (cudaLaunchHostFunc),
   // with status cudaSuccess; flags must be 0.
   (void)flags;
@@ -11172,6 +11616,7 @@ static void *yasai_find_own_symbol(const char *symbol) {
 __host__ cudaError_t CUDARTAPI cudaGetDriverEntryPoint(
     const char *symbol, void **funcPtr, unsigned long long flags,
     enum cudaDriverEntryPointQueryResult *driverStatus = NULL) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -11221,6 +11666,7 @@ __host__ cudaError_t CUDARTAPI cudaGetDriverEntryPointByVersion(
     const char *symbol, void **funcPtr, unsigned int cudaVersion,
     unsigned long long flags,
     enum cudaDriverEntryPointQueryResult *driverStatus = NULL) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -11244,6 +11690,7 @@ __host__ cudaError_t CUDARTAPI cudaGetDriverEntryPointByVersion(
 }
 
 __host__ cudaError_t CUDARTAPI cudaHostUnregister(void *ptr) {
+  YASAI_FAULT_RT();
   // yasai: undoes cudaHostRegister, after the work queued before it, which may still access the
   // range through its device address.
   const size_t n = host_window::size_at(reinterpret_cast<uint64_t>(ptr));
@@ -11257,6 +11704,7 @@ __host__ cudaError_t CUDARTAPI cudaHostUnregister(void *ptr) {
 
 __host__ cudaError_t CUDARTAPI cudaLaunchKernelExC(
     const cudaLaunchConfig_t *config, const void *func, void **args) {
+  YASAI_FAULT_RT();
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
@@ -11286,6 +11734,7 @@ __host__ cudaError_t CUDARTAPI _cudaLaunchKernelEx(
 }
 
 __host__ cudaError_t CUDARTAPI cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void *userData) {
+  YASAI_FAULT_RT();
   // yasai: a stream operation; the host-callback thread calls fn when the stream reaches it, and
   // the stream continues when fn returns (as the CUDA driver's callback thread does). With
   // YASAI_STREAM_ZERO_HOST_SYNC=1 the former behaviour (wait for the stream, then call fn in
@@ -11317,6 +11766,7 @@ __host__ cudaError_t CUDARTAPI cudaLaunchHostFunc(cudaStream_t stream, cudaHostF
 // function handle.
 extern "C" __host__ cudaError_t CUDARTAPI cudaGetFuncBySymbol(cudaFunction_t *functionPtr,
                                                              const void *symbolPtr) {
+  YASAI_FAULT_RT();
   if (functionPtr == NULL || symbolPtr == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   *functionPtr = (cudaFunction_t)symbolPtr;
   return g_last_cudaError = cudaSuccess;
@@ -11325,6 +11775,7 @@ extern "C" __host__ cudaError_t CUDARTAPI cudaGetFuncBySymbol(cudaFunction_t *fu
 // yasai: stream id from the simulator's stream uid (0 for the default stream).
 extern "C" __host__ cudaError_t CUDARTAPI cudaStreamGetId(cudaStream_t hStream,
                                                          unsigned long long *streamId) {
+  YASAI_FAULT_RT();
   if (streamId == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   *streamId = hStream ? (unsigned long long)((struct CUstream_st *)hStream)->get_uid() : 0;
   return g_last_cudaError = cudaSuccess;
@@ -11359,6 +11810,7 @@ struct yasai_CUlaunchAttribute {
 // come from the config.
 extern "C" CUresult CUDAAPI cuLaunchKernelEx(const yasai_CUlaunchConfig *config, CUfunction f,
                                              void **kernelParams, void **extra) {
+  YASAI_FAULT_CU();
   if (config == NULL) return CUDA_ERROR_INVALID_VALUE;
   // yasai: the cluster shape attribute applies to this launch.
   const yasai_CUlaunchAttribute *attrs = (const yasai_CUlaunchAttribute *)config->attrs;
@@ -11384,6 +11836,7 @@ extern "C" CUresult CUDAAPI cuLaunchKernelEx(const yasai_CUlaunchConfig *config,
 // @param ctx Context (NULL: the current one).
 // @param ctxId Receives the id.
 extern "C" CUresult CUDAAPI cuCtxGetId(CUcontext ctx, unsigned long long *ctxId) {
+  YASAI_FAULT_CU();
   (void)ctx;
   if (ctxId == NULL) return CUDA_ERROR_INVALID_VALUE;
   *ctxId = 1;
@@ -11402,6 +11855,7 @@ extern "C" CUresult CUDAAPI cuDeviceGetUuid_v2(CUuuid *uuid, CUdevice dev) {
 // yasai: the _v2 symbol of cuDevicePrimaryCtxRelease.
 // @param dev Device ordinal.
 extern "C" CUresult CUDAAPI cuDevicePrimaryCtxRelease_v2(CUdevice dev) {
+  YASAI_FAULT_CU();
   return cuDevicePrimaryCtxRelease(dev);
 }
 
@@ -11411,6 +11865,7 @@ extern "C" CUresult CUDAAPI cuDevicePrimaryCtxRelease_v2(CUdevice dev) {
 // @param Flags cudaIpcMemLazyEnablePeerAccess.
 extern "C" CUresult CUDAAPI cuIpcOpenMemHandle_v2(CUdeviceptr *pdptr, CUipcMemHandle handle,
                                                   unsigned int Flags) {
+  YASAI_FAULT_CU();
   return cuIpcOpenMemHandle(pdptr, handle, Flags);
 }
 
@@ -11426,6 +11881,7 @@ extern "C" CUresult CUDAAPI cuIpcOpenMemHandle_v2(CUdeviceptr *pdptr, CUipcMemHa
 extern "C" CUresult CUDAAPI cuMemcpyBatchAsync_v2(CUdeviceptr *dsts, CUdeviceptr *srcs, size_t *sizes,
                                                   size_t count, void *attrs, size_t *attrsIdxs,
                                                   size_t numAttrs, CUstream hStream) {
+  YASAI_FAULT_CU();
   return cudaMemcpyBatchAsync(reinterpret_cast<void *const *>(dsts),
                               reinterpret_cast<const void *const *>(srcs), sizes, count,
                               reinterpret_cast<struct cudaMemcpyAttributes *>(attrs), attrsIdxs,
@@ -11438,6 +11894,7 @@ extern "C" CUresult CUDAAPI cuMemcpyBatchAsync_v2(CUdeviceptr *dsts, CUdeviceptr
 // @param pool Receives the pool.
 // @param poolProps Pool properties (not used).
 extern "C" CUresult CUDAAPI cuMemPoolCreate(cudaMemPool_t *pool, const void *poolProps) {
+  YASAI_FAULT_CU();
   (void)poolProps;
   return yasai_drv_status(cudaMemPoolCreate(pool, NULL));
 }
@@ -11445,6 +11902,7 @@ extern "C" CUresult CUDAAPI cuMemPoolCreate(cudaMemPool_t *pool, const void *poo
 // yasai: driver form of cudaMemPoolDestroy.
 // @param pool Pool.
 extern "C" CUresult CUDAAPI cuMemPoolDestroy(cudaMemPool_t pool) {
+  YASAI_FAULT_CU();
   return yasai_drv_status(cudaMemPoolDestroy(pool));
 }
 
@@ -11452,6 +11910,7 @@ extern "C" CUresult CUDAAPI cuMemPoolDestroy(cudaMemPool_t pool) {
 // @param pool_out Receives the pool.
 // @param dev Device ordinal.
 extern "C" CUresult CUDAAPI cuDeviceGetDefaultMemPool(cudaMemPool_t *pool_out, CUdevice dev) {
+  YASAI_FAULT_CU();
   return yasai_drv_status(cudaDeviceGetDefaultMemPool(pool_out, int(dev)));
 }
 
@@ -11459,6 +11918,7 @@ extern "C" CUresult CUDAAPI cuDeviceGetDefaultMemPool(cudaMemPool_t *pool_out, C
 // @param pool Receives the pool.
 // @param dev Device ordinal.
 extern "C" CUresult CUDAAPI cuDeviceGetMemPool(cudaMemPool_t *pool, CUdevice dev) {
+  YASAI_FAULT_CU();
   return yasai_drv_status(cudaDeviceGetDefaultMemPool(pool, int(dev)));
 }
 
@@ -11467,6 +11927,7 @@ extern "C" CUresult CUDAAPI cuDeviceGetMemPool(cudaMemPool_t *pool, CUdevice dev
 // @param attr Attribute.
 // @param value Receives the value.
 extern "C" CUresult CUDAAPI cuMemPoolGetAttribute(cudaMemPool_t pool, int attr, void *value) {
+  YASAI_FAULT_CU();
   return yasai_drv_status(cudaMemPoolGetAttribute(pool, (enum cudaMemPoolAttr)attr, value));
 }
 
@@ -11475,6 +11936,7 @@ extern "C" CUresult CUDAAPI cuMemPoolGetAttribute(cudaMemPool_t pool, int attr, 
 // @param attr Attribute.
 // @param value Value.
 extern "C" CUresult CUDAAPI cuMemPoolSetAttribute(cudaMemPool_t pool, int attr, void *value) {
+  YASAI_FAULT_CU();
   return yasai_drv_status(cudaMemPoolSetAttribute(pool, (enum cudaMemPoolAttr)attr, value));
 }
 
@@ -11483,6 +11945,7 @@ extern "C" CUresult CUDAAPI cuMemPoolSetAttribute(cudaMemPool_t pool, int attr, 
 // @param map Access descriptors.
 // @param count Number of descriptors.
 extern "C" CUresult CUDAAPI cuMemPoolSetAccess(cudaMemPool_t pool, const void *map, size_t count) {
+  YASAI_FAULT_CU();
   return yasai_drv_status(
       cudaMemPoolSetAccess(pool, reinterpret_cast<const struct cudaMemAccessDesc *>(map), count));
 }
@@ -11491,6 +11954,7 @@ extern "C" CUresult CUDAAPI cuMemPoolSetAccess(cudaMemPool_t pool, const void *m
 // @param pool Pool.
 // @param minBytesToKeep Bytes to keep.
 extern "C" CUresult CUDAAPI cuMemPoolTrimTo(cudaMemPool_t pool, size_t minBytesToKeep) {
+  YASAI_FAULT_CU();
   return yasai_drv_status(cudaMemPoolTrimTo(pool, minBytesToKeep));
 }
 
@@ -11502,6 +11966,7 @@ extern "C" CUresult CUDAAPI cuMemPoolTrimTo(cudaMemPool_t pool, size_t minBytesT
 // @param hStream Stream.
 extern "C" CUresult CUDAAPI cuMemAllocFromPoolAsync(CUdeviceptr *dptr, size_t bytesize,
                                                     cudaMemPool_t pool, CUstream hStream) {
+  YASAI_FAULT_CU();
   void *p = NULL;
   if (dptr == NULL) return CUDA_ERROR_INVALID_VALUE;
   const CUresult r = yasai_drv_status(
@@ -11515,6 +11980,7 @@ extern "C" CUresult CUDAAPI cuMemAllocFromPoolAsync(CUdeviceptr *dptr, size_t by
 // @param bytesize Bytes.
 // @param hStream Stream.
 extern "C" CUresult CUDAAPI cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize, CUstream hStream) {
+  YASAI_FAULT_CU();
   void *p = NULL;
   if (dptr == NULL) return CUDA_ERROR_INVALID_VALUE;
   const CUresult r =
@@ -11527,6 +11993,7 @@ extern "C" CUresult CUDAAPI cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize, 
 // @param dptr Allocation.
 // @param hStream Stream.
 extern "C" CUresult CUDAAPI cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream) {
+  YASAI_FAULT_CU();
   return yasai_drv_status(cudaFreeAsync(reinterpret_cast<void *>(dptr),
                                         reinterpret_cast<cudaStream_t>(hStream)));
 }
@@ -11540,6 +12007,7 @@ extern "C" CUresult CUDAAPI cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream) {
 // @param flags Must be 0.
 extern "C" CUresult CUDAAPI cuMemPoolExportToShareableHandle(void *handle_out, cudaMemPool_t pool,
                                                              int handleType, unsigned long long flags) {
+  YASAI_FAULT_CU();
   (void)pool;
   (void)flags;
   if (handle_out == NULL || handleType != 1) return CUDA_ERROR_NOT_SUPPORTED;
@@ -11558,6 +12026,7 @@ extern "C" CUresult CUDAAPI cuMemPoolExportToShareableHandle(void *handle_out, c
 extern "C" CUresult CUDAAPI cuMemPoolImportFromShareableHandle(cudaMemPool_t *pool_out, void *handle,
                                                                int handleType,
                                                                unsigned long long flags) {
+  YASAI_FAULT_CU();
   (void)handle;
   (void)flags;
   if (pool_out == NULL || handleType != 1) return CUDA_ERROR_NOT_SUPPORTED;
@@ -11571,6 +12040,7 @@ static_assert(sizeof(cudaIpcMemHandle_t) <= 64, "an IPC handle fits CUmemPoolPtr
 // @param shareData_out Receives the export data.
 // @param ptr Allocation.
 extern "C" CUresult CUDAAPI cuMemPoolExportPointer(void *shareData_out, CUdeviceptr ptr) {
+  YASAI_FAULT_CU();
   if (shareData_out == NULL) return CUDA_ERROR_INVALID_VALUE;
   cudaIpcMemHandle_t h;
   if (cudaIpcGetMemHandle(&h, reinterpret_cast<void *>(ptr)) != cudaSuccess)
@@ -11586,6 +12056,7 @@ extern "C" CUresult CUDAAPI cuMemPoolExportPointer(void *shareData_out, CUdevice
 // @param shareData Export data.
 extern "C" CUresult CUDAAPI cuMemPoolImportPointer(CUdeviceptr *ptr_out, cudaMemPool_t pool,
                                                    void *shareData) {
+  YASAI_FAULT_CU();
   (void)pool;
   if (ptr_out == NULL || shareData == NULL) return CUDA_ERROR_INVALID_VALUE;
   cudaIpcMemHandle_t h;
@@ -11625,6 +12096,7 @@ extern "C" CUresult CUDAAPI cuDeviceGetUuid(CUuuid *uuid, CUdevice dev) {
 //   symbolStatus  receives CU_GET_PROC_ADDRESS_SUCCESS (0) or _SYMBOL_NOT_FOUND (1); may be NULL
 extern "C" CUresult CUDAAPI cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion,
                                                 unsigned long long flags, int *symbolStatus) {
+  YASAI_FAULT_CU();
   (void)cudaVersion;
   (void)flags;
   if (symbol == NULL || pfn == NULL) return CUDA_ERROR_INVALID_VALUE;
@@ -11644,23 +12116,30 @@ extern "C" CUresult CUDAAPI cuGetProcAddress(const char *symbol, void **pfn, int
 // every call answers CUDA_ERROR_NOT_SUPPORTED, which callers treat as a GPU without the feature.
 //   (parameters as in cuda.h; not used)
 extern "C" CUresult CUDAAPI cuDeviceGetDevResource(CUdevice, void *, int) {
+  YASAI_FAULT_CU();
   return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuDevSmResourceSplitByCount(void *, unsigned *, const void *, void *,
                                                         unsigned, unsigned) {
+  YASAI_FAULT_CU();
   return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuDevResourceGenerateDesc(void *, void *, unsigned) {
+  YASAI_FAULT_CU();
   return CUDA_ERROR_NOT_SUPPORTED;
 }
 extern "C" CUresult CUDAAPI cuGreenCtxCreate(void *, void *, CUdevice, unsigned) {
+  YASAI_FAULT_CU();
   return CUDA_ERROR_NOT_SUPPORTED;
 }
-extern "C" CUresult CUDAAPI cuGreenCtxDestroy(void *) { return CUDA_ERROR_NOT_SUPPORTED; }
+extern "C" CUresult CUDAAPI cuGreenCtxDestroy(void *) {
+  YASAI_FAULT_CU(); return CUDA_ERROR_NOT_SUPPORTED; }
 extern "C" CUresult CUDAAPI cuGreenCtxGetDevResource(void *, void *, int) {
+  YASAI_FAULT_CU();
   return CUDA_ERROR_NOT_SUPPORTED;
 }
-extern "C" CUresult CUDAAPI cuCtxFromGreenCtx(void *, void *) { return CUDA_ERROR_NOT_SUPPORTED; }
+extern "C" CUresult CUDAAPI cuCtxFromGreenCtx(void *, void *) {
+  YASAI_FAULT_CU(); return CUDA_ERROR_NOT_SUPPORTED; }
 
 // cudaLaunchCooperativeKernel: a cooperative launch. All CTAs of the grid run together
 // (yasai_func_run), %envreg1:%envreg2 give the grid barrier workspace, and a grid larger than
@@ -11669,6 +12148,7 @@ extern "C" CUresult CUDAAPI cuCtxFromGreenCtx(void *, void *) { return CUDA_ERRO
 extern "C" cudaError_t CUDARTAPI cudaLaunchCooperativeKernel(const void *func, dim3 gridDim,
                                                              dim3 blockDim, void **args,
                                                              size_t sharedMem, cudaStream_t stream) {
+  YASAI_FAULT_RT();
   g_yasai_pending_cooperative = true;
   // As cudaLaunchKernelExC: cudaLaunchKernelInternal pushes the configuration (no <<<>>> stub).
   const cudaError_t e = cudaLaunchKernelInternal((const char *)func, gridDim, blockDim,
@@ -11687,6 +12167,7 @@ extern "C" CUresult CUDAAPI cuLaunchCooperativeKernel(CUfunction f, unsigned int
                                                       unsigned int blockDimZ,
                                                       unsigned int sharedMemBytes,
                                                       CUstream hStream, void **kernelParams) {
+  YASAI_FAULT_CU();
   g_yasai_pending_cooperative = true;
   const CUresult r = cuLaunchKernelInternal(f, gridDimX, gridDimY, gridDimZ, blockDimX,
                                             blockDimY, blockDimZ, sharedMemBytes, hStream,
@@ -11700,6 +12181,7 @@ extern "C" CUresult CUDAAPI cuLaunchCooperativeKernel(CUfunction f, unsigned int
 extern "C" cudaError_t CUDARTAPI cudaMemset2DAsync(void *devPtr, size_t pitch, int value,
                                                    size_t width, size_t height,
                                                    cudaStream_t stream) {
+  YASAI_FAULT_RT();
   for (size_t r = 0; r < height; ++r) {
     const cudaError_t e = cudaMemsetAsync((char *)devPtr + r * pitch, value, width, stream);
     if (e != cudaSuccess) return e;
@@ -11711,6 +12193,7 @@ extern "C" cudaError_t CUDARTAPI cudaMemset2DAsync(void *devPtr, size_t pitch, i
 //   numBlocks, func, blockSize, dynamicSMemSize  as in the CUDA runtime API
 extern "C" cudaError_t CUDARTAPI cudaOccupancyMaxActiveBlocksPerMultiprocessor(
     int *numBlocks, const void *func, int blockSize, size_t dynamicSMemSize) {
+  YASAI_FAULT_RT();
   return cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(numBlocks, (const char *)func,
                                                                 blockSize, dynamicSMemSize, 0);
 }
@@ -11726,6 +12209,7 @@ extern "C" CUresult CUDAAPI cuTensorMapEncodeIm2col(
     cuuint32_t pixelsPerColumn, const cuuint32_t *elementStrides, CUtensorMapInterleave interleave,
     CUtensorMapSwizzle swizzle, CUtensorMapL2promotion l2Promotion,
     CUtensorMapFloatOOBfill oobFill) {
+  YASAI_FAULT_CU();
   (void)tensorMap; (void)tensorDataType; (void)tensorRank; (void)globalAddress; (void)globalDim;
   (void)globalStrides; (void)pixelBoxLowerCorner; (void)pixelBoxUpperCorner;
   (void)channelsPerPixel; (void)pixelsPerColumn; (void)elementStrides; (void)interleave;
@@ -11952,6 +12436,7 @@ extern "C" {
 //   mode    capture mode (not used: every mode records the same way)
 __host__ cudaError_t CUDARTAPI cudaStreamBeginCapture(cudaStream_t stream,
                                                       enum cudaStreamCaptureMode mode) {
+  YASAI_FAULT_RT();
   (void)mode;
   if (stream == NULL) return g_last_cudaError = cudaErrorStreamCaptureUnsupported;
   std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
@@ -11966,6 +12451,7 @@ __host__ cudaError_t CUDARTAPI cudaStreamBeginCapture(cudaStream_t stream,
 //   stream  the stream the capture began on
 //   pGraph  receives the graph
 __host__ cudaError_t CUDARTAPI cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t *pGraph) {
+  YASAI_FAULT_RT();
   std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
   auto it = g_yasai_capturing.find(stream);
   if (it == g_yasai_capturing.end() || pGraph == NULL) return g_last_cudaError = cudaErrorIllegalState;
@@ -11989,6 +12475,7 @@ __host__ cudaError_t CUDARTAPI cudaStreamBeginCaptureToGraph(cudaStream_t stream
                                                              const cudaGraphNode_t *,
                                                              const cudaGraphEdgeData *, size_t,
                                                              enum cudaStreamCaptureMode) {
+  YASAI_FAULT_RT();
   if (stream == NULL || graph == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
   if (g_yasai_capturing.count(stream)) return g_last_cudaError = cudaErrorIllegalState;
@@ -12002,6 +12489,7 @@ __host__ cudaError_t CUDARTAPI cudaStreamBeginCaptureToGraph(cudaStream_t stream
 //   pCaptureStatus  receives the status
 __host__ cudaError_t CUDARTAPI cudaStreamIsCapturing(cudaStream_t stream,
                                                      enum cudaStreamCaptureStatus *pCaptureStatus) {
+  YASAI_FAULT_RT();
   if (pCaptureStatus == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   *pCaptureStatus = yasai_graph_of(stream) ? cudaStreamCaptureStatusActive : cudaStreamCaptureStatusNone;
   return g_last_cudaError = cudaSuccess;
@@ -12015,6 +12503,7 @@ __host__ cudaError_t CUDARTAPI cudaStreamGetCaptureInfo(
     unsigned long long *id_out, cudaGraph_t *graph_out,
     const cudaGraphNode_t **dependencies_out, const cudaGraphEdgeData **edgeData_out,
     size_t *numDependencies_out) {
+  YASAI_FAULT_RT();
   cudaGraph_t g = yasai_graph_of(stream);
   if (captureStatus_out)
     *captureStatus_out = g ? cudaStreamCaptureStatusActive : cudaStreamCaptureStatusNone;
@@ -12032,6 +12521,7 @@ __host__ cudaError_t CUDARTAPI cudaStreamGetCaptureInfo_v2(
     cudaStream_t stream, enum cudaStreamCaptureStatus *captureStatus_out,
     unsigned long long *id_out, cudaGraph_t *graph_out,
     const cudaGraphNode_t **dependencies_out, size_t *numDependencies_out) {
+  YASAI_FAULT_RT();
   return cudaStreamGetCaptureInfo(stream, captureStatus_out, id_out, graph_out, dependencies_out,
                                   NULL, numDependencies_out);
 }
@@ -12041,6 +12531,7 @@ __host__ cudaError_t CUDARTAPI cudaStreamGetCaptureInfo_v2(
 __host__ cudaError_t CUDARTAPI cudaStreamUpdateCaptureDependencies(cudaStream_t, cudaGraphNode_t *,
                                                                    const cudaGraphEdgeData *,
                                                                    size_t, unsigned int) {
+  YASAI_FAULT_RT();
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -12048,6 +12539,7 @@ __host__ cudaError_t CUDARTAPI cudaStreamUpdateCaptureDependencies(cudaStream_t,
 //   pGraph  receives the graph
 //   flags   must be 0
 __host__ cudaError_t CUDARTAPI cudaGraphCreate(cudaGraph_t *pGraph, unsigned int flags) {
+  YASAI_FAULT_RT();
   (void)flags;
   if (pGraph == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   *pGraph = new CUgraph_st();
@@ -12057,6 +12549,7 @@ __host__ cudaError_t CUDARTAPI cudaGraphCreate(cudaGraph_t *pGraph, unsigned int
 // cudaGraphDestroy: releases the graph's user-object references and frees it.
 //   graph  the graph
 __host__ cudaError_t CUDARTAPI cudaGraphDestroy(cudaGraph_t graph) {
+  YASAI_FAULT_RT();
   if (graph == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   for (const auto &uo : graph->user_objects) yasai_user_object_release(uo.first, uo.second);
   delete graph;
@@ -12067,6 +12560,7 @@ __host__ cudaError_t CUDARTAPI cudaGraphDestroy(cudaGraph_t graph) {
 //   graph, nodes, numNodes  as in the CUDA runtime API
 __host__ cudaError_t CUDARTAPI cudaGraphGetNodes(cudaGraph_t graph, cudaGraphNode_t *nodes,
                                                  size_t *numNodes) {
+  YASAI_FAULT_RT();
   if (graph == NULL || numNodes == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   if (nodes != NULL) {
     const size_t n = std::min(*numNodes, graph->nodes.size());
@@ -12082,6 +12576,7 @@ __host__ cudaError_t CUDARTAPI cudaGraphGetNodes(cudaGraph_t graph, cudaGraphNod
 __host__ cudaError_t CUDARTAPI cudaGraphNodeGetDependencies(cudaGraphNode_t node,
                                                             cudaGraphNode_t *pDependencies,
                                                             size_t *pNumDependencies) {
+  YASAI_FAULT_RT();
   (void)node;
   (void)pDependencies;
   if (pNumDependencies) *pNumDependencies = 0;
@@ -12093,6 +12588,7 @@ __host__ cudaError_t CUDARTAPI cudaGraphNodeGetDependencies(cudaGraphNode_t node
 __host__ cudaError_t CUDARTAPI cudaGraphAddDependencies(cudaGraph_t, const cudaGraphNode_t *,
                                                         const cudaGraphNode_t *,
                                                         const cudaGraphEdgeData *, size_t) {
+  YASAI_FAULT_RT();
   return g_last_cudaError = cudaSuccess;
 }
 
@@ -12102,6 +12598,7 @@ __host__ cudaError_t CUDARTAPI cudaGraphAddEventRecordNode(cudaGraphNode_t *pGra
                                                            cudaGraph_t graph,
                                                            const cudaGraphNode_t *, size_t,
                                                            cudaEvent_t event) {
+  YASAI_FAULT_RT();
   if (graph == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
   graph->nodes.emplace_back();
@@ -12117,6 +12614,7 @@ __host__ cudaError_t CUDARTAPI cudaUserObjectCreate(cudaUserObject_t *object_out
                                                     cudaHostFn_t destroy,
                                                     unsigned int initialRefcount,
                                                     unsigned int flags) {
+  YASAI_FAULT_RT();
   (void)flags;
   if (object_out == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   cudaUserObject_t o = new CUuserObject_st();
@@ -12130,6 +12628,7 @@ __host__ cudaError_t CUDARTAPI cudaUserObjectCreate(cudaUserObject_t *object_out
 // cudaUserObjectRetain: adds count references.
 //   object, count  as in the CUDA runtime API
 __host__ cudaError_t CUDARTAPI cudaUserObjectRetain(cudaUserObject_t object, unsigned int count) {
+  YASAI_FAULT_RT();
   if (object == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   object->refs += count;
   return g_last_cudaError = cudaSuccess;
@@ -12138,6 +12637,7 @@ __host__ cudaError_t CUDARTAPI cudaUserObjectRetain(cudaUserObject_t object, uns
 // cudaUserObjectRelease: drops count references (the last runs the destructor).
 //   object, count  as in the CUDA runtime API
 __host__ cudaError_t CUDARTAPI cudaUserObjectRelease(cudaUserObject_t object, unsigned int count) {
+  YASAI_FAULT_RT();
   if (object == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   yasai_user_object_release(object, count);
   return g_last_cudaError = cudaSuccess;
@@ -12148,6 +12648,7 @@ __host__ cudaError_t CUDARTAPI cudaUserObjectRelease(cudaUserObject_t object, un
 //   graph, object, count, flags  as in the CUDA runtime API
 __host__ cudaError_t CUDARTAPI cudaGraphRetainUserObject(cudaGraph_t graph, cudaUserObject_t object,
                                                          unsigned int count, unsigned int flags) {
+  YASAI_FAULT_RT();
   if (graph == NULL || object == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   if (!(flags & cudaGraphUserObjectMove)) object->refs += count;
   graph->user_objects.emplace_back(object, count);
@@ -12158,6 +12659,7 @@ __host__ cudaError_t CUDARTAPI cudaGraphRetainUserObject(cudaGraph_t graph, cuda
 //   pGraphExec, graph, flags  as in the CUDA runtime API
 __host__ cudaError_t CUDARTAPI cudaGraphInstantiate(cudaGraphExec_t *pGraphExec, cudaGraph_t graph,
                                                     unsigned long long flags) {
+  YASAI_FAULT_RT();
   (void)flags;
   if (pGraphExec == NULL || graph == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   cudaGraphExec_t e = new CUgraphExec_st();
@@ -12171,6 +12673,7 @@ __host__ cudaError_t CUDARTAPI cudaGraphInstantiate(cudaGraphExec_t *pGraphExec,
 __host__ cudaError_t CUDARTAPI cudaGraphInstantiateWithFlags(cudaGraphExec_t *pGraphExec,
                                                              cudaGraph_t graph,
                                                              unsigned long long flags) {
+  YASAI_FAULT_RT();
   return cudaGraphInstantiate(pGraphExec, graph, flags);
 }
 
@@ -12178,6 +12681,7 @@ __host__ cudaError_t CUDARTAPI cudaGraphInstantiateWithFlags(cudaGraphExec_t *pG
 //   graphExec, graph, resultInfo  as in the CUDA runtime API
 __host__ cudaError_t CUDARTAPI cudaGraphExecUpdate(cudaGraphExec_t graphExec, cudaGraph_t graph,
                                                    cudaGraphExecUpdateResultInfo *resultInfo) {
+  YASAI_FAULT_RT();
   if (graphExec == NULL || graph == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   graphExec->nodes.assign(graph->nodes.begin(), graph->nodes.end());
   if (resultInfo) {
@@ -12190,6 +12694,7 @@ __host__ cudaError_t CUDARTAPI cudaGraphExecUpdate(cudaGraphExec_t graphExec, cu
 // cudaGraphUpload: nothing to upload in the simulator.
 //   graphExec, stream  as in the CUDA runtime API
 __host__ cudaError_t CUDARTAPI cudaGraphUpload(cudaGraphExec_t graphExec, cudaStream_t stream) {
+  YASAI_FAULT_RT();
   (void)stream;
   return g_last_cudaError = graphExec ? cudaSuccess : cudaErrorInvalidValue;
 }
@@ -12198,6 +12703,7 @@ __host__ cudaError_t CUDARTAPI cudaGraphUpload(cudaGraphExec_t graphExec, cudaSt
 // appended to that capture instead.
 //   graphExec, stream  as in the CUDA runtime API
 __host__ cudaError_t CUDARTAPI cudaGraphLaunch(cudaGraphExec_t graphExec, cudaStream_t stream) {
+  YASAI_FAULT_RT();
   if (graphExec == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   if (cudaGraph_t g = yasai_graph_of(stream)) {
     std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
@@ -12214,6 +12720,7 @@ __host__ cudaError_t CUDARTAPI cudaGraphLaunch(cudaGraphExec_t graphExec, cudaSt
 // cudaGraphExecDestroy: frees the executable graph.
 //   graphExec  as in the CUDA runtime API
 __host__ cudaError_t CUDARTAPI cudaGraphExecDestroy(cudaGraphExec_t graphExec) {
+  YASAI_FAULT_RT();
   delete graphExec;
   return g_last_cudaError = cudaSuccess;
 }
@@ -12222,6 +12729,7 @@ __host__ cudaError_t CUDARTAPI cudaGraphExecDestroy(cudaGraphExec_t graphExec) {
 //   graph, path, flags  as in the CUDA runtime API
 __host__ cudaError_t CUDARTAPI cudaGraphDebugDotPrint(cudaGraph_t graph, const char *path,
                                                       unsigned int flags) {
+  YASAI_FAULT_RT();
   (void)flags;
   if (graph == NULL || path == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   if (FILE *f = fopen(path, "w")) {
@@ -12234,40 +12742,49 @@ __host__ cudaError_t CUDARTAPI cudaGraphDebugDotPrint(cudaGraph_t graph, const c
 // Driver API equivalents (cuStream*Capture*, cuGraph*): the runtime functions above.
 //   (parameters as in cuda.h)
 CUresult CUDAAPI cuStreamBeginCapture_v2(CUstream hStream, CUstreamCaptureMode mode) {
+  YASAI_FAULT_CU();
   return cudaStreamBeginCapture((cudaStream_t)hStream, (enum cudaStreamCaptureMode)mode) == cudaSuccess
              ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 CUresult CUDAAPI cuStreamEndCapture(CUstream hStream, CUgraph *phGraph) {
+  YASAI_FAULT_CU();
   return cudaStreamEndCapture((cudaStream_t)hStream, (cudaGraph_t *)phGraph) == cudaSuccess
              ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 CUresult CUDAAPI cuStreamIsCapturing(CUstream hStream, CUstreamCaptureStatus *captureStatus) {
+  YASAI_FAULT_CU();
   enum cudaStreamCaptureStatus st;
   cudaStreamIsCapturing((cudaStream_t)hStream, &st);
   if (captureStatus) *captureStatus = (CUstreamCaptureStatus)st;
   return CUDA_SUCCESS;
 }
 CUresult CUDAAPI cuGraphCreate(CUgraph *phGraph, unsigned int flags) {
+  YASAI_FAULT_CU();
   return cudaGraphCreate((cudaGraph_t *)phGraph, flags) == cudaSuccess ? CUDA_SUCCESS
                                                                         : CUDA_ERROR_INVALID_VALUE;
 }
 CUresult CUDAAPI cuGraphInstantiateWithFlags(CUgraphExec *phGraphExec, CUgraph hGraph,
                                              unsigned long long flags) {
+  YASAI_FAULT_CU();
   return cudaGraphInstantiate((cudaGraphExec_t *)phGraphExec, (cudaGraph_t)hGraph, flags) == cudaSuccess
              ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 CUresult CUDAAPI cuGraphLaunch(CUgraphExec hGraphExec, CUstream hStream) {
+  YASAI_FAULT_CU();
   return cudaGraphLaunch((cudaGraphExec_t)hGraphExec, (cudaStream_t)hStream) == cudaSuccess
              ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 CUresult CUDAAPI cuGraphDestroy(CUgraph hGraph) {
+  YASAI_FAULT_CU();
   return cudaGraphDestroy((cudaGraph_t)hGraph) == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 CUresult CUDAAPI cuGraphExecDestroy(CUgraphExec hGraphExec) {
+  YASAI_FAULT_CU();
   return cudaGraphExecDestroy((cudaGraphExec_t)hGraphExec) == cudaSuccess ? CUDA_SUCCESS
                                                                           : CUDA_ERROR_INVALID_VALUE;
 }
 CUresult CUDAAPI cuGraphUpload(CUgraphExec hGraphExec, CUstream hStream) {
+  YASAI_FAULT_CU();
   return cudaGraphUpload((cudaGraphExec_t)hGraphExec, (cudaStream_t)hStream) == cudaSuccess
              ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
@@ -12303,6 +12820,7 @@ static std::vector<std::string> yasai_module_entries(CUmodule module) {
 //   library, code, options  as in cuda.h (options not used)
 extern "C" CUresult CUDAAPI cuLibraryLoadData(void **library, const void *code, void *, void **,
                                               unsigned, void *, void **, unsigned) {
+  YASAI_FAULT_CU();
   if (library == NULL) return CUDA_ERROR_INVALID_VALUE;
   CUmodule module = NULL;
   const CUresult r = yasai_load_module_image(&module, code, __my_func__);
@@ -12315,6 +12833,7 @@ extern "C" CUresult CUDAAPI cuLibraryLoadData(void **library, const void *code, 
 //   library, fileName, options  as in cuda.h (options not used)
 extern "C" CUresult CUDAAPI cuLibraryLoadFromFile(void **library, const char *fileName, void *,
                                                   void **, unsigned, void *, void **, unsigned) {
+  YASAI_FAULT_CU();
   if (library == NULL || fileName == NULL) return CUDA_ERROR_INVALID_VALUE;
   CUmodule module = NULL;
   const std::string sidecar = sidecar_ptx_for_module(fileName);
@@ -12335,6 +12854,7 @@ extern "C" CUresult CUDAAPI cuLibraryLoadFromFile(void **library, const char *fi
 // cuLibraryUnload: modules stay loaded.
 //   library  as in cuda.h
 extern "C" CUresult CUDAAPI cuLibraryUnload(void *library) {
+  YASAI_FAULT_CU();
   (void)library;
   return CUDA_SUCCESS;
 }
@@ -12342,6 +12862,7 @@ extern "C" CUresult CUDAAPI cuLibraryUnload(void *library) {
 // cuLibraryGetModule: the library is a module.
 //   pMod, library  as in cuda.h
 extern "C" CUresult CUDAAPI cuLibraryGetModule(CUmodule *pMod, void *library) {
+  YASAI_FAULT_CU();
   if (pMod == NULL) return CUDA_ERROR_INVALID_VALUE;
   *pMod = (CUmodule)library;
   return CUDA_SUCCESS;
@@ -12350,6 +12871,7 @@ extern "C" CUresult CUDAAPI cuLibraryGetModule(CUmodule *pMod, void *library) {
 // cuLibraryGetKernel: the kernel of that name.
 //   pKernel, library, name  as in cuda.h
 extern "C" CUresult CUDAAPI cuLibraryGetKernel(void **pKernel, void *library, const char *name) {
+  YASAI_FAULT_CU();
   if (pKernel == NULL) return CUDA_ERROR_INVALID_VALUE;
   CUfunction f = NULL;
   const CUresult r = cuModuleGetFunction(&f, (CUmodule)library, name);
@@ -12360,6 +12882,7 @@ extern "C" CUresult CUDAAPI cuLibraryGetKernel(void **pKernel, void *library, co
 // cuLibraryGetKernelCount: number of entries of the library's PTX.
 //   count, library  as in cuda.h
 extern "C" CUresult CUDAAPI cuLibraryGetKernelCount(unsigned int *count, void *library) {
+  YASAI_FAULT_CU();
   if (count == NULL) return CUDA_ERROR_INVALID_VALUE;
   *count = (unsigned)yasai_module_entries((CUmodule)library).size();
   return CUDA_SUCCESS;
@@ -12369,6 +12892,7 @@ extern "C" CUresult CUDAAPI cuLibraryGetKernelCount(unsigned int *count, void *l
 //   kernels, numKernels, library  as in cuda.h
 extern "C" CUresult CUDAAPI cuLibraryEnumerateKernels(void **kernels, unsigned int numKernels,
                                                       void *library) {
+  YASAI_FAULT_CU();
   if (kernels == NULL) return CUDA_ERROR_INVALID_VALUE;
   const std::vector<std::string> names = yasai_module_entries((CUmodule)library);
   for (unsigned i = 0; i < numKernels && i < names.size(); ++i) {
@@ -12383,6 +12907,7 @@ extern "C" CUresult CUDAAPI cuLibraryEnumerateKernels(void **kernels, unsigned i
 // cuKernelGetFunction: a kernel is its function.
 //   pFunc, kernel  as in cuda.h
 extern "C" CUresult CUDAAPI cuKernelGetFunction(CUfunction *pFunc, void *kernel) {
+  YASAI_FAULT_CU();
   if (pFunc == NULL) return CUDA_ERROR_INVALID_VALUE;
   *pFunc = (CUfunction)kernel;
   return CUDA_SUCCESS;
@@ -12391,6 +12916,7 @@ extern "C" CUresult CUDAAPI cuKernelGetFunction(CUfunction *pFunc, void *kernel)
 // cuKernelGetName: the entry name of the kernel.
 //   name, kernel  as in cuda.h
 extern "C" CUresult CUDAAPI cuKernelGetName(const char **name, void *kernel) {
+  YASAI_FAULT_CU();
   if (name == NULL || kernel == NULL) return CUDA_ERROR_INVALID_VALUE;
   static std::map<void *, std::string> names;
   function_info *f = reinterpret_cast<function_info *>(kernel);
@@ -12430,6 +12956,7 @@ static int yasai_max_active_clusters(const void *attrs, unsigned num) {
 /// cudaOccupancyMaxActiveClusters (CUTLASS sizes its persistent cluster grids with it).
 extern "C" __host__ cudaError_t CUDARTAPI cudaOccupancyMaxActiveClusters(
     int *numClusters, const void *func, const yasai_cudaLaunchConfig *config) {
+  YASAI_FAULT_RT();
   (void)func;
   if (!numClusters || !config) return g_last_cudaError = cudaErrorInvalidValue;
   *numClusters = yasai_max_active_clusters(config->attrs, config->numAttrs);
@@ -12439,6 +12966,7 @@ extern "C" __host__ cudaError_t CUDARTAPI cudaOccupancyMaxActiveClusters(
 /// cuOccupancyMaxActiveClusters: the driver form of the same query.
 extern "C" CUresult CUDAAPI cuOccupancyMaxActiveClusters(int *numClusters, CUfunction func,
                                                          const yasai_CUlaunchConfig *config) {
+  YASAI_FAULT_CU();
   (void)func;
   if (!numClusters || !config) return CUDA_ERROR_INVALID_VALUE;
   *numClusters = yasai_max_active_clusters(config->attrs, config->numAttrs);
@@ -12459,12 +12987,14 @@ extern "C" __host__ cudaError_t CUDARTAPI cudaLaunchKernel_ptsz(const void *func
                                                                 dim3 blockDim, void **args,
                                                                 size_t sharedMem,
                                                                 cudaStream_t stream) {
+  YASAI_FAULT_RT();
   return cudaLaunchKernel((const char *)func, gridDim, blockDim, (const void **)args, sharedMem,
                           yasai_ptsz_stream(stream));
 }
 
 extern "C" __host__ cudaError_t CUDARTAPI cudaLaunchKernelExC_ptsz(const cudaLaunchConfig_t *config,
                                                                    const void *func, void **args) {
+  YASAI_FAULT_RT();
   if (config == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   cudaLaunchConfig_t c = *config;
   c.stream = yasai_ptsz_stream(c.stream);
@@ -12474,6 +13004,7 @@ extern "C" __host__ cudaError_t CUDARTAPI cudaLaunchKernelExC_ptsz(const cudaLau
 extern "C" __host__ cudaError_t CUDARTAPI cudaLaunchCooperativeKernel_ptsz(
     const void *func, dim3 gridDim, dim3 blockDim, void **args, size_t sharedMem,
     cudaStream_t stream) {
+  YASAI_FAULT_RT();
   return cudaLaunchCooperativeKernel(func, gridDim, blockDim, args, sharedMem,
                                      yasai_ptsz_stream(stream));
 }

@@ -460,7 +460,7 @@ bool launch_only() { return g_launch_only; }
 bool cta_sampled() { return !g_launch_only && (config().cta_sample || g_sample_kernel); }
 
 bool cta_is_representative(Dim3 g, unsigned cta_linear_id) {
-  if (g_launch_only) return false;
+  if (g_launch_only || kernel_fault()) return false;  // yasai: no CTA runs after a kernel fault
   if (!config().cta_sample && !g_sample_kernel) return true;
   const unsigned x = cta_linear_id % g.x;
   const unsigned y = (cta_linear_id / g.x) % g.y;
@@ -788,6 +788,20 @@ bool mbar_phase_done(uint64_t cta_key, uint32_t addr, uint32_t parity) {
   const bool done = (it->second.phase & 1u) != (parity & 1u);
   if (mbar_debug()) mbar_log(done ? "wait_true" : "wait_false", cta_key, addr, parity, &it->second);
   return done;
+}
+
+static std::atomic<bool> g_kernel_fault{false};
+
+bool kernel_fault() { return g_kernel_fault.load(std::memory_order_relaxed); }
+
+void raise_kernel_fault(const char *what, const char *kernel, unsigned long long pc, unsigned ctax, unsigned ctay,
+                        unsigned ctaz, unsigned tidx, unsigned tidy, unsigned tidz, const char *source) {
+  if (g_kernel_fault.exchange(true)) return;
+  fprintf(stderr,
+          "yasai-kernel-fault: %s in kernel %s, pc 0x%llx, cta (%u,%u,%u) tid (%u,%u,%u), source \"%s\": the kernel "
+          "stops and CUDA calls of this process now return 719 (CUDA_ERROR_LAUNCH_FAILED)\n",
+          what, kernel, pc, ctax, ctay, ctaz, tidx, tidy, tidz, source + strspn(source, " \t"));
+  fflush(stderr);
 }
 
 uint32_t mbar_phase(uint64_t cta_key, uint32_t addr) {
