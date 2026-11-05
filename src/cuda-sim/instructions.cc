@@ -3612,6 +3612,32 @@ static uint64_t f2i(double v, bool src_f64, unsigned to_width, bool to_signed, i
   return uint64_t(r);
 }
 
+/// Integer to integer conversion as a GPU does it (value sweep, key_values.cu): .sat clamps the source's value to the destination's range, without it the value is cut to the
+/// destination's width, and a signed destination is sign-extended to the register (cvt.s8.s32 of 0x7fffffff writes 0xffff in a 16-bit register; cvt.sat.s8.s32 of 0x80000000 writes
+/// 0xffffff80 in a 32-bit register). raw: the source's bits; from_width, to_width: 8, 16, 32 or 64; from_signed, to_signed: the types' signs; sat: .sat.
+static inline uint64_t i2i(uint64_t raw, unsigned from_width, bool from_signed, unsigned to_width, bool to_signed, bool sat) {
+  const uint64_t from_mask = from_width >= 64 ? ~0ull : (1ull << from_width) - 1;
+  raw &= from_mask;
+  __int128 v = (__int128)raw;
+  if (from_signed && from_width < 64 && ((raw >> (from_width - 1)) & 1)) v -= (__int128)1 << from_width;
+  if (from_signed && from_width == 64) v = (__int128)(int64_t)raw;
+  if (sat) {
+    const __int128 hi = to_signed ? ((__int128)1 << (to_width - 1)) - 1 : ((__int128)1 << to_width) - 1;
+    const __int128 lo = to_signed ? -((__int128)1 << (to_width - 1)) : (__int128)0;
+    if (v > hi) v = hi;
+    if (v < lo) v = lo;
+  }
+  uint64_t r = (uint64_t)v;
+  if (to_width < 64) {
+    const uint64_t mask = (1ull << to_width) - 1;
+    if (to_signed && ((r >> (to_width - 1)) & 1))
+      r |= ~mask;
+    else
+      r &= mask;
+  }
+  return r;
+}
+
 }  // namespace yasai_cvt
 
 ptx_reg_t f2x(ptx_reg_t x, unsigned from_width, unsigned to_width, int to_sign,
@@ -4539,6 +4565,14 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       default:
         assert(0);
     }
+  }
+
+  // yasai: integer to integer (yasai_cvt::i2i). The table's chop neither sign-extended a signed destination nor saturated.
+  if (src_fmt < 8 && dst_fmt < 8) {
+    ptx_reg_t result;
+    result.u64 = yasai_cvt::i2i(data.u64, unsigned(from_width), from_sign == 1, unsigned(to_width), to_sign == 1, saturation_mode != 0);
+    thread->set_operand_value(dst, result, to_type, thread, pI);
+    return;
   }
 
   if (g_cvt_fn[src_fmt][dst_fmt] != NULL) {
