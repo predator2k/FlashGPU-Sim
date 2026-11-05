@@ -2121,12 +2121,14 @@ static unsigned datatype2size(unsigned data_type) {
     case S16_TYPE:
     case U16_TYPE:
     case F16_TYPE:
+    case BF16_TYPE:  // yasai: atom.add.noftz.bf16, ld/st of .bf16
       data_size = 2;
       break;
     case B32_TYPE:
     case S32_TYPE:
     case U32_TYPE:
     case F32_TYPE:
+    case F16X2_TYPE:  // yasai: atom.add.noftz.f16x2 and .bf16x2 (bf16x2 is F16X2_TYPE with a flag)
       data_size = 4;
       break;
     case B64_TYPE:

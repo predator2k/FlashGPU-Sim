@@ -4400,9 +4400,11 @@ void cvta_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
         break;
       case param_space_unclassified:
       case param_space_kernel:
+      case const_space:  // yasai: .const variables live at their own addresses in the global window
         to_addr_hw = from_addr_hw;
         break;
       default:
+        fprintf(stderr, "yasai-cvta: %s: state space not implemented\n", pI->to_string().c_str());
         abort();
     }
   } else {
@@ -4420,9 +4422,11 @@ void cvta_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
         break;
       case param_space_unclassified:
       case param_space_kernel:
+      case const_space:  // yasai: see above (generic loads of the address read the same bytes)
         to_addr_hw = from_addr_hw;
         break;
       default:
+        fprintf(stderr, "yasai-cvta: %s: state space not implemented\n", pI->to_string().c_str());
         abort();
     }
   }
@@ -7389,11 +7393,69 @@ void setp_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     return;
   }
 
-  assert(pI->get_num_operands() <
-         4);  // or need to deal with "c" operand / boolOp
-
   unsigned type = pI->get_type();
   unsigned cmpop = pI->get_cmpop();
+  // yasai: the boolean operation (.and, .or, .xor with the predicate c, which may be negated), the
+  // p|q destination (q takes the negated comparison, or the high half's), and the packed f16x2 and
+  // bf16x2 forms, each half compared in f32 (exact). PTX ISA setp: p = BoolOp(t, c), q = BoolOp(!t, c);
+  // packed: p = BoolOp(t[lo], c), q = BoolOp(t[hi], c). Measured on a GB10 (tests/gaps_m2.cu).
+  const bool packed = type == F16X2_TYPE;
+  if (pI->get_num_operands() >= 4 || dst.is_vector() || packed) {
+    bool has_c = pI->get_num_operands() >= 4, c = false;
+    if (has_c) {
+      const operand_info &cop = pI->src3();
+      c = !(thread->get_operand_value(cop, cop, PRED_TYPE, thread, 1).pred & 1);
+      if (cop.is_neg_pred()) c = !c;
+    }
+    auto combine = [&](bool v) {
+      if (!has_c) return v;
+      switch (pI->get_atomic()) {
+        case ATOMIC_AND: return v && c;
+        case ATOMIC_OR: return v || c;
+        case ATOMIC_XOR: return v != c;
+        default:
+          fprintf(stderr, "yasai-setp: %s: a c operand without .and, .or or .xor\n",
+                  pI->to_string().c_str());
+          abort();
+      }
+    };
+    bool p, q;
+    if (packed) {
+      const bool bf16 = pI->is_bf16x2();
+      const uint32_t av = thread->get_operand_value(src1, dst, B32_TYPE, thread, 1).u32;
+      const uint32_t bv = thread->get_operand_value(src2, dst, B32_TYPE, thread, 1).u32;
+      bool th[2];
+      for (int h = 0; h < 2; ++h) {
+        ptx_reg_t x, y;
+        x.u64 = 0;
+        y.u64 = 0;
+        x.f32 = packed_half_to_f32(uint16_t(av >> (16 * h)), bf16);
+        y.f32 = packed_half_to_f32(uint16_t(bv >> (16 * h)), bf16);
+        th[h] = CmpOp(F32_TYPE, x, y, cmpop);
+      }
+      p = combine(th[0]);
+      q = combine(th[1]);
+    } else {
+      a = thread->get_operand_value(src1, dst, type, thread, 1);
+      b = thread->get_operand_value(src2, dst, type, thread, 1);
+      const bool tv = CmpOp(type, a, b, cmpop);
+      p = combine(tv);
+      q = combine(!tv);
+    }
+    ptx_reg_t pd, qd;
+    pd.u64 = 0;
+    qd.u64 = 0;
+    pd.pred = p ? 0 : 1;  // predicates are stored inverted (0 means true)
+    qd.pred = q ? 0 : 1;
+    if (dst.is_vector()) {
+      thread->set_reg(dst.vec_symbol(0), pd);
+      thread->set_reg(dst.vec_symbol(1), qd);
+    } else {
+      thread->set_operand_value(dst, pd, PRED_TYPE, thread, pI);
+    }
+    return;
+  }
+
   a = thread->get_operand_value(src1, dst, type, thread, 1);
   b = thread->get_operand_value(src2, dst, type, thread, 1);
 

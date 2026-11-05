@@ -203,6 +203,10 @@ void mbar_complete_tx(uint64_t cta_key, uint32_t addr, int64_t bytes);
 // as completed (warned once), so a missed init cannot hang the simulation.
 bool mbar_phase_done(uint64_t cta_key, uint32_t addr, uint32_t parity);
 
+/// The current phase number of the mbarrier at addr (0 when it was not initialised): the state that
+/// mbarrier.arrive returns, which try_wait and test_wait without .parity take as the phase to wait for.
+uint32_t mbar_phase(uint64_t cta_key, uint32_t addr);
+
 // mbarrier.inval: forget the state.
 void mbar_inval(uint64_t cta_key, uint32_t addr);
 

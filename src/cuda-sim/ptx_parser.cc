@@ -715,7 +715,8 @@ void ptx_recognizer::req_ncta_per_cluster(int x, int y, int z) {
 // yasai: see ptx_parser.h.
 void ptx_recognizer::shared_window_space() {
   if (g_space_spec == undefined_space &&
-      (g_opcode == LD_OP || g_opcode == ST_OP || g_opcode == ATOM_OP || g_opcode == RED_OP))
+      (g_opcode == LD_OP || g_opcode == ST_OP || g_opcode == ATOM_OP || g_opcode == RED_OP ||
+       g_opcode == CVTA_OP))  // yasai: cvta.to.shared::cta, cvta.shared::cta
     add_space_spec(shared_space, 0);
 }
 

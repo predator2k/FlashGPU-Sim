@@ -790,6 +790,14 @@ bool mbar_phase_done(uint64_t cta_key, uint32_t addr, uint32_t parity) {
   return done;
 }
 
+uint32_t mbar_phase(uint64_t cta_key, uint32_t addr) {
+  mbar_canonical(cta_key, addr);
+  MbarShard &sh = mbar_shard(cta_key);
+  std::lock_guard<std::mutex> lk(sh.mu);
+  auto it = sh.map.find({cta_key, addr});
+  return it == sh.map.end() ? 0u : uint32_t(it->second.phase);
+}
+
 void mbar_inval(uint64_t cta_key, uint32_t addr) {
   mbar_canonical(cta_key, addr);
   MbarShard &sh = mbar_shard(cta_key);
