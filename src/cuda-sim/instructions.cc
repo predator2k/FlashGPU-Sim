@@ -1727,6 +1727,11 @@ uint64_t yasai_atom_shared(const ptx_instruction *pI, ptx_thread_info *thread, a
                            uint64_t b, uint64_t c);
 bool yasai_atom_is_shared(const ptx_instruction *pI, memory_space_t space, addr_t addr);
 
+// yasai: atom.add of f64, f16, bf16, f16x2 and bf16x2 in atom_callback's switch (shared memory, and the
+// global words the switch handles), with the arithmetic and NaN rules of yasai_rmw::apply (defined after
+// yasai_rmw.inc).
+static uint64_t yasai_atom_add_fp(const ptx_instruction *pI, uint64_t a, uint64_t b);
+
 void atom_callback(const inst_t *inst, ptx_thread_info *thread) {
   const ptx_instruction *pI = dynamic_cast<const ptx_instruction *>(inst);
 
@@ -1968,6 +1973,13 @@ void atom_callback(const inst_t *inst, ptx_thread_info *thread) {
           if (std::isnan(op_result.f32)) op_result.u32 = 0x7fffffffu;  // yasai: canonical NaN (yasai_nan)
           data_ready = true;
           break;
+        case F64_TYPE:  // yasai: atom.shared.add.f64 and the 16-bit float types
+        case F16_TYPE:
+        case BF16_TYPE:
+        case F16X2_TYPE:
+          op_result.u64 = yasai_atom_add_fp(pI, data.u64, src2_data.u64);
+          data_ready = true;
+          break;
         default:
           printf(
               "Execution error: type mismatch with instruction\natom.ADD only "
@@ -2143,6 +2155,11 @@ void multimem_st_impl(const ptx_instruction *pI, ptx_thread_info *thread);
 void multimem_red_impl(const ptx_instruction *pI, ptx_thread_info *thread);
 void cvt_pack_impl(const ptx_instruction *pI, ptx_thread_info *thread);
 #include "yasai_rmw.inc"
+
+static uint64_t yasai_atom_add_fp(const ptx_instruction *pI, uint64_t a, uint64_t b) {
+  unsigned word_bytes;
+  return yasai_rmw::apply(ATOMIC_ADD, pI->get_type(), pI->is_bf16x2(), a, b, 0, &word_bytes);
+}
 
 void bar_impl(const ptx_instruction *pIin, ptx_thread_info *thread) {
   ptx_instruction *pI = const_cast<ptx_instruction *>(pIin);
@@ -2860,7 +2877,11 @@ void mma_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst) {
             hex_val = (v[k / 2].s64 & 0xffff);
           else
             hex_val = ((v[k / 2].s64 & 0xffff0000) >> 16);
-          nw_v[k].f16 = *(reinterpret_cast<half *>(hex_val));
+          // yasai: the half with these bits (the cast took hex_val as an address and crashed).
+          {
+            const uint16_t bits16 = uint16_t(hex_val);
+            memcpy(&nw_v[k].f16, &bits16, sizeof bits16);
+          }
         }
       }
       if (!((operand_num == 3) && (type2 == F32_TYPE))) {
