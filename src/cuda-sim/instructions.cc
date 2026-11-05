@@ -1477,8 +1477,62 @@ static bool yasai_mixed_f32_binop(const ptx_instruction *pI, ptx_thread_info *th
 // yasai: see yasai_fused_add (defined after yasai_fma, before mad_def).
 static void yasai_fused_add(const ptx_instruction *pI, ptx_thread_info *thread, bool is_sub);
 
+// yasai: extended-precision integer arithmetic with the carry flag CC.CF of the executing thread (PTX
+// ISA: add.cc, addc{.cc}, sub.cc, subc{.cc}, mad{.lo,.hi}.cc, madc{.lo,.hi}{.cc}; .u32, .s32, .u64,
+// .s64). add: d = a + b (+ CF); sub: d = a - (b + CF), CF the borrow; mad: d = lo or hi of a * b (signed
+// for .s32 and .s64) + c (+ CF); .cc writes the carry (borrow) out of that sum into CF. Measured on a
+// GB10 (tests/gaps_m3.cu, case carry). Returns false for other instructions, so that the callers go on.
+static bool yasai_extp(const ptx_instruction *pI, ptx_thread_info *thread) {
+  const unsigned op = pI->get_opcode();
+  const bool use_cf = op == ADDC_OP || op == SUBC_OP || op == MADC_OP;
+  if (!pI->yasai_cc() && !use_cf) return false;
+  const unsigned t = pI->get_type();
+  const bool w64 = t == U64_TYPE || t == S64_TYPE || t == B64_TYPE;
+  const bool sgn = t == S32_TYPE || t == S64_TYPE;
+  if (!w64 && t != U32_TYPE && t != S32_TYPE && t != B32_TYPE) return false;
+  const unsigned bits = w64 ? 64 : 32;
+  const uint64_t mask = w64 ? ~0ull : 0xffffffffull;
+  const operand_info &dst = pI->dst();
+  auto val = [&](const operand_info &o) {
+    return thread->get_operand_value(o, dst, t, thread, 1).u64 & mask;
+  };
+  const unsigned cin = use_cf ? thread->yasai_cf() : 0;
+  const uint64_t a = val(pI->src1()), b = val(pI->src2());
+  unsigned __int128 sum;
+  uint64_t res;
+  unsigned cout;
+  if (op == SUB_OP || op == SUBC_OP) {
+    const unsigned __int128 sub = (unsigned __int128)b + cin;
+    res = (a - b - cin) & mask;
+    cout = (unsigned __int128)a < sub ? 1 : 0;
+  } else {
+    uint64_t x = a, y = b;
+    if (op == MAD_OP || op == MADC_OP) {
+      unsigned __int128 prod;
+      if (sgn) {
+        const __int128 sa = w64 ? (__int128)(int64_t)a : (__int128)(int32_t)a;
+        const __int128 sb = w64 ? (__int128)(int64_t)b : (__int128)(int32_t)b;
+        prod = (unsigned __int128)(sa * sb);
+      } else {
+        prod = (unsigned __int128)a * b;
+      }
+      x = uint64_t((pI->is_hi() ? (prod >> bits) : prod) & mask);
+      y = val(pI->src3());
+    }
+    sum = (unsigned __int128)x + y + cin;
+    res = uint64_t(sum & mask);
+    cout = unsigned((sum >> bits) & 1);
+  }
+  ptx_reg_t d;
+  d.u64 = res;
+  thread->set_operand_value(dst, d, t, thread, pI);
+  if (pI->yasai_cc()) thread->yasai_set_cf(cout);
+  return true;
+}
+
 void add_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   if (pI->yasai_fuse_src()) return yasai_fused_add(pI, thread, false);  // yasai_contract.h
+  if (pI->yasai_cc() && yasai_extp(pI, thread)) return;  // yasai: add.cc
   if (yasai_packed_binop(pI, thread, '+')) return;
   if (yasai_mixed_f32_binop(pI, thread, '+')) return;  // yasai
   ptx_reg_t src1_data, src2_data, data;
@@ -1601,6 +1655,7 @@ void add_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 }
 
 void addc_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  if (yasai_extp(pI, thread)) return;  // yasai
   inst_not_implemented(pI);
 }
 
@@ -5423,6 +5478,7 @@ void mad24_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 }
 
 void mad_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  if (pI->yasai_cc() && yasai_extp(pI, thread)) return;  // yasai: mad.lo.cc, mad.hi.cc
   mad_def(pI, thread, false);
 }
 
@@ -5431,6 +5487,8 @@ void madp_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 }
 
 void madc_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  // yasai: PTX madc (carry in CC.CF); the PTXPlus form with a carry predicate operand takes mad_def.
+  if (pI->get_num_operands() == 4 && yasai_extp(pI, thread)) return;
   mad_def(pI, thread, true);
 }
 
@@ -8239,6 +8297,7 @@ static bool yasai_mixed_f32_binop(const ptx_instruction *pI, ptx_thread_info *th
 
 void sub_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   if (pI->yasai_fuse_src()) return yasai_fused_add(pI, thread, true);  // yasai_contract.h
+  if (pI->yasai_cc() && yasai_extp(pI, thread)) return;  // yasai: sub.cc
   if (yasai_packed_binop(pI, thread, '-')) return;  // yasai
   if (yasai_mixed_f32_binop(pI, thread, '-')) return;  // yasai
   ptx_reg_t data;
@@ -8341,6 +8400,7 @@ void nop_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 }
 
 void subc_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  if (yasai_extp(pI, thread)) return;  // yasai
   inst_not_implemented(pI);
 }
 void suld_impl(const ptx_instruction *pI, ptx_thread_info *thread) {

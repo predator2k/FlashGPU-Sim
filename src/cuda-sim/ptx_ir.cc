@@ -1823,6 +1823,7 @@ ptx_instruction::ptx_instruction(
         m_inst_size = 4;  // bytes
         break;
       case EXTP_OPTION:
+        m_yasai_cc = true;  // yasai: .cc (see yasai_cc())
         break;
       case NC_OPTION:
         m_cache_option = last_ptx_inst_option;

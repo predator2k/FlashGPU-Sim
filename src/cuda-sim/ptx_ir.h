@@ -1338,6 +1338,8 @@ class ptx_instruction : public warp_inst_t {
   // yasai: the instruction names a rounding modifier (.rn, .rz, .rm, .rp or an integer form);
   // rounding_mode() answers RN for both an absent modifier and .rn.
   bool has_rounding_modifier() const { return m_yasai_rnd_explicit; }
+  // yasai: the instruction carries .cc (writes the carry flag CC.CF; instructions.cc yasai_extp).
+  bool yasai_cc() const { return m_yasai_cc; }
   // yasai: contraction of a mul and an add (yasai_contract.h). The analysis of the parsed function
   // gives each contracted mul a pair id (yasai_save_id) and each add or sub that fuses its product
   // the same id (yasai_fuse_id), the product's source position yasai_fuse_src (1 or 2; 0: none) and
@@ -1489,6 +1491,7 @@ class ptx_instruction : public warp_inst_t {
   bool m_relu = false;    // yasai: see is_relu()
   bool m_yasai_ftz = false;  // yasai: see is_ftz()
   bool m_yasai_rnd_explicit = false;           // yasai: see has_rounding_modifier()
+  bool m_yasai_cc = false;                     // yasai: see yasai_cc()
   int m_yasai_save_id = -1;                    // yasai: see yasai_save_id()
   int m_yasai_save_slot = -1;                  // yasai: see yasai_save_slot()
   int m_yasai_fuse_src = 0;                    // yasai: see yasai_fuse_src()
