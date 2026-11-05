@@ -3246,6 +3246,67 @@ unsigned int saturatei(unsigned int a, unsigned int max) {
   return a;
 }
 
+// ---- yasai: float-to-integer conversion (cvt.{rni,rzi,rmi,rpi}{.sat}.<int>.<float>) -------------
+// As an RTX 5090 does it (tests/cvt_int_probe.cu: 7,128 cases on the 5090, driver 580.159.03, file
+// tests/cvt_int_probe_ref5090.txt): the source rounded to an integer in the instruction's mode,
+// saturated to the destination's range with or without .sat (.sat changes no result), subnormal
+// sources taken as they are (cvt.rmi.s32.f32 of -1e-40 is -1; .ftz flushes them first through the
+// operand accessor), and NaN giving a value that depends on the source format and the width:
+//   f32, f16, bf16 to 8, 16 or 32 bits: 0; to 64 bits: 0x8000000000000000;
+//   f64 to a signed width: its most negative value (s8 -128, s16 -32768, s32 0x80000000), to an
+//   unsigned width the same bits (u8 0x80, u16 0x8000, u32 0x80000000), to 64 bits
+//   0x8000000000000000.
+// The conversion before held five defects (found 2026-11-05): f32 to s32/u32 by a C cast (undefined
+// for NaN and out-of-range values; x86 gives 0x80000000, and a negative value wraps in u32), f32 to
+// s64/u64 through 32 bits, an f64 u32 upper bound of (1 << 31) - 1, f64 64-bit bounds by 1 << 63 on
+// int (undefined), and an f16 source read as x.f32; subnormal f32 sources were also taken as zero.
+namespace yasai_cvt {
+
+// The integer of to_width bits for the value v (every f16, bf16 and f32 value is exact in double).
+//   v: the source value; src_f64: whether the source is f64 (the NaN result depends on it)
+//   to_width: 8, 16, 32 or 64; to_signed: whether the destination is signed
+//   rounding_mode: RNI_OPTION, RZI_OPTION, RMI_OPTION or RPI_OPTION (otherwise RZI)
+//   return: the integer, sign-extended (signed) or zero-extended (unsigned) to 64 bits, so that a
+//     register of any width holds what the GPU's holds
+static uint64_t f2i(double v, bool src_f64, unsigned to_width, bool to_signed, int rounding_mode) {
+  const int64_t smin = to_width == 64 ? INT64_MIN : -(int64_t(1) << (to_width - 1));
+  const int64_t smax = to_width == 64 ? INT64_MAX : (int64_t(1) << (to_width - 1)) - 1;
+  const uint64_t umax = to_width == 64 ? UINT64_MAX : (uint64_t(1) << to_width) - 1;
+  if (std::isnan(v)) {
+    if (to_width == 64) return 0x8000000000000000ull;
+    if (!src_f64) return 0;
+    return to_signed ? uint64_t(smin) : uint64_t(1) << (to_width - 1);
+  }
+  double r;
+  switch (rounding_mode) {
+    case RNI_OPTION:
+      r = std::nearbyint(v);  // ties to even in the default rounding mode
+      break;
+    case RMI_OPTION:
+      r = std::floor(v);
+      break;
+    case RPI_OPTION:
+      r = std::ceil(v);
+      break;
+    default:
+      r = std::trunc(v);
+      break;
+  }
+  // Bounds as exact powers of two in double: 2^(w-1) for signed, 2^w for unsigned.
+  if (to_signed) {
+    const double lim = std::ldexp(1.0, int(to_width) - 1);
+    if (r >= lim) return uint64_t(smax);
+    if (r < -lim) return uint64_t(smin);
+    return uint64_t(int64_t(r));
+  }
+  const double lim = std::ldexp(1.0, int(to_width));
+  if (r >= lim) return umax;
+  if (r < 0) return 0;
+  return uint64_t(r);
+}
+
+}  // namespace yasai_cvt
+
 ptx_reg_t f2x(ptx_reg_t x, unsigned from_width, unsigned to_width, int to_sign,
               int rounding_mode, int saturation_mode) {
   half mytemp;
@@ -3270,6 +3331,15 @@ ptx_reg_t f2x(ptx_reg_t x, unsigned from_width, unsigned to_width, int to_sign,
   }
 
   ptx_reg_t y;
+  // yasai: integer destinations as an RTX 5090 converts (yasai_cvt::f2i above); an f16 source is
+  // read from its 16 bits (x.f32 held the f16 bits as a float).
+  if (to_sign == 0 || to_sign == 1) {
+    (void)mode;
+    const double v = from_width == 16 ? double(half_float::detail::half2float<float>(x.u16))
+                                      : double(x.f32);
+    y.u64 = yasai_cvt::f2i(v, false, to_width, to_sign == 1, rounding_mode);
+    return y;
+  }
   if (to_sign == 1) {  // convert to 64-bit number first?
     int tmp = cuda_math::float2int(x.f32, mode);
     if ((x.u32 & 0x7f800000) == 0) tmp = 0;  // round denorm. FP to 0
@@ -3348,6 +3418,12 @@ double saturated2i(double a, double max, double min) {
 ptx_reg_t d2x(ptx_reg_t x, unsigned from_width, unsigned to_width, int to_sign,
               int rounding_mode, int saturation_mode) {
   assert(from_width == 64);
+  // yasai: integer destinations as an RTX 5090 converts (yasai_cvt::f2i).
+  if (to_sign == 0 || to_sign == 1) {
+    ptx_reg_t y;
+    y.u64 = yasai_cvt::f2i(x.f64, true, to_width, to_sign == 1, rounding_mode);
+    return y;
+  }
 
   double tmp;
   switch (rounding_mode) {
@@ -4053,6 +4129,22 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
         abort();
     }
     if (pI->is_neg()) f = -f;
+    // yasai: an integer destination is converted by yasai_cvt::f2i (any rounding modifier, all
+    // widths); .sat clamps to [0, 1] only for floating-point destinations.
+    switch (to_type) {
+      case S8_TYPE: case S16_TYPE: case S32_TYPE: case S64_TYPE:
+      case U8_TYPE: case U16_TYPE: case U32_TYPE: case U64_TYPE: {
+        size_t w = 0;
+        int sgn = 0;
+        type_info_key::type_decode(to_type, w, sgn);
+        ptx_reg_t iout;
+        iout.u64 = yasai_cvt::f2i(double(f), false, unsigned(w), sgn == 1, rounding_mode);
+        thread->set_operand_value(dst, iout, to_type, thread, pI);
+        return;
+      }
+      default:
+        break;
+    }
     if (saturation_mode) f = cuda_math::__saturatef(f);
     if (pI->is_relu() && !std::isnan(f) && f < 0.0f) f = 0.0f;  // yasai: cvt .relu
     ptx_reg_t out;
