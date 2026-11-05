@@ -465,6 +465,17 @@ void tensor_mma_impl(const ptx_instruction *pI, core_t *core,
     }
   }
 
+  // yasai: f16 accumulators (mma.sync ... .f16.f16.f16.f16: C and D in two f16x2 registers) take the
+  // generic model, which computes D exactly and rounds it once to f16; tensor_mma_f16_impl reads and writes
+  // f32 accumulators only. Measured on a GB10 (tests/gaps_m3.cu, case mma_f16).
+  if ((is_f16_type || is_bf16_type) && shape != MMA_M8N8K4) {
+    const std::list<int> tl = pI->get_scalar_type();
+    if (!tl.empty() && tl.front() == F16_TYPE) {
+      tensor_mma_generic_impl(pI, core, inst, M, N, K, tid);
+      return;
+    }
+  }
+
   // Dispatch to type-specific implementation based on data type
   if (is_s8_type) {
     // S8/U8 M8N8K16 requires specialized implementation due to smaller M

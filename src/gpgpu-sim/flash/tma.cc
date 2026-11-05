@@ -5,6 +5,7 @@
 #include "tma_reduction.h"
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
@@ -2486,6 +2487,54 @@ static void reduce_add_f32_mem(memory_space *src_mem, uint64_t src_addr,
   dst_mem->write(dst_addr, size_in_bytes, dst.data(), thread, pI);
 }
 
+// yasai: cp.reduce.async.bulk.global.shared::cta .add of .f64, .noftz.f16 and .noftz.bf16 (the .f32 form
+// is reduce_add_f32_mem). Each element is rounded to nearest; a NaN result is written as atom.add writes it
+// (yasai_rmw): the canonical NaN 0x7fff for f16 and bf16; for f64 the source element's NaN, else the
+// destination's, else 0xfff8000000000000 for an invalid sum. Measured on a GB10 (tests/gaps_m3.cu, bulk_red).
+static void yasai_reduce_add_mem(memory_space *src_mem, uint64_t src_addr, memory_space *dst_mem,
+                                 uint64_t dst_addr, uint32_t size_in_bytes, ptx_thread_info *thread,
+                                 const ptx_instruction *pI, int type) {
+  const unsigned eb = type == F64_TYPE ? 8 : 2;
+  if (size_in_bytes % eb != 0) {
+    fprintf(stderr, "TMA ERROR: reduce size %u is not a multiple of the element size %u\n",
+            size_in_bytes, eb);
+    abort();
+  }
+  std::vector<unsigned char> src(size_in_bytes), dst(size_in_bytes);
+  yasai_func::RmwGuard rmw_guard(dst_addr, size_in_bytes);
+  src_mem->read(src_addr, size_in_bytes, src.data());
+  dst_mem->read(dst_addr, size_in_bytes, dst.data());
+  if (type == F64_TYPE) {
+    for (uint32_t i = 0; i < size_in_bytes; i += 8) {
+      uint64_t a, b;
+      memcpy(&a, &dst[i], 8);
+      memcpy(&b, &src[i], 8);
+      double x, y;
+      memcpy(&x, &a, 8);
+      memcpy(&y, &b, 8);
+      const double r = x + y;
+      uint64_t out;
+      if (std::isnan(r))
+        out = std::isnan(y) ? b : (std::isnan(x) ? a : 0xfff8000000000000ull);
+      else
+        memcpy(&out, &r, 8);
+      memcpy(&dst[i], &out, 8);
+    }
+  } else {
+    apply_tma_tensor_reduction(tma_reduction_op_t::ADD, type == BF16_TYPE ? TMA_DTYPE_BF16 : TMA_DTYPE_F16,
+                               dst.data(), src.data(), size_in_bytes);
+    for (uint32_t i = 0; i < size_in_bytes; i += 2) {
+      uint16_t h;
+      memcpy(&h, &dst[i], 2);
+      if ((h & 0x7fff) > (type == BF16_TYPE ? 0x7f80 : 0x7c00)) {
+        h = 0x7fff;
+        memcpy(&dst[i], &h, 2);
+      }
+    }
+  }
+  dst_mem->write(dst_addr, size_in_bytes, dst.data(), thread, pI);
+}
+
 // Check 16-byte alignment for TMA addresses and size
 static void check_tma_alignment(uint64_t dst_addr, uint64_t src_addr,
                                 uint32_t size_in_bytes) {
@@ -2649,14 +2698,21 @@ static void handle_tma_copy(ptx_instruction *pI, ptx_thread_info *thread) {
 
     if (reduce_add) {
       const auto scalar_types = pI->get_scalar_type();
-      if (scalar_types.empty() || scalar_types.front() != F32_TYPE) {
-        fprintf(stderr,
-                "TMA ERROR: only cp.reduce.async.bulk.add.f32 is supported\n");
-        pI->print_insn();
-        abort();
+      const int rtype = scalar_types.empty() ? 0 : scalar_types.front();
+      if (rtype == F64_TYPE || rtype == F16_TYPE || rtype == BF16_TYPE) {  // yasai
+        yasai_reduce_add_mem(shared_mem, src_addr, global_mem, dst_addr, size_in_bytes, thread, pI,
+                             rtype);
+      } else {
+        if (rtype != F32_TYPE) {
+          fprintf(stderr,
+                  "TMA ERROR: cp.reduce.async.bulk.add of this type is not implemented (f32, f64, "
+                  "f16 and bf16 are)\n");
+          pI->print_insn();
+          abort();
+        }
+        reduce_add_f32_mem(shared_mem, src_addr, global_mem, dst_addr,
+                           size_in_bytes, thread, pI);
       }
-      reduce_add_f32_mem(shared_mem, src_addr, global_mem, dst_addr,
-                         size_in_bytes, thread, pI);
     } else {
       copy_mem(shared_mem, src_addr, global_mem, dst_addr, size_in_bytes,
                thread, pI);

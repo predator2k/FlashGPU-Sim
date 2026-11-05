@@ -452,6 +452,10 @@ class ptx_thread_info {
     const size_t i = 2 * size_t(slot) + k;
     return i < m_yasai_fma_save.size() ? m_yasai_fma_save[i] : ptx_reg_t();
   }
+  // yasai: the carry flag CC.CF of the condition code register (add.cc, addc, sub.cc, subc, mad.cc,
+  // madc; instructions.cc yasai_extp).
+  unsigned yasai_cf() const { return m_yasai_cf; }
+  void yasai_set_cf(unsigned cf) { m_yasai_cf = cf & 1; }
   ptx_reg_t get_operand_value(const operand_info &op, operand_info dstInfo,
                               unsigned opType, ptx_thread_info *thread,
                               int derefFlag);
@@ -644,6 +648,7 @@ class ptx_thread_info {
   std::vector<yasai_cp_async_copy> m_cp_async_open;  ///< issued since the last commit_group
   std::list<std::vector<yasai_cp_async_copy>>
       m_cp_async_committed;  ///< committed groups, oldest first
+  unsigned m_yasai_cf = 0;  // yasai: see yasai_cf()
   // yasai: save slots of contracted muls, two values per slot (yasai_fma_save).
   std::vector<ptx_reg_t> m_yasai_fma_save;
 

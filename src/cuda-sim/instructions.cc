@@ -1477,8 +1477,62 @@ static bool yasai_mixed_f32_binop(const ptx_instruction *pI, ptx_thread_info *th
 // yasai: see yasai_fused_add (defined after yasai_fma, before mad_def).
 static void yasai_fused_add(const ptx_instruction *pI, ptx_thread_info *thread, bool is_sub);
 
+// yasai: extended-precision integer arithmetic with the carry flag CC.CF of the executing thread (PTX
+// ISA: add.cc, addc{.cc}, sub.cc, subc{.cc}, mad{.lo,.hi}.cc, madc{.lo,.hi}{.cc}; .u32, .s32, .u64,
+// .s64). add: d = a + b (+ CF); sub: d = a - (b + CF), CF the borrow; mad: d = lo or hi of a * b (signed
+// for .s32 and .s64) + c (+ CF); .cc writes the carry (borrow) out of that sum into CF. Measured on a
+// GB10 (tests/gaps_m3.cu, case carry). Returns false for other instructions, so that the callers go on.
+static bool yasai_extp(const ptx_instruction *pI, ptx_thread_info *thread) {
+  const unsigned op = pI->get_opcode();
+  const bool use_cf = op == ADDC_OP || op == SUBC_OP || op == MADC_OP;
+  if (!pI->yasai_cc() && !use_cf) return false;
+  const unsigned t = pI->get_type();
+  const bool w64 = t == U64_TYPE || t == S64_TYPE || t == B64_TYPE;
+  const bool sgn = t == S32_TYPE || t == S64_TYPE;
+  if (!w64 && t != U32_TYPE && t != S32_TYPE && t != B32_TYPE) return false;
+  const unsigned bits = w64 ? 64 : 32;
+  const uint64_t mask = w64 ? ~0ull : 0xffffffffull;
+  const operand_info &dst = pI->dst();
+  auto val = [&](const operand_info &o) {
+    return thread->get_operand_value(o, dst, t, thread, 1).u64 & mask;
+  };
+  const unsigned cin = use_cf ? thread->yasai_cf() : 0;
+  const uint64_t a = val(pI->src1()), b = val(pI->src2());
+  unsigned __int128 sum;
+  uint64_t res;
+  unsigned cout;
+  if (op == SUB_OP || op == SUBC_OP) {
+    const unsigned __int128 sub = (unsigned __int128)b + cin;
+    res = (a - b - cin) & mask;
+    cout = (unsigned __int128)a < sub ? 1 : 0;
+  } else {
+    uint64_t x = a, y = b;
+    if (op == MAD_OP || op == MADC_OP) {
+      unsigned __int128 prod;
+      if (sgn) {
+        const __int128 sa = w64 ? (__int128)(int64_t)a : (__int128)(int32_t)a;
+        const __int128 sb = w64 ? (__int128)(int64_t)b : (__int128)(int32_t)b;
+        prod = (unsigned __int128)(sa * sb);
+      } else {
+        prod = (unsigned __int128)a * b;
+      }
+      x = uint64_t((pI->is_hi() ? (prod >> bits) : prod) & mask);
+      y = val(pI->src3());
+    }
+    sum = (unsigned __int128)x + y + cin;
+    res = uint64_t(sum & mask);
+    cout = unsigned((sum >> bits) & 1);
+  }
+  ptx_reg_t d;
+  d.u64 = res;
+  thread->set_operand_value(dst, d, t, thread, pI);
+  if (pI->yasai_cc()) thread->yasai_set_cf(cout);
+  return true;
+}
+
 void add_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   if (pI->yasai_fuse_src()) return yasai_fused_add(pI, thread, false);  // yasai_contract.h
+  if (pI->yasai_cc() && yasai_extp(pI, thread)) return;  // yasai: add.cc
   if (yasai_packed_binop(pI, thread, '+')) return;
   if (yasai_mixed_f32_binop(pI, thread, '+')) return;  // yasai
   ptx_reg_t src1_data, src2_data, data;
@@ -1601,6 +1655,7 @@ void add_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 }
 
 void addc_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  if (yasai_extp(pI, thread)) return;  // yasai
   inst_not_implemented(pI);
 }
 
@@ -1671,6 +1726,11 @@ void bar_callback(const inst_t *inst, ptx_thread_info *thread) {
 uint64_t yasai_atom_shared(const ptx_instruction *pI, ptx_thread_info *thread, addr_t addr,
                            uint64_t b, uint64_t c);
 bool yasai_atom_is_shared(const ptx_instruction *pI, memory_space_t space, addr_t addr);
+
+// yasai: atom.add of f64, f16, bf16, f16x2 and bf16x2 in atom_callback's switch (shared memory, and the
+// global words the switch handles), with the arithmetic and NaN rules of yasai_rmw::apply (defined after
+// yasai_rmw.inc).
+static uint64_t yasai_atom_add_fp(const ptx_instruction *pI, uint64_t a, uint64_t b);
 
 void atom_callback(const inst_t *inst, ptx_thread_info *thread) {
   const ptx_instruction *pI = dynamic_cast<const ptx_instruction *>(inst);
@@ -1913,6 +1973,13 @@ void atom_callback(const inst_t *inst, ptx_thread_info *thread) {
           if (std::isnan(op_result.f32)) op_result.u32 = 0x7fffffffu;  // yasai: canonical NaN (yasai_nan)
           data_ready = true;
           break;
+        case F64_TYPE:  // yasai: atom.shared.add.f64 and the 16-bit float types
+        case F16_TYPE:
+        case BF16_TYPE:
+        case F16X2_TYPE:
+          op_result.u64 = yasai_atom_add_fp(pI, data.u64, src2_data.u64);
+          data_ready = true;
+          break;
         default:
           printf(
               "Execution error: type mismatch with instruction\natom.ADD only "
@@ -2088,6 +2155,11 @@ void multimem_st_impl(const ptx_instruction *pI, ptx_thread_info *thread);
 void multimem_red_impl(const ptx_instruction *pI, ptx_thread_info *thread);
 void cvt_pack_impl(const ptx_instruction *pI, ptx_thread_info *thread);
 #include "yasai_rmw.inc"
+
+static uint64_t yasai_atom_add_fp(const ptx_instruction *pI, uint64_t a, uint64_t b) {
+  unsigned word_bytes;
+  return yasai_rmw::apply(ATOMIC_ADD, pI->get_type(), pI->is_bf16x2(), a, b, 0, &word_bytes);
+}
 
 void bar_impl(const ptx_instruction *pIin, ptx_thread_info *thread) {
   ptx_instruction *pI = const_cast<ptx_instruction *>(pIin);
@@ -2757,7 +2829,121 @@ void mapping(int thread, int wmma_type, int wmma_layout, int type, int index,
   }
 }
 
+
+void decode_space(memory_space_t &space, ptx_thread_info *thread, const operand_info &op,
+                  memory_space *&mem, addr_t &addr);
+// yasai: wmma with bf16 inputs, m16n16k16 (PTX ISA wmma; sm_80 and later). The fragments of a and b are those of
+// two mma.m16n8k16 (measured on a GB10 with tests/wmma_layout.cu: all 32 lanes, 4 registers, 2 halves of each of
+// a and b in row and col agree): lane l = 4g + q holds in half h of register r
+//   a: row g + 8 (r % 2), column 2q + h + 8 (r / 2);
+//   b: row (k) 2q + h + 8 (r % 2), column (n) g + 8 (r / 2).
+// The f32 accumulator fragments keep the simulator's wmma layout (mapping(), LOAD_C), which wmma.load.c and
+// wmma.store.d of every wmma use; a GPU's accumulator layout is that of the two mma tiles, so code that changes
+// accumulator elements by position would differ (none in the census).
+static void yasai_wmma_bf16_pos(bool is_a, unsigned lane, unsigned r, unsigned h, unsigned *row, unsigned *col) {
+  const unsigned g = lane / 4, q = lane % 4;
+  if (is_a) {
+    *row = g + 8 * (r % 2);
+    *col = 2 * q + h + 8 * (r / 2);
+  } else {
+    *row = 2 * q + h + 8 * (r % 2);
+    *col = g + 8 * (r / 2);
+  }
+}
+
+// yasai: wmma.load.{a,b}.sync.aligned.{row,col}.m16n16k16.{global,shared}.bf16 d, [p], ldm (see above).
+static void yasai_wmma_bf16_ld(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
+  const unsigned wmma_type = pI->get_wmma_type();
+  const bool row_major = pI->get_wmma_layout(0) == ROW;
+  const unsigned tid = (core->get_gpu()->is_functional_sim() ? inst.warp_id_func() : inst.warp_id()) *
+                       core->get_warp_size();
+  const operand_info &dst = pI->dst();
+  for (unsigned lane = 0; lane < core->get_warp_size(); lane++) {
+    ptx_thread_info *thread = core->get_thread_info()[tid + lane];
+    addr_t addr = thread->get_operand_value(pI->src1(), dst, U32_TYPE, thread, 1).u64;
+    const unsigned ldm = thread->get_operand_value(pI->src2(), dst, U32_TYPE, thread, 1).u32;
+    memory_space_t space = pI->get_space();
+    if (whichspace(addr) == shared_space) {
+      addr = generic_to_shared(thread->get_hw_sid(), addr);
+      space = shared_space;
+    }
+    memory_space *mem = NULL;
+    decode_space(space, thread, pI->src1(), mem, addr);
+    ptx_reg_t regs[4];
+    new_addr_type txn[MAX_ACCESSES_PER_INSN_PER_THREAD];
+    int ntxn = 0;
+    for (unsigned r = 0; r < 4; r++) {
+      regs[r].u64 = 0;
+      for (unsigned h = 0; h < 2; h++) {
+        unsigned row, col;
+        yasai_wmma_bf16_pos(wmma_type == LOAD_A, lane, r, h, &row, &col);
+        const addr_t off = row_major ? addr_t(row) * ldm + col : addr_t(col) * ldm + row;
+        uint16_t v = 0;
+        mem->read(addr + 2 * off, 2, &v);
+        regs[r].u32 |= uint32_t(v) << (16 * h);
+        if (h == 0 && ntxn < MAX_ACCESSES_PER_INSN_PER_THREAD) txn[ntxn++] = addr + 2 * off;
+      }
+    }
+    thread->set_vector_operand_values(dst, regs[0], regs[1], regs[2], regs[3]);
+    inst.space = space;
+    inst.set_addr(lane, txn, ntxn);
+    inst.data_size = 4;
+  }
+}
+
+// yasai: wmma.mma.sync.aligned.{row,col}.{row,col}.m16n16k16.f32.bf16.bf16.f32 d, a, b, c: a and b in the
+// fragments above, c and d in the simulator's f32 accumulator layout. Each product is exact in f32 and the sum
+// runs over k in order in f32, then c is added, as mma.sync's bf16 model does (tensor_mma_f16_impl).
+static void yasai_wmma_bf16_mma(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
+  const unsigned tid = (core->get_gpu()->is_functional_sim() ? inst.warp_id_func() : inst.warp_id()) *
+                       core->get_warp_size();
+  float A[16][16], B[16][16], C[16][16];
+  auto bf = [](uint16_t b) {
+    const uint32_t u = uint32_t(b) << 16;
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+  };
+  for (unsigned lane = 0; lane < 32; lane++) {
+    ptx_thread_info *thread = core->get_thread_info()[tid + lane];
+    ptx_reg_t a[4], b[4], c[8];
+    thread->get_vector_operand_values(pI->operand_lookup(1), a, 4);
+    thread->get_vector_operand_values(pI->operand_lookup(2), b, 4);
+    thread->get_vector_operand_values(pI->operand_lookup(3), c, 8);
+    for (unsigned r = 0; r < 4; r++)
+      for (unsigned h = 0; h < 2; h++) {
+        unsigned row, col;
+        yasai_wmma_bf16_pos(true, lane, r, h, &row, &col);
+        A[row][col] = bf(uint16_t(a[r].u32 >> (16 * h)));
+        yasai_wmma_bf16_pos(false, lane, r, h, &row, &col);
+        B[row][col] = bf(uint16_t(b[r].u32 >> (16 * h)));
+      }
+    for (int k = 0; k < 8; k++) {
+      int row, col, offset;
+      mapping(lane, LOAD_C, ROW, F32_TYPE, k, 16, row, col, offset);
+      C[row][col] = c[offset].f32;
+    }
+  }
+  for (unsigned lane = 0; lane < 32; lane++) {
+    ptx_thread_info *thread = core->get_thread_info()[tid + lane];
+    ptx_reg_t dv[8];
+    for (int k = 0; k < 8; k++) {
+      int row, col, offset;
+      mapping(lane, LOAD_C, ROW, F32_TYPE, k, 16, row, col, offset);
+      float sum = 0.0f;
+      for (int kk = 0; kk < 16; kk++) sum += A[row][kk] * B[kk][col];
+      dv[offset].u64 = 0;
+      dv[offset].f32 = sum + C[row][col];
+    }
+    thread->set_wmma_vector_operand_values(pI->dst(), dv[0], dv[1], dv[2], dv[3], dv[4], dv[5], dv[6], dv[7]);
+  }
+}
+
 void mma_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst) {
+  {  // yasai: bf16 inputs (four types: .f32.bf16.bf16.f32)
+    const std::list<int> tl = pI->get_scalar_type();
+    if (tl.size() == 4 && *std::next(tl.begin()) == BF16_TYPE) return yasai_wmma_bf16_mma(pI, core, inst);
+  }
   int i, j, k, thrd;
   int row, col, offset;
   ptx_reg_t matrix_a[16][16];
@@ -2805,7 +2991,11 @@ void mma_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst) {
             hex_val = (v[k / 2].s64 & 0xffff);
           else
             hex_val = ((v[k / 2].s64 & 0xffff0000) >> 16);
-          nw_v[k].f16 = *(reinterpret_cast<half *>(hex_val));
+          // yasai: the half with these bits (the cast took hex_val as an address and crashed).
+          {
+            const uint16_t bits16 = uint16_t(hex_val);
+            memcpy(&nw_v[k].f16, &bits16, sizeof bits16);
+          }
         }
       }
       if (!((operand_num == 3) && (type2 == F32_TYPE))) {
@@ -5131,6 +5321,9 @@ void mma_st_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
 }
 
 void mma_ld_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
+  if (pI->get_type() == BF16_TYPE &&
+      (pI->get_wmma_type() == LOAD_A || pI->get_wmma_type() == LOAD_B))  // yasai
+    return yasai_wmma_bf16_ld(pI, core, inst);
   size_t size;
   int t, i;
   unsigned smid;
@@ -5423,6 +5616,7 @@ void mad24_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 }
 
 void mad_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  if (pI->yasai_cc() && yasai_extp(pI, thread)) return;  // yasai: mad.lo.cc, mad.hi.cc
   mad_def(pI, thread, false);
 }
 
@@ -5431,6 +5625,8 @@ void madp_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 }
 
 void madc_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  // yasai: PTX madc (carry in CC.CF); the PTXPlus form with a carry predicate operand takes mad_def.
+  if (pI->get_num_operands() == 4 && yasai_extp(pI, thread)) return;
   mad_def(pI, thread, true);
 }
 
@@ -8239,6 +8435,7 @@ static bool yasai_mixed_f32_binop(const ptx_instruction *pI, ptx_thread_info *th
 
 void sub_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   if (pI->yasai_fuse_src()) return yasai_fused_add(pI, thread, true);  // yasai_contract.h
+  if (pI->yasai_cc() && yasai_extp(pI, thread)) return;  // yasai: sub.cc
   if (yasai_packed_binop(pI, thread, '-')) return;  // yasai
   if (yasai_mixed_f32_binop(pI, thread, '-')) return;  // yasai
   ptx_reg_t data;
@@ -8341,6 +8538,7 @@ void nop_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 }
 
 void subc_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  if (yasai_extp(pI, thread)) return;  // yasai
   inst_not_implemented(pI);
 }
 void suld_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
