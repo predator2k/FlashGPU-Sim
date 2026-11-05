@@ -1735,6 +1735,29 @@ static thread_local std::string t_yasai_host_fill_fields;
 // execution's deferred_exec record, and whether lazy execution deferred that launch
 // (yasai_lazy.h; set by cudaLaunchInternalImpl).
 static thread_local unsigned t_yasai_launch_corr = 0;
+
+/// yasai: the CUDA graph node that this thread is replaying (cudaGraphLaunch). The device record of the node carries the
+/// launch's correlation id, the graph's id, the executable node's id and the launch's index, and the node has no api
+/// record of its own, as under the CUPTI recorder.
+struct yasai_graph_replay_ctx {
+  bool active = false;      ///< a node is being replayed on this thread
+  uint32_t corr = 0;        ///< correlation id of the cudaGraphLaunch call
+  uint32_t graph_id = 0;    ///< recorder's id of the graph
+  uint64_t node_id = 0;     ///< recorder's id of the executable node
+  uint64_t launch_idx = 0;  ///< how many launches of this executable graph came before this one
+};
+static thread_local yasai_graph_replay_ctx t_yasai_graph_replay;
+
+/// yasai: the correlation id of a device operation: the launch's during a graph replay, else a new one.
+static uint32_t yasai_rec_op_corr() {
+  return t_yasai_graph_replay.active ? t_yasai_graph_replay.corr : yasai_rec::Recorder::get().corr();
+}
+
+/// yasai: the fields of a device record that belong to a graph replay after graph_node, empty otherwise.
+static std::string yasai_rec_replay_fields() {
+  if (!t_yasai_graph_replay.active) return std::string();
+  return ",\"graph_launch_idx\":" + std::to_string(t_yasai_graph_replay.launch_idx);
+}
 static thread_local bool t_yasai_lazy_deferred = false;
 
 // yasai: stream capture (CUDA graphs; implemented at the end of this file). Each returns true
@@ -1766,7 +1789,7 @@ cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = N
     return cudaLaunchInternalImpl(hostFun, gpgpu_ctx);
   kernel_config config = ctx->api->g_cuda_launch_stack.back();
   const uint64_t t0 = yasai_rec::mono_ns();
-  const uint32_t corr = rec.corr();
+  const uint32_t corr = yasai_rec_op_corr();
   t_yasai_host_fill_launch = false;
   t_yasai_launch_corr = corr;
   t_yasai_lazy_deferred = false;
@@ -1806,18 +1829,20 @@ cudaError_t cudaLaunchInternal(const char *hostFun, gpgpu_context *gpgpu_ctx = N
       if (n > 0) host_so.assign(exe, static_cast<size_t>(n));
     }
   }
-  rec.api("cudaLaunchKernel", t0, t1, corr, int(ret));
+  if (!t_yasai_graph_replay.active) rec.api("cudaLaunchKernel", t0, t1, corr, int(ret));
   rec.write("\"rec\":\"kernel\",\"start\":%llu,\"end\":%llu,\"dev\":0,\"ctx\":1,\"stream\":%u,"
             "\"corr\":%u,\"name\":\"%s\",\"grid\":[%u,%u,%u],\"block\":[%u,%u,%u],"
             "\"cluster\":[1,1,1],\"smem_static\":%u,\"smem_dynamic\":%zu,\"regs\":%u,"
-            "\"local_per_thread\":0,\"graph_id\":0,\"graph_node\":0,\"launch_type\":0,"
+            "\"local_per_thread\":0,\"graph_id\":%u,\"graph_node\":%llu%s,\"launch_type\":0,"
             "\"queued\":0,\"submitted\":0,\"device_launched\":0,\"ptx_target\":\"%s\","
             "\"ptx_version\":\"%s\",\"ptx_file\":\"%s\",\"host_so\":\"%s\"%s,"
             "\"func_threads\":%u%s",
             (unsigned long long)t0, (unsigned long long)t1,
             rec.stream_id(config.get_stream()), corr, yasai_rec::esc(name.c_str()).c_str(),
             g.x, g.y, g.z, b.x, b.y, b.z, info ? info->smem : 0u, (size_t)config.shared_mem(),
-            info ? info->regs : 0u, yasai_rec::esc(ptx_target.c_str()).c_str(), ptx_ver,
+            info ? info->regs : 0u, t_yasai_graph_replay.graph_id,
+            (unsigned long long)t_yasai_graph_replay.node_id, yasai_rec_replay_fields().c_str(),
+            yasai_rec::esc(ptx_target.c_str()).c_str(), ptx_ver,
             yasai_rec::esc(ptx_file.c_str()).c_str(), yasai_rec::esc(host_so.c_str()).c_str(),
             // A host-executed fill runs no simulated instruction: the record says so, its
             // time source is "none" (no simulated time exists for it; start and end above are
@@ -3920,11 +3945,12 @@ void yasai_rec_copy(const char *api, uint64_t t0, uint32_t corr, cudaError_t ret
                     int kind, const void *stream) {
   yasai_rec::Recorder &r = yasai_rec::Recorder::get();
   const uint64_t t1 = yasai_rec::mono_ns();
-  r.api(api, t0, t1, corr, int(ret));
+  if (!t_yasai_graph_replay.active) r.api(api, t0, t1, corr, int(ret));
   r.write("\"rec\":\"memcpy\",\"start\":%llu,\"end\":%llu,\"dev\":0,\"ctx\":1,\"stream\":%u,"
-          "\"corr\":%u,\"bytes\":%zu,\"copy_kind\":%u,\"src_kind\":0,\"dst_kind\":0,\"graph_node\":0",
+          "\"corr\":%u,\"bytes\":%zu,\"copy_kind\":%u,\"src_kind\":0,\"dst_kind\":0,\"graph_node\":%llu%s",
           (unsigned long long)t0, (unsigned long long)t1, r.stream_id(stream), corr, count,
-          yasai_rec::copy_kind(kind));
+          yasai_rec::copy_kind(kind), (unsigned long long)t_yasai_graph_replay.node_id,
+          yasai_rec_replay_fields().c_str());
 }
 
 /// Records a memset call and its memset operation.
@@ -3932,11 +3958,12 @@ void yasai_rec_memset(const char *api, uint64_t t0, uint32_t corr, cudaError_t r
                       size_t count, int value, const void *stream) {
   yasai_rec::Recorder &r = yasai_rec::Recorder::get();
   const uint64_t t1 = yasai_rec::mono_ns();
-  r.api(api, t0, t1, corr, int(ret));
+  if (!t_yasai_graph_replay.active) r.api(api, t0, t1, corr, int(ret));
   r.write("\"rec\":\"memset\",\"start\":%llu,\"end\":%llu,\"dev\":0,\"ctx\":1,\"stream\":%u,"
-          "\"corr\":%u,\"bytes\":%zu,\"value\":%u,\"graph_node\":0",
+          "\"corr\":%u,\"bytes\":%zu,\"value\":%u,\"graph_node\":%llu%s",
           (unsigned long long)t0, (unsigned long long)t1, r.stream_id(stream), corr, count,
-          unsigned(value) & 0xff);
+          unsigned(value) & 0xff, (unsigned long long)t_yasai_graph_replay.node_id,
+          yasai_rec_replay_fields().c_str());
 }
 
 /// Records a synchronization call (type: yasai_rec::SyncType).
@@ -4079,7 +4106,7 @@ __host__ cudaError_t CUDARTAPI cudaMemcpyAsync(void *dst, const void *src,
   if (!yasai_rec::Recorder::get().on())
     return cudaMemcpyAsyncInternal(dst, src, count, kind, stream);
   const uint64_t t0 = yasai_rec::mono_ns();
-  const uint32_t corr = yasai_rec::Recorder::get().corr();
+  const uint32_t corr = yasai_rec_op_corr();
   const cudaError_t ret = cudaMemcpyAsyncInternal(dst, src, count, kind, stream);
   yasai_rec_copy("cudaMemcpyAsync", t0, corr, ret, count, int(kind), stream);
   return ret;
@@ -4182,7 +4209,7 @@ __host__ cudaError_t CUDARTAPI cudaMemsetAsync(void *mem, int c, size_t count,
   if (yasai_capture_memset(mem, c, count, stream)) return g_last_cudaError = cudaSuccess;
   if (!yasai_rec::Recorder::get().on()) return cudaMemsetAsyncInternal(mem, c, count, stream);
   const uint64_t t0 = yasai_rec::mono_ns();
-  const uint32_t corr = yasai_rec::Recorder::get().corr();
+  const uint32_t corr = yasai_rec_op_corr();
   const void *recorded_stream = stream;
   const cudaError_t ret = cudaMemsetAsyncInternal(mem, c, count, stream);
   yasai_rec_memset("cudaMemsetAsync", t0, corr, ret, count, c, recorded_stream);
@@ -12288,6 +12315,7 @@ struct CUgraphNode_st {
   cudaHostFn_t fn = nullptr;        // HOST_FN: function
   void *user = nullptr;             // HOST_FN: its argument
   cudaEvent_t event = nullptr;      // EVENT_RECORD: event recorded on the launch stream
+  uint64_t rec_node_id = 0;         // recorder's id of this node (graph_node, graph_node_clone); 0 when off
 };
 
 // A user object (cudaUserObjectCreate): reference counted, destructor run at the last release.
@@ -12301,12 +12329,17 @@ struct CUuserObject_st {
 struct CUgraph_st {
   std::deque<CUgraphNode_st> nodes;                         // stable addresses for node handles
   unsigned long long capture_id = 0;                        // id of the capture that built it
+  uint32_t rec_id = 0;                                      // recorder's id of the graph (0 when off)
+  uint64_t rec_last_node_id = 0;                            // recorder's id of its last node
   std::vector<std::pair<cudaUserObject_t, unsigned>> user_objects;  // retained objects, counts
 };
 
 // An executable graph: a copy of the graph's nodes.
 struct CUgraphExec_st {
   std::vector<CUgraphNode_st> nodes;  // nodes in replay order
+  uint32_t rec_id = 0;                // recorder's id of the executable graph (graph_exec; 0 when off)
+  uint32_t rec_graph_id = 0;          // recorder's id of the graph it was made from
+  uint64_t rec_launches = 0;          // launches so far (graph_launch_idx of the next one)
 };
 
 namespace {
@@ -12315,6 +12348,99 @@ std::map<cudaStream_t, cudaGraph_t> g_yasai_capturing;     // capturing stream -
 std::map<cudaStream_t, cudaStream_t> g_yasai_capture_origin;  // joined stream -> origin stream
 std::map<cudaEvent_t, cudaGraph_t> g_yasai_capture_events;  // event recorded during a capture
 unsigned long long g_yasai_next_capture_id = 1;            // capture ids handed out
+uint32_t g_yasai_next_rec_graph_id = 1;                    // recorder's graph ids handed out
+uint64_t g_yasai_next_rec_node_id = 1;                     // recorder's node ids handed out
+uint32_t g_yasai_next_rec_exec_id = 1;                     // recorder's executable graph ids handed out
+
+// The type of a node as the CUPTI recorder writes it (CUgraphNodeType).
+//   n  the node
+int yasai_rec_node_type(const CUgraphNode_st &n) {
+  switch (n.kind) {
+    case CUgraphNode_st::KERNEL: return 0;
+    case CUgraphNode_st::MEMCPY: return 1;
+    case CUgraphNode_st::MEMSET: return 2;
+    case CUgraphNode_st::HOST_FN: return 3;
+    case CUgraphNode_st::EVENT_RECORD: return 7;
+  }
+  return 0;
+}
+
+// The name of a kernel node's kernel, under its source name; empty for other nodes.
+//   n  the node
+std::string yasai_rec_node_name(const CUgraphNode_st &n) {
+  if (n.kind != CUgraphNode_st::KERNEL) return std::string();
+  function_info *entry = GPGPUSim_Context(GPGPU_Context())->get_kernel(n.host_fun);
+  return entry ? yasai_scope::source_name(entry->get_name()) : std::string("unknown");
+}
+
+// Writes a graph_node or graph_node_clone record, in the CUPTI recorder's format.
+//   rec_name  record name; node, orig, graph  ids (orig 0 for graph_node); n  the node; name  its kernel's name
+void yasai_rec_write_node(const char *rec_name, uint64_t node, uint64_t orig, uint32_t graph,
+                          const CUgraphNode_st &n, const std::string &name) {
+  yasai_rec::Recorder::get().write(
+      "\"rec\":\"%s\",\"t\":%llu,\"node\":%llu,\"orig\":%llu,\"graph\":%u,\"type\":%d,\"name\":\"%s\","
+      "\"cumodule\":\"0x0\"",
+      rec_name, (unsigned long long)yasai_rec::mono_ns(), (unsigned long long)node, (unsigned long long)orig, graph,
+      yasai_rec_node_type(n), yasai_rec::esc(name.c_str()).c_str());
+}
+
+// Gives a node just added to a graph its recorder id and writes its graph_node record, the graph_edge from the node before
+// it (the capture order, which is how the simulator replays), and, for a node taken from an executable graph launched into
+// a capturing stream, a graph_node_clone back to that node. Caller holds g_yasai_graph_mu and has checked that the recorder
+// is on.
+//   g  the graph; n  the node in it; name  its kernel's name; orig  the node it was taken from, or 0
+void yasai_rec_node_added(cudaGraph_t g, CUgraphNode_st &n, const std::string &name, uint64_t orig) {
+  yasai_rec::Recorder &rec = yasai_rec::Recorder::get();
+  if (g->rec_id == 0) g->rec_id = g_yasai_next_rec_graph_id++;
+  n.rec_node_id = g_yasai_next_rec_node_id++;
+  yasai_rec_write_node("graph_node", n.rec_node_id, 0, g->rec_id, n, name);
+  if (orig != 0) yasai_rec_write_node("graph_node_clone", n.rec_node_id, orig, g->rec_id, n, name);
+  if (g->rec_last_node_id != 0)
+    rec.write("\"rec\":\"graph_edge\",\"t\":%llu,\"node\":%llu,\"dep\":%llu",
+              (unsigned long long)yasai_rec::mono_ns(), (unsigned long long)n.rec_node_id,
+              (unsigned long long)g->rec_last_node_id);
+  g->rec_last_node_id = n.rec_node_id;
+}
+
+// Gives the nodes of an executable graph their own ids and writes their graph_node_clone records and the graph_exec record,
+// in the CUPTI recorder's order.
+//   e  the executable graph, just filled from graph; graph  the graph
+void yasai_rec_exec_filled(cudaGraphExec_t e, cudaGraph_t graph) {
+  yasai_rec::Recorder &rec = yasai_rec::Recorder::get();
+  if (!rec.on()) return;
+  std::vector<std::string> names;
+  for (const CUgraphNode_st &n : e->nodes) names.push_back(yasai_rec_node_name(n));
+  std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
+  if (graph->rec_id == 0) graph->rec_id = g_yasai_next_rec_graph_id++;
+  e->rec_graph_id = graph->rec_id;
+  if (e->rec_id == 0) e->rec_id = g_yasai_next_rec_exec_id++;
+  for (size_t i = 0; i < e->nodes.size(); ++i) {
+    const uint64_t orig = e->nodes[i].rec_node_id;
+    e->nodes[i].rec_node_id = g_yasai_next_rec_node_id++;
+    yasai_rec_write_node("graph_node_clone", e->nodes[i].rec_node_id, orig, graph->rec_id, e->nodes[i], names[i]);
+  }
+  rec.write("\"rec\":\"graph_exec\",\"t\":%llu,\"exec\":%u,\"graph\":%u",
+            (unsigned long long)yasai_rec::mono_ns(), e->rec_id, graph->rec_id);
+}
+
+// The api record of one graph call, written when the scope ends with the call's result in g_last_cudaError.
+struct yasai_graph_api_scope {
+  const char *name;   // API name
+  bool on;            // recorder on
+  uint64_t t0 = 0;    // start
+  uint32_t corr = 0;  // correlation id
+  explicit yasai_graph_api_scope(const char *api) : name(api), on(yasai_rec::Recorder::get().on()) {
+    if (on) {
+      t0 = yasai_rec::mono_ns();
+      corr = yasai_rec::Recorder::get().corr();
+    }
+  }
+  ~yasai_graph_api_scope() {
+    if (on) yasai_rec::Recorder::get().api(name, t0, yasai_rec::mono_ns(), corr, int(g_last_cudaError));
+  }
+  yasai_graph_api_scope(const yasai_graph_api_scope &) = delete;
+  yasai_graph_api_scope &operator=(const yasai_graph_api_scope &) = delete;
+};
 
 // The graph that stream is being captured into, or NULL.
 //   stream  any stream
@@ -12371,8 +12497,11 @@ cudaError_t yasai_replay_node(const CUgraphNode_st &n, cudaStream_t stream) {
 bool yasai_capture_append(cudaStream_t stream, CUgraphNode_st &&node) {
   cudaGraph_t g = yasai_graph_of(stream);
   if (g == nullptr) return false;
+  const bool rec_on = yasai_rec::Recorder::get().on();
+  const std::string name = rec_on ? yasai_rec_node_name(node) : std::string();
   std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
   g->nodes.push_back(std::move(node));
+  if (rec_on) yasai_rec_node_added(g, g->nodes.back(), name, 0);
   return true;
 }
 }  // namespace
@@ -12471,12 +12600,14 @@ extern "C" {
 __host__ cudaError_t CUDARTAPI cudaStreamBeginCapture(cudaStream_t stream,
                                                       enum cudaStreamCaptureMode mode) {
   YASAI_FAULT_RT();
+  yasai_graph_api_scope rec_api("cudaStreamBeginCapture");
   (void)mode;
   if (stream == NULL) return g_last_cudaError = cudaErrorStreamCaptureUnsupported;
   std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
   if (g_yasai_capturing.count(stream)) return g_last_cudaError = cudaErrorIllegalState;
   cudaGraph_t g = new CUgraph_st();
   g->capture_id = g_yasai_next_capture_id++;
+  if (rec_api.on) g->rec_id = g_yasai_next_rec_graph_id++;
   g_yasai_capturing[stream] = g;
   return g_last_cudaError = cudaSuccess;
 }
@@ -12486,6 +12617,7 @@ __host__ cudaError_t CUDARTAPI cudaStreamBeginCapture(cudaStream_t stream,
 //   pGraph  receives the graph
 __host__ cudaError_t CUDARTAPI cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t *pGraph) {
   YASAI_FAULT_RT();
+  yasai_graph_api_scope rec_api("cudaStreamEndCapture");
   std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
   auto it = g_yasai_capturing.find(stream);
   if (it == g_yasai_capturing.end() || pGraph == NULL) return g_last_cudaError = cudaErrorIllegalState;
@@ -12584,6 +12716,7 @@ __host__ cudaError_t CUDARTAPI cudaGraphCreate(cudaGraph_t *pGraph, unsigned int
 //   graph  the graph
 __host__ cudaError_t CUDARTAPI cudaGraphDestroy(cudaGraph_t graph) {
   YASAI_FAULT_RT();
+  yasai_graph_api_scope rec_api("cudaGraphDestroy");
   if (graph == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   for (const auto &uo : graph->user_objects) yasai_user_object_release(uo.first, uo.second);
   delete graph;
@@ -12638,6 +12771,7 @@ __host__ cudaError_t CUDARTAPI cudaGraphAddEventRecordNode(cudaGraphNode_t *pGra
   graph->nodes.emplace_back();
   graph->nodes.back().kind = CUgraphNode_st::EVENT_RECORD;
   graph->nodes.back().event = event;
+  if (yasai_rec::Recorder::get().on()) yasai_rec_node_added(graph, graph->nodes.back(), std::string(), 0);
   if (pGraphNode) *pGraphNode = &graph->nodes.back();
   return g_last_cudaError = cudaSuccess;
 }
@@ -12694,10 +12828,12 @@ __host__ cudaError_t CUDARTAPI cudaGraphRetainUserObject(cudaGraph_t graph, cuda
 __host__ cudaError_t CUDARTAPI cudaGraphInstantiate(cudaGraphExec_t *pGraphExec, cudaGraph_t graph,
                                                     unsigned long long flags) {
   YASAI_FAULT_RT();
+  yasai_graph_api_scope rec_api("cudaGraphInstantiate");
   (void)flags;
   if (pGraphExec == NULL || graph == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   cudaGraphExec_t e = new CUgraphExec_st();
   e->nodes.assign(graph->nodes.begin(), graph->nodes.end());
+  yasai_rec_exec_filled(e, graph);
   *pGraphExec = e;
   return g_last_cudaError = cudaSuccess;
 }
@@ -12718,6 +12854,7 @@ __host__ cudaError_t CUDARTAPI cudaGraphExecUpdate(cudaGraphExec_t graphExec, cu
   YASAI_FAULT_RT();
   if (graphExec == NULL || graph == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   graphExec->nodes.assign(graph->nodes.begin(), graph->nodes.end());
+  yasai_rec_exec_filled(graphExec, graph);
   if (resultInfo) {
     memset(resultInfo, 0, sizeof(*resultInfo));
     resultInfo->result = cudaGraphExecUpdateSuccess;
@@ -12738,14 +12875,31 @@ __host__ cudaError_t CUDARTAPI cudaGraphUpload(cudaGraphExec_t graphExec, cudaSt
 //   graphExec, stream  as in the CUDA runtime API
 __host__ cudaError_t CUDARTAPI cudaGraphLaunch(cudaGraphExec_t graphExec, cudaStream_t stream) {
   YASAI_FAULT_RT();
+  yasai_graph_api_scope rec_api("cudaGraphLaunch");
   if (graphExec == NULL) return g_last_cudaError = cudaErrorInvalidValue;
   if (cudaGraph_t g = yasai_graph_of(stream)) {
+    std::vector<std::string> names;
+    if (rec_api.on)
+      for (const CUgraphNode_st &n : graphExec->nodes) names.push_back(yasai_rec_node_name(n));
     std::lock_guard<std::mutex> lock(g_yasai_graph_mu);
-    for (const CUgraphNode_st &n : graphExec->nodes) g->nodes.push_back(n);
+    for (size_t i = 0; i < graphExec->nodes.size(); ++i) {
+      g->nodes.push_back(graphExec->nodes[i]);
+      if (rec_api.on) yasai_rec_node_added(g, g->nodes.back(), names[i], graphExec->nodes[i].rec_node_id);
+    }
     return g_last_cudaError = cudaSuccess;
   }
+  // Each replayed node's device record carries this call's correlation id, the graph, the node and the launch's index.
+  const uint64_t launch_idx = graphExec->rec_launches++;
   for (const CUgraphNode_st &n : graphExec->nodes) {
+    if (rec_api.on) {
+      t_yasai_graph_replay.active = true;
+      t_yasai_graph_replay.corr = rec_api.corr;
+      t_yasai_graph_replay.graph_id = graphExec->rec_graph_id;
+      t_yasai_graph_replay.node_id = n.rec_node_id;
+      t_yasai_graph_replay.launch_idx = launch_idx;
+    }
     const cudaError_t e = yasai_replay_node(n, stream);
+    t_yasai_graph_replay = yasai_graph_replay_ctx();
     if (e != cudaSuccess) return g_last_cudaError = e;
   }
   return g_last_cudaError = cudaSuccess;
@@ -12755,6 +12909,7 @@ __host__ cudaError_t CUDARTAPI cudaGraphLaunch(cudaGraphExec_t graphExec, cudaSt
 //   graphExec  as in the CUDA runtime API
 __host__ cudaError_t CUDARTAPI cudaGraphExecDestroy(cudaGraphExec_t graphExec) {
   YASAI_FAULT_RT();
+  yasai_graph_api_scope rec_api("cudaGraphExecDestroy");
   delete graphExec;
   return g_last_cudaError = cudaSuccess;
 }
