@@ -32,6 +32,8 @@
 
 #include "host_window.h"
 #include "yasai_strict_addr.h"
+// yasai: the executing .ftz instruction (instructions.cc), or nullptr.
+extern thread_local const ptx_instruction *t_ftz_inst;
 #include "shared_devmem.h"
 #include "cuda-sim.h"
 #include <shared_mutex>
@@ -2936,6 +2938,14 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
   const ptx_instruction *pI = m_func_info->get_dyn_inst(pc);
   // yasai: names this thread and instruction in illegal-address reports.
   yasai_strict_addr::inst_scope strict_ctx(this, pI);
+  // yasai: .ftz of this instruction for its operand reads and result writes (instructions.cc).
+  struct ftz_scope {
+    const ptx_instruction *saved;
+    explicit ftz_scope(const ptx_instruction *p) : saved(t_ftz_inst) {
+      t_ftz_inst = p->is_ftz() ? p : nullptr;
+    }
+    ~ftz_scope() { t_ftz_inst = saved; }
+  } ftz_ctx(pI);
 
   set_npc(pc + pI->inst_size());
 
