@@ -163,6 +163,9 @@ void ptx_recognizer::start_function(int entry_point) {
   g_entry_point = entry_point;
   g_func_info = NULL;
   g_entry_func_param_index = 0;
+  // yasai: prototypes and target lists are scoped to one function body.
+  g_func_protos.clear();
+  g_func_targets.clear();
 }
 
 void ptx_recognizer::add_function_name(const char *name) {
@@ -215,6 +218,7 @@ void ptx_recognizer::end_function() {
   init_instruction_state();
   g_max_regs_per_thread = mymax(g_max_regs_per_thread,
                                 (g_current_symbol_table->next_reg_num() - 1));
+  resolve_call_tails();
   // yasai: mul and add pairs that ptxas would contract into one fused multiply-add
   // (yasai_contract.h; YASAI_FMA_CONTRACT).
   yasai_contract::analyze(g_instructions, g_current_symbol_table, gpgpu_ctx->g_filename);
@@ -288,6 +292,11 @@ void ptx_recognizer::add_instruction() {
       g_scalar_type, g_space_spec, g_space_spec2,
       gpgpu_ctx->g_filename, ptx_get_lineno(scanner), linebuf,
       g_shader_core_config, gpgpu_ctx);
+  if (!g_call_tail.empty()) {
+    parse_assert(g_opcode == CALL_OP, "only call names a prototype or target list");
+    i->yasai_set_call_tail(g_call_tail, g_current_symbol_table);
+    g_call_tail.clear();
+  }
   g_instructions.push_back(i);
   g_inst_lookup[gpgpu_ctx->g_filename][ptx_get_lineno(scanner)] = i;
   init_instruction_state();
@@ -705,6 +714,98 @@ void ptx_recognizer::add_branchtargets(const char *identifier) {
                                          ptx_get_lineno(scanner));
   g_func_info->add_branch_target_list(identifier, g_branchtarget_labels);
   g_branchtarget_labels.clear();
+}
+
+// yasai: see ptx_parser.h.
+void ptx_recognizer::start_callprototype(const char *name) {
+  PTX_PARSE_GPPRINTF("start_callprototype %s", name);
+  parse_assert(g_func_info != NULL, ".callprototype outside a function body");
+  // (parse_assert drops format arguments, so the formatted checks call parse_error.)
+  const auto key = std::make_pair(g_current_symbol_table, std::string(name));
+  if (g_func_protos.count(key) != 0 || g_func_targets.count(key) != 0)
+    parse_error("\"%s\" is declared twice in one block of function %s", name,
+                g_func_info->get_name().c_str());
+  g_proto_cur = new yasai_call_proto;  // owned by the module, never freed (instructions point at it)
+  g_proto_cur->name = name;
+  g_proto_params.clear();
+}
+
+// yasai: see ptx_parser.h.
+void ptx_recognizer::add_proto_param(long long bytes) {
+  parse_assert(bytes > 0, "a .callprototype parameter has no size");
+  g_proto_params.push_back(unsigned(bytes));
+}
+
+// yasai: see ptx_parser.h.
+void ptx_recognizer::proto_params_are_return() {
+  if (g_proto_params.size() != 1)
+    parse_error(".callprototype %s declares %zu return values", g_proto_cur->name.c_str(),
+                g_proto_params.size());
+  g_proto_cur->has_ret = true;
+  g_proto_cur->ret_bytes = g_proto_params[0];
+  g_proto_params.clear();
+}
+
+// yasai: see ptx_parser.h.
+void ptx_recognizer::end_callprototype() {
+  g_proto_cur->arg_bytes = g_proto_params;
+  g_proto_params.clear();
+  g_func_protos[std::make_pair(g_current_symbol_table, g_proto_cur->name)] = g_proto_cur;
+  g_proto_cur = nullptr;
+}
+
+// yasai: see ptx_parser.h.
+void ptx_recognizer::add_calltarget_func(const char *name) { g_calltarget_funcs.push_back(name); }
+
+// yasai: see ptx_parser.h.
+void ptx_recognizer::add_calltargets(const char *name) {
+  PTX_PARSE_GPPRINTF("add_calltargets %s", name);
+  parse_assert(g_func_info != NULL, ".calltargets outside a function body");
+  const auto key = std::make_pair(g_current_symbol_table, std::string(name));
+  if (g_func_protos.count(key) != 0 || g_func_targets.count(key) != 0)
+    parse_error("\"%s\" is declared twice in one block of function %s", name,
+                g_func_info->get_name().c_str());
+  yasai_call_targets *t = new yasai_call_targets;  // owned by the module, never freed
+  t->name = name;
+  t->funcs = g_calltarget_funcs;
+  g_calltarget_funcs.clear();
+  for (const std::string &f : t->funcs) g_module_target_funcs.emplace_back(t->name, f);
+  g_func_targets[key] = t;
+}
+
+// yasai: see ptx_parser.h.
+void ptx_recognizer::set_call_tail(const char *name) { g_call_tail = name; }
+
+// yasai: see ptx_parser.h.
+void ptx_recognizer::resolve_call_tails() {
+  for (ptx_instruction *i : g_instructions) {
+    const std::string &t = i->yasai_call_tail();
+    if (t.empty()) continue;
+    // The innermost enclosing block that declares the name.
+    const yasai_call_proto *proto = nullptr;
+    const yasai_call_targets *list = nullptr;
+    for (symbol_table *s = i->yasai_call_scope(); s != NULL && !proto && !list;
+         s = s->get_parent()) {
+      auto p = g_func_protos.find(std::make_pair(s, t));
+      if (p != g_func_protos.end()) proto = p->second;
+      auto l = g_func_targets.find(std::make_pair(s, t));
+      if (l != g_func_targets.end()) list = l->second;
+    }
+    if (!proto && !list)
+      parse_error("call at %s:%u names \"%s\", which is neither a .callprototype nor a "
+                  ".calltargets of function %s in an enclosing block",
+                  i->source_file(), i->source_line(), t.c_str(), g_func_info->get_name().c_str());
+    i->yasai_resolve_call_tail(proto, list);
+  }
+}
+
+// yasai: see ptx_parser.h.
+void ptx_recognizer::end_module() {
+  for (const auto &e : g_module_target_funcs)
+    if (g_global_symbol_table->lookup(e.second.c_str()) == NULL)
+      parse_error(".calltargets %s names %s, which the module does not declare", e.first.c_str(),
+                  e.second.c_str());
+  g_module_target_funcs.clear();
 }
 
 // yasai: see ptx_parser.h.
@@ -1249,13 +1350,6 @@ void ptx_recognizer::add_function_address_literal(const char *identifier) {
   }
   g_operands.push_back(
       operand_info((long long)yasai_func::function_handle(s), gpgpu_ctx));
-}
-
-void ptx_recognizer::add_indirect_call(int opcode, const char *target_reg) {
-  PTX_PARSE_GPPRINTF("add_indirect_call");
-  add_opcode(opcode);
-  add_scalar_operand(target_reg);
-  add_instruction();
 }
 
 void ptx_recognizer::add_literal_float(float value) {

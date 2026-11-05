@@ -137,6 +137,39 @@ class ptx_recognizer {
   void add_branchtargets(const char *identifier);
   // yasai: labels of the .branchtargets statement being parsed.
   std::vector<std::string> g_branchtarget_labels;
+  // yasai: indirect calls (PTX ISA call with a register target, .callprototype, .calltargets).
+  // A prototype or target list is visible in the block of the function body that declares it and
+  // in the blocks nested in it (two functions, or two blocks, may use one name); a call names one
+  // after its arguments, and the name is resolved at the end of the function body, since the
+  // declaration may come later. The functions of a target list are
+  // resolved at the end of the module, since they may be defined later.
+  //   start_callprototype: "<name>: .callprototype" begins (name: its label)
+  //   add_proto_param: one parameter of the list being read (bytes: its size)
+  //   proto_params_are_return: the list just read is the return value
+  //   end_callprototype: the declaration ends; the list just read are the parameters
+  //   add_calltarget_func: one function of a .calltargets list (name: the function)
+  //   add_calltargets: the .calltargets statement ends (name: its label)
+  //   set_call_tail: the current call instruction names a prototype or list (name)
+  //   end_module: checks the target lists' functions after the whole module is parsed
+  void start_callprototype(const char *name);
+  void add_proto_param(long long bytes);
+  void proto_params_are_return();
+  void end_callprototype();
+  void add_calltarget_func(const char *name);
+  void add_calltargets(const char *name);
+  void set_call_tail(const char *name);
+  void end_module();
+  // yasai: resolves the tails of the current function's calls (end_function); an unknown name
+  // stops the parse rather than leaving the call unchecked.
+  void resolve_call_tails();
+  yasai_call_proto *g_proto_cur = nullptr;      // declaration being read
+  std::vector<unsigned> g_proto_params;         // parameter sizes being read
+  // current function's prototypes and lists: (declaring block, name) to the declaration
+  std::map<std::pair<symbol_table *, std::string>, yasai_call_proto *> g_func_protos;
+  std::map<std::pair<symbol_table *, std::string>, yasai_call_targets *> g_func_targets;
+  std::vector<std::string> g_calltarget_funcs;  // functions of the list being read
+  std::vector<std::pair<std::string, std::string>> g_module_target_funcs;  // (list, function)
+  std::string g_call_tail;                      // tail name of the current call
   // yasai: marks the current instruction as bf16x2 (the type itself is stored as f16x2); no
   // effect outside an instruction (a .reg .bf16x2 declaration).
   void note_bf16x2();
@@ -193,9 +226,6 @@ class ptx_recognizer {
   // yasai: a function name in a global initializer list (for example NCCL's ncclDevFuncTable);
   // the literal value is the function's handle from yasai_func::function_handle.
   void add_function_address_literal(const char *identifier);
-  // yasai: an indirect call "call %reg, (), prototype;" with no arguments and no return value
-  // becomes a call instruction whose operand is the register holding a function handle.
-  void add_indirect_call(int opcode, const char *target_reg);
   void add_literal_float(float value);
   void add_literal_double(double value);
   void add_address_operand(const char *identifier, long long offset);
