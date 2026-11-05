@@ -7978,12 +7978,14 @@ void shl_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   b = thread->get_operand_value(src2, dst, i_type, thread, 1);
 
   switch (i_type) {
+    // yasai: the shift count is a u32 at every operand width; a GPU looks at all 32 bits (value sweep,
+    // key_values.cu). b.u16 took a count of 0x80000000 as 0 and b.u64 read beyond the register.
     case B16_TYPE:
     case U16_TYPE:
-      if (b.u16 >= 16)
+      if (b.u32 >= 16)
         d.u16 = 0;
       else
-        d.u16 = (unsigned short)((a.u16 << b.u16) & 0xFFFF);
+        d.u16 = (unsigned short)((a.u16 << b.u32) & 0xFFFF);
       break;
     case B32_TYPE:
     case U32_TYPE:
@@ -7997,7 +7999,7 @@ void shl_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       if (b.u32 >= 64)
         d.u64 = 0;
       else
-        d.u64 = (a.u64 << b.u64);
+        d.u64 = (a.u64 << b.u32);
       break;
     default:
       printf("Execution error: type mismatch with instruction\n");
@@ -8019,10 +8021,12 @@ void shr_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   b = thread->get_operand_value(src2, dst, i_type, thread, 1);
 
   switch (i_type) {
+    // yasai: the shift count is a u32 at every operand width (see shl_impl). shr.s64 of a negative value by
+    // a count of 2^31 or more is all ones, as on a GPU; the branch before wrote 0xffffffff00000000.
     case U16_TYPE:
     case B16_TYPE:
-      if (b.u16 < 16)
-        d.u16 = (unsigned short)((a.u16 >> b.u16) & 0xFFFF);
+      if (b.u32 < 16)
+        d.u16 = (unsigned short)((a.u16 >> b.u32) & 0xFFFF);
       else
         d.u16 = 0;
       break;
@@ -8036,13 +8040,13 @@ void shr_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     case U64_TYPE:
     case B64_TYPE:
       if (b.u32 < 64)
-        d.u64 = (a.u64 >> b.u64);
+        d.u64 = (a.u64 >> b.u32);
       else
         d.u64 = 0;
       break;
     case S16_TYPE:
-      if (b.u16 < 16)
-        d.s64 = (a.s16 >> b.s16);
+      if (b.u32 < 16)
+        d.s64 = (a.s16 >> b.u32);
       else {
         if (a.s16 < 0) {
           d.s64 = -1;
@@ -8053,7 +8057,7 @@ void shr_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       break;
     case S32_TYPE:
       if (b.u32 < 32)
-        d.s64 = (a.s32 >> b.s32);
+        d.s64 = (a.s32 >> b.u32);
       else {
         if (a.s32 < 0) {
           d.s64 = -1;
@@ -8063,20 +8067,10 @@ void shr_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       }
       break;
     case S64_TYPE:
-      if (b.u64 < 64)
-        d.s64 = (a.s64 >> b.u64);
-      else {
-        if (a.s64 < 0) {
-          if (b.s32 < 0) {
-            d.u64 = -1;
-            d.s32 = 0;
-          } else {
-            d.s64 = -1;
-          }
-        } else {
-          d.s64 = 0;
-        }
-      }
+      if (b.u32 < 64)
+        d.s64 = (a.s64 >> b.u32);
+      else
+        d.s64 = a.s64 < 0 ? -1 : 0;
       break;
     default:
       printf("Execution error: type mismatch with instruction\n");
