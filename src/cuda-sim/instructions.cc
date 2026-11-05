@@ -2449,10 +2449,16 @@ void cp_async_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     info.bar_id = addr;
     const_cast<ptx_instruction *>(pI)->set_mbarrier_info(
         thread->get_laneid(), info);
-    // yasai: functional cp.async copies complete at issue, so the arrive happens now (.noinc
-    // does not change the expected count, which the functional model does not track per phase).
-    if (thread->isInFunctionalSimulationMode())
-      yasai_func::mbar_arrive(thread->get_cta_uid(), addr, 1);
+    // yasai: functional cp.async copies complete at issue. With .noinc the arrive happens now. Without it the pending count goes up by 1 at issue and down by 1 when the copies complete, so it only holds
+    // the phase until they land, and nothing changes here: a GB10 and an RTX 5090 finish a phase only when the thread also runs mbarrier.arrive (value sweep, ptx_key_values2.py; alone, the barrier
+    // never completes). Counting it as an arrival completed that phase early and left the thread's own arrival for the next one.
+    if (thread->isInFunctionalSimulationMode()) {
+      bool noinc = false;
+      for (int opt : pI->get_options()) {
+        if (opt == NOINC_OPTION) noinc = true;
+      }
+      if (noinc) yasai_func::mbar_arrive(thread->get_cta_uid(), addr, 1);
+    }
     return;
   }
 
