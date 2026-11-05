@@ -30,6 +30,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
+#include <algorithm>
 #include <cstring>
 #include "instructions.h"
 #include "yasai_func.h"
@@ -3454,6 +3455,19 @@ void cnot_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   thread->set_operand_value(dst, d, i_type, thread, pI);
 }
 
+// yasai: the angle of sin.approx and cos.approx as a GB10 and an RTX 5090 reduce it, in radians, for a finite x (tests/trig_ends_probe.cu, the value sweep): |x| * (2 / pi), with 2 / pi as an
+// f32 and the product cut toward zero to f32, is cut to 23 fraction bits modulo 4, so |x| below (pi / 2) 2^-23 is angle 0 (sin gives a zero of x's sign), and from (pi / 2) 2^25 on
+// the angle is 0 (sin gives zero and cos gives 1). The GPU's sine and cosine of that angle have no bitwise model here: libm's differ from them by at most 1e-4 for |x| below 2^10, and
+// by more at large |x|, where the angle's reduction differs too.
+static inline double yasai_trig_angle(float x) {
+  const double p = double(std::fabs(x)) * double(0.63661975f);
+  float t = float(p);
+  if (double(t) > p) t = std::nextafterf(t, 0.0f);
+  if (t >= 33554432.0f) return 0.0;
+  const uint64_t k = uint64_t(double(t) * 8388608.0) % (1ull << 25);
+  return double(k) * 1.5707963267948966 / 8388608.0;
+}
+
 void cos_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   ptx_reg_t a, d;
   const operand_info &dst = pI->dst();
@@ -3464,7 +3478,7 @@ void cos_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
   switch (i_type) {
     case F32_TYPE:
-      d.f32 = cos(a.f32);
+      d.f32 = std::isfinite(a.f32) ? float(cos(yasai_trig_angle(a.f32))) : cos(a.f32);  // yasai
       break;
     default:
       printf("Execution error: type mismatch with instruction\n");
@@ -4741,7 +4755,15 @@ void div_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       data.f16 = src1_data.f16 / src2_data.f16;
       break;  // assert(0); break;
     case F32_TYPE:
-      data.f32 = src1_data.f32 / src2_data.f32;
+      // yasai: div.approx.f32 is a * (1 / b) with the reciprocal rounded on its own and flushed when subnormal, as the PTX ISA describes it and as a GB10 and an RTX 5090 give it
+      // (value sweep, key_values.cu: 0x7f7fffff / 0x7f7fffff is 0, since the reciprocal is subnormal). A subnormal divisor without .ftz divides directly.
+      if (pI->is_approx() && !std::isnan(src1_data.f32) && !std::isnan(src2_data.f32) && std::fpclassify(src2_data.f32) != FP_SUBNORMAL) {
+        float r = 1.0f / src2_data.f32;
+        if (std::fpclassify(r) == FP_SUBNORMAL) r = std::copysign(0.0f, r);
+        data.f32 = src1_data.f32 * r;
+      } else {
+        data.f32 = src1_data.f32 / src2_data.f32;
+      }
       break;
     case F64_TYPE:
     case FF64_TYPE:
@@ -7064,6 +7086,34 @@ void prmt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   thread->set_operand_value(dst, data, i_type, thread, pI);
 }
 
+// yasai: rcp.approx.ftz.f64 and rsqrt.approx.ftz.f64 work on the top 32 bits of the input and write the top 32 bits of the result: the low word of every result is zero, and the input's
+// low word does not count (a GB10 and an RTX 5090, value sweep, key_values.cu: 0x7ff0000000000001 is an infinity to them, so its reciprocal is 0). A NaN in the top word, and a negative
+// input of rsqrt, give 0x7fffffff00000000. The result's top word is the exact value's, cut toward zero; the GPU's is the same in 3,902 of 4,096 cases for rcp and in 4,011 for rsqrt, and
+// one unit of the top word away otherwise. a: the input's bits; rsqrt: which of the two.
+static inline uint64_t yasai_f64_top_word_approx(uint64_t a, bool rsqrt) {
+  const uint64_t hi = a & 0xffffffff00000000ull;
+  const uint64_t sign = hi & 0x8000000000000000ull;
+  const unsigned exp = unsigned((hi >> 52) & 0x7ff);
+  if (exp == 0x7ff && (hi & 0x000fffff00000000ull) != 0) return 0x7fffffff00000000ull;
+  double x;
+  if (exp == 0) {
+    x = sign ? -0.0 : 0.0;  // .ftz
+  } else {
+    std::memcpy(&x, &hi, 8);
+  }
+  double r;
+  if (rsqrt) {
+    if (x < 0) return 0x7fffffff00000000ull;
+    r = x == 0 ? std::copysign(std::numeric_limits<double>::infinity(), x) : 1.0 / std::sqrt(x);
+  } else {
+    r = 1.0 / x;
+  }
+  uint64_t b;
+  std::memcpy(&b, &r, 8);
+  if (((b >> 52) & 0x7ff) == 0) return b & 0x8000000000000000ull;
+  return b & 0xffffffff00000000ull;
+}
+
 void rcp_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   ptx_reg_t src1_data, src2_data, data;
   const operand_info &dst = pI->dst();
@@ -7088,6 +7138,7 @@ void rcp_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
   // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
   yasai_nan::fix(i_type, pI->is_ftz() ? 'r' : '1', src1_data, src1_data, src1_data, data);
+  if ((i_type == F64_TYPE || i_type == FF64_TYPE) && pI->is_ftz() && pI->is_approx()) data.u64 = yasai_f64_top_word_approx(src1_data.u64, false);
   thread->set_operand_value(dst, data, i_type, thread, pI);
 }
 
@@ -7190,6 +7241,7 @@ void rsqrt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
   // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
   yasai_nan::fix(i_type, '1', a, a, a, d);
+  if ((i_type == F64_TYPE || i_type == FF64_TYPE) && pI->is_ftz() && pI->is_approx()) d.u64 = yasai_f64_top_word_approx(a.u64, true);
   thread->set_operand_value(dst, d, i_type, thread, pI);
 }
 
@@ -8114,7 +8166,8 @@ void sin_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
   switch (i_type) {
     case F32_TYPE:
-      d.f32 = sin(a.f32);
+      // yasai: odd in x, so a tiny negative x gives -0 (yasai_trig_angle).
+      d.f32 = std::isfinite(a.f32) ? float(std::signbit(a.f32) ? -sin(yasai_trig_angle(a.f32)) : sin(yasai_trig_angle(a.f32))) : sin(a.f32);
       break;
     default:
       printf("Execution error: type mismatch with instruction\n");

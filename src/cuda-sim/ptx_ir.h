@@ -1335,6 +1335,8 @@ class ptx_instruction : public warp_inst_t {
   // yasai: the instruction carries .ftz (subnormal inputs and results flushed to sign-preserving
   // zero); only fma and mad model it.
   bool is_ftz() const { return m_yasai_ftz; }
+  /// yasai: the instruction has .approx (div, rcp, rsqrt, which compute otherwise without it).
+  bool is_approx() const { return m_yasai_approx; }
   // yasai: the instruction names a rounding modifier (.rn, .rz, .rm, .rp or an integer form);
   // rounding_mode() answers RN for both an absent modifier and .rn.
   bool has_rounding_modifier() const { return m_yasai_rnd_explicit; }
@@ -1490,6 +1492,7 @@ class ptx_instruction : public warp_inst_t {
   unsigned m_clamp_mode;
   bool m_relu = false;    // yasai: see is_relu()
   bool m_yasai_ftz = false;  // yasai: see is_ftz()
+  bool m_yasai_approx = false;  // yasai: see is_approx()
   bool m_yasai_rnd_explicit = false;           // yasai: see has_rounding_modifier()
   bool m_yasai_cc = false;                     // yasai: see yasai_cc()
   int m_yasai_save_id = -1;                    // yasai: see yasai_save_id()
