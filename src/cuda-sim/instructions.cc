@@ -5947,7 +5947,9 @@ void mad_def(const ptx_instruction *pI, ptx_thread_info *thread,
           ((long long int)(t.s32 + c.s32 + carry_bit.pred) & 0x100000000) >> 32;
       break;
     case S32_TYPE:
-      t.s64 = a.s32 * b.s32;
+      // yasai: the product in 64 bits; a.s32 * b.s32 is a 32-bit product, so mad.wide and mad.hi lost its
+      // upper half (value sweep, key_values.cu).
+      t.s64 = (long long)a.s32 * (long long)b.s32;
       if (pI->is_wide())
         d.s64 = t.s64 + c.s64 + carry_bit.pred;
       else if (pI->is_hi())
@@ -5968,11 +5970,11 @@ void mad_def(const ptx_instruction *pI, ptx_thread_info *thread,
         assert(0);
       break;
     case U16_TYPE:
-      t.u32 = a.u16 * b.u16;
+      t.u32 = (unsigned)a.u16 * (unsigned)b.u16;
       if (pI->is_wide())
         d.u32 = t.u32 + c.u32 + carry_bit.pred;
-      else if (pI->is_hi())
-        d.u16 = (t.u32 + c.u16 + carry_bit.pred) >> 16;
+      else if (pI->is_hi())  // yasai: the PTX ISA's t[2n-1:n] + c, as for s16
+        d.u16 = (t.u32 >> 16) + c.u16 + carry_bit.pred;
       else if (pI->is_lo())
         d.u16 = t.u16 + c.u16 + carry_bit.pred;
       else
@@ -5982,11 +5984,14 @@ void mad_def(const ptx_instruction *pI, ptx_thread_info *thread,
               32;
       break;
     case U32_TYPE:
-      t.u64 = a.u32 * b.u32;
+      // yasai: the product in 64 bits (see s32), and mad.hi as the PTX ISA's t[63:32] + c; the expression
+      // before took the upper half of the sum, so a GPU's 1 for hi(0 * 1) + 1 read 0 (value sweep,
+      // key_values.cu).
+      t.u64 = (unsigned long long)a.u32 * (unsigned long long)b.u32;
       if (pI->is_wide())
         d.u64 = t.u64 + c.u64 + carry_bit.pred;
       else if (pI->is_hi())
-        d.u32 = (t.u64 + c.u32 + carry_bit.pred) >> 32;
+        d.u32 = (unsigned)(t.u64 >> 32) + c.u32 + carry_bit.pred;
       else if (pI->is_lo())
         d.u32 = t.u32 + c.u32 + carry_bit.pred;
       else
