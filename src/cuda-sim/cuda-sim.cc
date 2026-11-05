@@ -37,7 +37,6 @@ extern thread_local const ptx_instruction *t_ftz_inst;
 #include "shared_devmem.h"
 #include "cuda-sim.h"
 #include <shared_mutex>
-#include <mutex>
 
 // yasai: guards cuda_sim::g_pc_to_finfo. PTX pieces are assembled (map insertions) while
 // kernels run and look up reconvergence points (map lookups) on another thread.
@@ -2613,6 +2612,7 @@ void function_info::finalize(memory_space *param_mem) {
     param->set_address(param_address);
     param_address += size;
   }
+  m_yasai_param_block_size = param_address;
 }
 
 void function_info::param_to_shared(memory_space *shared_mem,

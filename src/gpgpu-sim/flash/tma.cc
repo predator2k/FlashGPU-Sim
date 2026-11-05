@@ -452,6 +452,7 @@ static void read_tensormap_descriptor(memory_space *global_mem,
                                       uint64_t tensormap_addr,
                                       unsigned inst_dim,
                                       tensormap_descriptor_t &out_tensormap) {
+  yasai_cvta_report::note_tensor_map_read(tensormap_addr);
   if (tensormap_addr < STATIC_ALLOC_LIMIT && param_mem != nullptr) {
     param_mem->read(tensormap_addr, TENSORMAP_DESCRIPTOR_SIZE, &out_tensormap);
     if (try_decode_tensormap_descriptor(out_tensormap, inst_dim)) {
@@ -2555,7 +2556,7 @@ static void check_tma_alignment(uint64_t dst_addr, uint64_t src_addr,
 
 // Read tensormap from memory, validate, parse coordinates, compute size.
 // FA3/CUTLASS may pass descriptors embedded in kernel .param storage via
-// cvta.param; those addresses are simulator param-memory offsets.
+// cvta.param; those addresses are in the launch's copy of its parameters, in the global space.
 static void
 setup_tensor_tma(memory_space *global_mem, uint64_t tensormap_addr,
                  unsigned inst_dim, const operand_info &coord_operand,

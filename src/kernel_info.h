@@ -1,6 +1,7 @@
 #ifndef KERNEL_INFO_INCLUDED
 #define KERNEL_INFO_INCLUDED
 
+#include <atomic>
 #include <assert.h>
 #include <list>
 #include <map>
@@ -57,6 +58,16 @@ void increment_x_then_y_then_z(dim3 &i, const dim3 &bound);
  *
  * ! Our solution so far is to use a mutex in dec_running()...
  */
+/// yasai: counters of the parameters' copies (kernel_info_t::yasai_param_window), which
+/// YASAI_CVTA_REPORT=<file> appends to the file at exit.
+namespace yasai_cvta_report {
+/// Counts a tensor map read at an address, if the address is in a copy.
+/// @param addr The address.
+void note_tensor_map_read(unsigned long long addr);
+/// Counts one prefetch instruction.
+void note_prefetch();
+}  // namespace yasai_cvta_report
+
 class kernel_info_t {
 public:
   kernel_info_t(dim3 gridDim, dim3 blockDim, class function_info *entry,
@@ -128,6 +139,18 @@ public:
     return m_active_threads;
   }
   class memory_space *get_param_memory() { return m_param_mem; }
+  /// yasai: this launch's parameters in the global space, copied on first use and at the same
+  /// offsets as in the parameter space. cvta.param adds this base on both GPUs. All blocks of a launch
+  /// share the copy, and the next launch has a new one. A store through the pointer changes what
+  /// generic and global loads read but not what ld.param reads.
+  /// @param gpu Owner of the global space.
+  /// @return The copy's address.
+  unsigned long long yasai_param_window(class gpgpu_t *gpu);
+  /// yasai: tests an address against the copy, as isspacep.param answers: true from the copy's first
+  /// byte through the byte just past it. Measured with blocks of 8 to 320 bytes (RTX 5090, GB10).
+  /// @param addr The address.
+  /// @return Whether a copy exists and holds the address.
+  bool yasai_in_param_window(unsigned long long addr) const;
 
   // The following functions access texture bindings present at the kernel's
   // launch
@@ -168,6 +191,10 @@ private:
 
   std::list<class ptx_thread_info *> m_active_threads;
   class memory_space *m_param_mem;
+  /// yasai: address of the parameters' copy in the global space; 0 until the first use.
+  std::atomic<unsigned long long> m_yasai_param_window{0};
+  /// yasai: length of that copy in bytes.
+  unsigned m_yasai_param_window_size{0};
 
 #ifdef FLASH_GPGPU_SIM_OMP
   mutable std::shared_mutex m_mutex;

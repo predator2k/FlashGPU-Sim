@@ -1771,6 +1771,9 @@ class function_info {
   addr_t get_start_PC() const { return m_start_PC; }
 
   void finalize(memory_space *param_mem);
+  /// yasai: length of the parameter block that finalize laid out.
+  /// @return Bytes; 0 before the first finalize.
+  unsigned yasai_param_block_size() const { return m_yasai_param_block_size; }
   void param_to_shared(memory_space *shared_mem, symbol_table *symtab);
   void list_param(FILE *fout) const;
   void ptx_jit_config(std::map<unsigned long long, size_t> mallocPtr_Size,
@@ -2016,6 +2019,8 @@ class function_info {
 
   // parameter size for device kernels
   int m_args_aligned_size;
+  /// yasai: length of the parameter block, set by finalize.
+  unsigned m_yasai_param_block_size = 0;
 
   addr_t m_n;  // offset in m_instr_mem (used in do_pdom)
 };

@@ -4743,6 +4743,9 @@ void cvta_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
         break;
       case param_space_unclassified:
       case param_space_kernel:
+        // yasai: the inverse of cvta.param below, for any value, as on both GPUs.
+        to_addr_hw = from_addr_hw - thread->get_kernel().yasai_param_window(thread->get_gpu());
+        break;
       case const_space:  // yasai: .const variables live at their own addresses in the global window
         to_addr_hw = from_addr_hw;
         break;
@@ -4765,6 +4768,12 @@ void cvta_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
         break;
       case param_space_unclassified:
       case param_space_kernel:
+        // yasai: on both GPUs (value sweep) the result is the value plus the address of the launch's
+        // parameters in the global space, whatever the value: generic and global loads through it
+        // read the parameters, stores change what they read and not what ld.param reads, and it
+        // travels like any pointer. ld.param of the symbol's value is unaffected.
+        to_addr_hw = from_addr_hw + thread->get_kernel().yasai_param_window(thread->get_gpu());
+        break;
       case const_space:  // yasai: see above (generic loads of the address read the same bytes)
         to_addr_hw = from_addr_hw;
         break;
@@ -5142,7 +5151,8 @@ void isspacep_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
   // yasai: the cases fell through to abort(), so every isspacep stopped the simulator (NVSHMEM's
   // barrier, broadcast and other collectives use isspacep.shared). Generic addresses of the const
-  // and param spaces are not modeled; isspacep.const and .param answer false.
+  // space are not modeled, so isspacep.const answers false; isspacep.param tests the launch's copy
+  // of its parameters (cvta.param).
   switch (space.get_type()) {
     case shared_space:
       t = isspace_shared(smid, addr);
@@ -5154,10 +5164,12 @@ void isspacep_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       t = isspace_global(addr) && !isspace_shared(smid, addr) && !isspace_local(smid, hwtid, addr);
       break;
     case const_space:
-    case param_space_kernel:
     case param_space_local:
-    case param_space_unclassified:
       t = false;
+      break;
+    case param_space_kernel:
+    case param_space_unclassified:
+      t = thread->get_kernel().yasai_in_param_window(addr);
       break;
     default:
       abort();
@@ -7072,6 +7084,7 @@ void popc_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 void prefetch_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   // Functional no-op. Prefetch instructions are cache hints; the simulator
   // handles the actual data movement through the load/store/TMA instructions.
+  yasai_cvta_report::note_prefetch();
 }
 void prefetchu_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   // Functional no-op. See prefetch_impl.

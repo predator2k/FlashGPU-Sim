@@ -1,10 +1,17 @@
 
 #include "kernel_info.h"
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
+#include <map>
+#include <mutex>
+#include <vector>
 #include "../libcuda/gpgpu_context.h"
 #include "cuda-sim/memory.h"
 #include "cuda-sim/ptx_ir.h"
+#include "cuda-sim/yasai_strict_addr.h"
 #include "gpgpu-sim/gpu-sim.h"
 #include "stream_manager.h"
 
@@ -89,10 +96,112 @@ kernel_info_t::kernel_info_t(
   m_dynamic_smem = 0;
 }
 
+namespace {
+
+/// yasai: guards the free lists of parameter copies and the creation of a copy.
+/// @return The mutex.
+std::mutex &param_window_mutex() {
+  static std::mutex m;
+  return m;
+}
+
+/// yasai: first address of the parameters' copies. They are global addresses (whichspace) outside
+/// the device heap, which grows from GLOBAL_HEAP_START, and below the range where Linux places host
+/// mappings, so that a program's allocations and memory counters do not see them.
+constexpr unsigned long long kParamWindowStart = 0x600000000000ull;
+/// yasai: alignment of a copy in bytes, enough for every .param alignment in the census.
+constexpr unsigned long long kParamWindowAlign = 256;
+/// yasai: next address for a new copy, guarded by param_window_mutex.
+unsigned long long g_param_window_next = kParamWindowStart;
+
+/// yasai: copies made, including reused ones.
+std::atomic<unsigned long long> g_param_window_copies{0};
+/// yasai: tensor maps read from a copy.
+std::atomic<unsigned long long> g_param_window_tensor_maps{0};
+/// yasai: prefetch instructions executed.
+std::atomic<unsigned long long> g_prefetches{0};
+/// yasai: end of the addresses given to copies so far; written under param_window_mutex.
+std::atomic<unsigned long long> g_param_window_end{kParamWindowStart};
+
+/// yasai: appends the counters and the working directory to the file YASAI_CVTA_REPORT names, at exit, when a counter is not zero.
+struct param_window_report {
+  ~param_window_report() {
+    const char *path = getenv("YASAI_CVTA_REPORT");
+    if (path == nullptr || g_param_window_copies.load() + g_prefetches.load() == 0) return;
+    char cwd[512] = "?";
+    if (getcwd(cwd, sizeof cwd) == nullptr) cwd[0] = '?';
+    FILE *f = fopen(path, "a");
+    if (f == nullptr) return;
+    fprintf(f, "copies=%llu tensor_map_reads=%llu prefetches=%llu cwd=%s\n", g_param_window_copies.load(), g_param_window_tensor_maps.load(), g_prefetches.load(), cwd);
+    fclose(f);
+  }
+} g_param_window_report;
+
+/// yasai: copies of finished launches, by length, for the next launches: a long run has millions
+/// of launches, and storage is never returned.
+/// @return Length to addresses.
+std::map<unsigned, std::vector<unsigned long long>> &param_window_free() {
+  static auto *lists = new std::map<unsigned, std::vector<unsigned long long>>();
+  return *lists;
+}
+
+}  // namespace
+
+unsigned long long kernel_info_t::yasai_param_window(gpgpu_t *gpu) {
+  unsigned long long base = m_yasai_param_window.load(std::memory_order_acquire);
+  if (base != 0) return base;
+  std::lock_guard<std::mutex> lk(param_window_mutex());
+  base = m_yasai_param_window.load(std::memory_order_relaxed);
+  if (base != 0) return base;
+  const unsigned size = m_kernel_entry->yasai_param_block_size();
+  if (size == 0) {
+    fprintf(stderr, "yasai-cvta: kernel %s has no parameter block for cvta.param\n", name().c_str());
+    abort();
+  }
+  std::vector<unsigned long long> &free_list = param_window_free()[size];
+  if (free_list.empty()) {
+    base = g_param_window_next;
+    g_param_window_next += (size + kParamWindowAlign - 1) / kParamWindowAlign * kParamWindowAlign;
+    g_param_window_end.store(g_param_window_next, std::memory_order_relaxed);
+    yasai_strict_addr::note_internal(base, size);
+  } else {
+    base = free_list.back();
+    free_list.pop_back();
+  }
+  // Word by word, since a parameter may cross a block of the parameter space (function_info::finalize).
+  for (unsigned i = 0; i < size; i += 4) {
+    const unsigned n = std::min(4u, size - i);
+    unsigned word = 0;
+    m_param_mem->read(i, n, &word);
+    gpu->get_global_memory()->write(base + i, n, &word, NULL, NULL);
+  }
+  m_yasai_param_window_size = size;
+  m_yasai_param_window.store(base, std::memory_order_release);
+  g_param_window_copies.fetch_add(1, std::memory_order_relaxed);
+  return base;
+}
+
+void yasai_cvta_report::note_tensor_map_read(unsigned long long addr) {
+  if (addr >= kParamWindowStart && addr < g_param_window_end.load(std::memory_order_relaxed))
+    g_param_window_tensor_maps.fetch_add(1, std::memory_order_relaxed);
+}
+
+void yasai_cvta_report::note_prefetch() { g_prefetches.fetch_add(1, std::memory_order_relaxed); }
+
+bool kernel_info_t::yasai_in_param_window(unsigned long long addr) const {
+  const unsigned long long base = m_yasai_param_window.load(std::memory_order_acquire);
+  return base != 0 && addr >= base && addr - base <= m_yasai_param_window_size;
+}
+
 kernel_info_t::~kernel_info_t() {
   assert(m_active_threads.empty());
   destroy_cta_streams();
   delete m_param_mem;
+  const unsigned long long window = m_yasai_param_window.load(std::memory_order_acquire);
+  if (window != 0) {
+    std::lock_guard<std::mutex> lk(param_window_mutex());
+    param_window_free()[m_yasai_param_window_size].push_back(window);
+  }
 }
 
 std::string kernel_info_t::name() const { return m_kernel_entry->get_name(); }
