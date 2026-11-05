@@ -93,7 +93,19 @@ static uint64_t apply1(unsigned op, elem k, unsigned bytes, uint64_t a, uint64_t
   const bool fp = k == elem::f16 || k == elem::bf16 || k == elem::f32 || k == elem::f64;
   switch (op) {
     case ATOMIC_ADD:
-      if (fp) return from_f(k, to_f(k, a) + to_f(k, b)) & m;
+      if (fp) {
+        // yasai: NaN results as an RTX 5090 writes them for atom.add (tests/nan_probe.cu): f32, f16 and bf16
+        // the canonical NaN; f64 the operand's NaN, else the memory word's, both unquieted, else for an
+        // invalid sum 0xfff8000000000000.
+        const double x = to_f(k, a), y = to_f(k, b), r = x + y;
+        if (std::isnan(r)) {
+          if (k != elem::f64) return k == elem::f32 ? 0x7fffffffull : 0x7fffull;
+          if (std::isnan(y)) return b;
+          if (std::isnan(x)) return a;
+          return 0xfff8000000000000ull;
+        }
+        return from_f(k, r) & m;
+      }
       return (a + b) & m;
     case ATOMIC_MIN:
       if (fp) return from_f(k, std::fmin(to_f(k, a), to_f(k, b))) & m;
