@@ -2790,15 +2790,23 @@ unsigned trunc(unsigned num, unsigned precision) {
   }
   return num;
 }
+// yasai: the f32 accumulator fragments of wmma m16n16k16 as a GB10 lays them out (tests/wmma_layout.cu for wmma.load.c,
+// tests/wmma_store_layout.cu for wmma.store.d and wmma.mma's result, all 32 lanes): lane l = 4g + q holds in register k
+//   row g + 8 ((k / 2) % 2), column 2q + (k % 2) + 8 (k / 4),
+// and wmma.store.d .f16 holds the same elements in half h of register r with k = 2r + h. In memory the element lies at
+// row * stride + column in the row layout and at column * stride + row in the col layout.
+//   lane: lane; k: fragment index; row, col: receive the element's position
+static void yasai_wmma_acc_pos(int lane, int k, int *row, int *col) {
+  const int g = lane / 4, q = lane % 4;
+  *row = g + 8 * ((k / 2) % 2);
+  *col = 2 * q + (k % 2) + 8 * (k / 4);
+}
+
 void mapping(int thread, int wmma_type, int wmma_layout, int type, int index,
              int stride, int &row, int &col, int &assg_offset) {
   int offset;
   int c_row_offset[] = {0, 8, 0, 8, 4, 12, 4, 12};
   int c_col_offset[] = {0, 0, 8, 8, 0, 0, 8, 8};
-  int c_tg_inside_row_offset[] = {0, 1, 0, 1};
-  int c_tg_inside_col_offset[] = {0, 0, 2, 2};
-  int c_inside_row_offset[] = {0, 0, 2, 2, 0, 0, 2, 2};
-  int c_inside_col_offset[] = {0, 1, 0, 1, 4, 5, 4, 5};
 
   offset = thread_group_offset(thread, wmma_type, wmma_layout, type, stride);
 
@@ -2823,10 +2831,7 @@ void mapping(int thread, int wmma_type, int wmma_layout, int type, int index,
       row = c_row_offset[thread / 4] + thread % 4;
       col = c_col_offset[thread / 4] + index;
     } else {
-      row = c_row_offset[thread / 4] + c_tg_inside_row_offset[thread % 4] +
-            c_inside_row_offset[index];
-      col = c_col_offset[thread / 4] + c_tg_inside_col_offset[thread % 4] +
-            c_inside_col_offset[index];
+      yasai_wmma_acc_pos(thread, index, &row, &col);
     }
     assg_offset = index;
   }
@@ -2850,9 +2855,8 @@ void decode_space(memory_space_t &space, ptx_thread_info *thread, const operand_
 // a and b in row and col agree): lane l = 4g + q holds in half h of register r
 //   a: row g + 8 (r % 2), column 2q + h + 8 (r / 2);
 //   b: row (k) 2q + h + 8 (r % 2), column (n) g + 8 (r / 2).
-// The f32 accumulator fragments keep the simulator's wmma layout (mapping(), LOAD_C), which wmma.load.c and
-// wmma.store.d of every wmma use; a GPU's accumulator layout is that of the two mma tiles, so code that changes
-// accumulator elements by position would differ (none in the census).
+// The f32 accumulator fragments are yasai_wmma_acc_pos's; Transformer Engine's Hadamard kernels convert them by position
+// and store the result with wmma.store.d .f16.
 static void yasai_wmma_bf16_pos(bool is_a, unsigned lane, unsigned r, unsigned h, unsigned *row, unsigned *col) {
   const unsigned g = lane / 4, q = lane % 4;
   if (is_a) {
@@ -2905,7 +2909,7 @@ static void yasai_wmma_bf16_ld(const ptx_instruction *pI, core_t *core, warp_ins
 }
 
 // yasai: wmma.mma.sync.aligned.{row,col}.{row,col}.m16n16k16.f32.bf16.bf16.f32 d, a, b, c: a and b in the
-// fragments above, c and d in the simulator's f32 accumulator layout. Each product is exact in f32 and the sum
+// fragments above, c and d in the f32 accumulator fragments. Each product is exact in f32 and the sum
 // runs over k in order in f32, then c is added, as mma.sync's bf16 model does (tensor_mma_f16_impl).
 static void yasai_wmma_bf16_mma(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
   const unsigned tid = (core->get_gpu()->is_functional_sim() ? inst.warp_id_func() : inst.warp_id()) *
@@ -5281,7 +5285,10 @@ void mma_st_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
 
     for (k = 0; k < 8; k++) {
       if (type == F32_TYPE) {
-        push_addr = new_addr + 4 * acc_float_offset(k, wmma_layout, stride);
+        // yasai: a GPU's layout (yasai_wmma_acc_pos)
+        int acc_row, acc_col;
+        yasai_wmma_acc_pos(thrd, k, &acc_row, &acc_col);
+        push_addr = addr + 4 * addr_t(wmma_layout == ROW ? acc_row * stride + acc_col : acc_col * stride + acc_row);
         mem->write(push_addr, size / 8, &v[k].s64, thread, pI);
         mem_txn_addr[num_mem_txn++] = push_addr;
 
@@ -5300,12 +5307,15 @@ void mma_st_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
           mma_trace.append("\n");
         });
       } else if (type == F16_TYPE) {
+        // yasai: a GPU's layout: halfword k = 2r + h of the registers (yasai_wmma_acc_pos)
+        int acc_row, acc_col;
+        yasai_wmma_acc_pos(thrd, k, &acc_row, &acc_col);
         if (wmma_layout == ROW) {
-          push_addr = new_addr + k * 2;
+          push_addr = addr + 2 * addr_t(acc_row * stride + acc_col);
           mem->write(push_addr, size / 8, &nw_v[k].s64, thread, pI);
           if (k % 2 == 0) mem_txn_addr[num_mem_txn++] = push_addr;
         } else if (wmma_layout == COL) {
-          push_addr = new_addr + k * 2 * stride;
+          push_addr = addr + 2 * addr_t(acc_col * stride + acc_row);
           mem->write(push_addr, size / 8, &nw_v[k].s64, thread, pI);
           mem_txn_addr[num_mem_txn++] = push_addr;
         }
@@ -5440,7 +5450,10 @@ void mma_ld_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
             abort();
           }
         } else if (type == F32_TYPE) {
-          fetch_addr = new_addr + 4 * acc_float_offset(i, wmma_layout, stride);
+          // yasai: a GPU's layout (yasai_wmma_acc_pos)
+          int acc_row, acc_col;
+          yasai_wmma_acc_pos(thrd, i, &acc_row, &acc_col);
+          fetch_addr = addr + 4 * addr_t(wmma_layout == ROW ? acc_row * stride + acc_col : acc_col * stride + acc_row);
           mem->read(fetch_addr, size / 8, &data[i].s64);
           mem_txn_addr[num_mem_txn++] = fetch_addr;
         } else {
