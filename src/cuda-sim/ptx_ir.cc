@@ -1771,6 +1771,7 @@ ptx_instruction::ptx_instruction(
         m_atomic_spec = last_ptx_inst_option;
         break;
       case APPROX_OPTION:
+        m_yasai_approx = true;  // yasai: is_approx
         break;
       case FULL_OPTION:
         break;
