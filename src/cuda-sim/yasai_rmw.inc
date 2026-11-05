@@ -175,11 +175,16 @@ static uint64_t host_rmw(uint64_t addr, unsigned bytes, unsigned op, unsigned ty
                          uint64_t b, uint64_t c) {
   uint64_t old = 0;
   host_window::read(addr, bytes, &old);
+  if (yasai_stall::t_reads) yasai_stall::note_load(addr, bytes, &old);
   for (;;) {
     unsigned wb;
     uint64_t nv = apply(op, type, bf16x2, old, b, c, &wb);
     uint64_t expect = old;
-    if (host_window::compare_exchange(addr, bytes, &expect, nv)) return old;
+    if (host_window::compare_exchange(addr, bytes, &expect, nv)) {
+      // yasai: progress only when the word changed (yasai_stall.h).
+      yasai_stall::note_rmw(old & mask_of(bytes), nv & mask_of(bytes));
+      return old;
+    }
     old = expect;
   }
 }
@@ -211,7 +216,12 @@ static uint64_t rmw(ptx_thread_info *thread, const ptx_instruction *pI, memory_s
   mem->read(addr, bytes, &old);
   unsigned wb;
   uint64_t nv = apply(op, type, pI->is_bf16x2(), old, b, c, &wb);
-  mem->write(addr, bytes, &nv, thread, pI);
+  {
+    // yasai: progress only when the value changed (yasai_stall.h), not by the store itself.
+    yasai_stall::rmw_scope rs;
+    mem->write(addr, bytes, &nv, thread, pI);
+  }
+  yasai_stall::note_rmw(old & mask_of(bytes), nv & mask_of(bytes));
   return old;
 }
 
@@ -373,6 +383,7 @@ void multimem_ld_reduce_impl(const ptx_instruction *pI, ptx_thread_info *thread)
     for (int t = 0; t < nt; t++) {
       uint32_t v = 0;
       host_window::read(tg[t], 4, &v);
+      if (yasai_stall::t_reads) yasai_stall::note_load(tg[t], 4, &v);
       float f;
       memcpy(&f, &v, 4);
       printf(" %g", f);
@@ -387,6 +398,7 @@ void multimem_ld_reduce_impl(const ptx_instruction *pI, ptx_thread_info *thread)
     for (int t = 0; t < nt; t++) {
       uint64_t v = 0;
       host_window::read(tg[t], 8, &v);
+      if (yasai_stall::t_reads) yasai_stall::note_load(tg[t], 8, &v);
       printf(" %llu", (unsigned long long)v);
     }
     printf("\n");
@@ -401,6 +413,7 @@ void multimem_ld_reduce_impl(const ptx_instruction *pI, ptx_thread_info *thread)
       for (int t = 0; t < nt; t++) {
         uint64_t v = 0;
         host_window::read(tg[t] + eoff, eb, &v);
+        if (yasai_stall::t_reads) yasai_stall::note_load(tg[t] + eoff, eb, &v);
         if (fp) {
           double x = yasai_rmw::to_f(k, v);
           if (t == 0) acc = x;
@@ -452,6 +465,7 @@ void multimem_st_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   const int nt = shared_devmem::mc_targets(mc, off, size_t(wb) * n, tg, shared_devmem::kMaxMcDevices);
   for (int t = 0; t < nt; t++)
     for (unsigned e = 0; e < n; e++) host_window::write(tg[t] + uint64_t(e) * wb, wb, &v[e].u64);
+  yasai_stall::note();  // yasai: a store is progress (yasai_stall.h)
   thread->m_last_effective_address = addr;
   thread->m_last_memory_space = global_space;
 }

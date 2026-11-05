@@ -29,6 +29,7 @@
 #include "memory.h"
 #include "host_window.h"
 #include "yasai_strict_addr.h"
+#include "yasai_stall.h"
 #include "ptx_ir.h"
 #include "ptx_sim.h"
 #include <stdlib.h>
@@ -47,6 +48,7 @@ memory_space_impl<BSIZE>::memory_space_impl(std::string name,
 
   m_log2_block_size = -1;
   m_host_window = (name == "global");
+  m_stall_track = m_host_window || name.compare(0, 7, "shared_") == 0;
   for (unsigned n = 0, mask = 1; mask != 0; mask <<= 1, n++) {
     if (BSIZE & mask) {
       assert(m_log2_block_size == (unsigned)-1);
@@ -92,6 +94,7 @@ mem_storage<BSIZE> *memory_space_impl<BSIZE>::try_get_block(mem_addr_t blk_idx) 
 template <unsigned BSIZE>
 void memory_space_impl<BSIZE>::write_only(mem_addr_t offset, mem_addr_t index,
                                           size_t length, const void *data) {
+  if (m_stall_track) yasai_stall::note_store();
   if (m_host_window) {
     const mem_addr_t addr = (index << m_log2_block_size) + offset;
     host_window::range_info r;
@@ -141,6 +144,7 @@ void memory_space_impl<BSIZE>::write(mem_addr_t addr, size_t length,
                                      const void *data,
                                      class ptx_thread_info *thread,
                                      const ptx_instruction *pI) {
+  if (m_stall_track) yasai_stall::note_store();
   if (m_host_window && yasai_watch_hit(addr, length)) {
     printf("yasai-watch: store 0x%llx len %zu bytes", (unsigned long long)addr, length);
     for (size_t i = 0; i < length && i < 16; i++)
@@ -283,6 +287,13 @@ void memory_space_impl<BSIZE>::read_single_block(mem_addr_t blk_idx,
 template <unsigned BSIZE>
 void memory_space_impl<BSIZE>::read(mem_addr_t addr, size_t length,
                                     void *data) const {
+  read_parts(addr, length, data);
+  // yasai: a load of the global or shared space while the group's read tracking is on.
+  if (yasai_stall::t_reads && m_stall_track) yasai_stall::note_load(addr, length, data);
+}
+
+template <unsigned BSIZE>
+void memory_space_impl<BSIZE>::read_parts(mem_addr_t addr, size_t length, void *data) const {
   if (m_host_window) {
     host_window::range_info r;
     std::vector<host_window::access_piece> parts;

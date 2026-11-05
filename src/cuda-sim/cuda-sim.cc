@@ -2953,6 +2953,9 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
     }
     ~ftz_scope() { t_ftz_inst = saved; }
   } ftz_ctx(pI);
+  // yasai: names the loads of this instruction while the group's read tracking is on.
+  if (yasai_stall::t_reads) yasai_stall::inst_begin(this, pc);
+
   set_npc(pc + pI->inst_size());
 
   try {
@@ -4001,7 +4004,7 @@ bool yasai_func_run::refill(group &g, unsigned pos) {
   gpgpu_context *gpgpu_ctx = m_sim->gpgpu_ctx;
   gpgpu_sim *gpu = gpgpu_ctx->the_gpgpusim->g_the_gpu;
   g.cores.clear();
-  g.rounds = 0;
+  g.stall.restart();
   if (m_csize <= 1) {
     while (!m_kernel.no_more_ctas_to_run()) {
       const unsigned id = m_kernel.get_next_cta_id_single();
@@ -4067,6 +4070,16 @@ bool yasai_func_run::refill(group &g, unsigned pos) {
 }
 
 void yasai_func_run::retire(group &g) {
+  if (yasai_stall::config().stats) {
+    yasai_stall::end_group(g.stall);
+    std::lock_guard<std::mutex> lk(m_stall_mu);
+    m_stall_max_quiet = std::max(m_stall_max_quiet, g.stall.max_quiet);
+    m_stall_max_quiet_s = std::max(m_stall_max_quiet_s, g.stall.max_quiet_s);
+    m_stall_max_silent = std::max(m_stall_max_silent, g.stall.max_silent);
+    m_stall_max_rounds = std::max(m_stall_max_rounds, g.stall.rounds);
+    g.stall.max_quiet = g.stall.max_silent = 0;
+    g.stall.max_quiet_s = 0;
+  }
   flash_gpgpu_sim::tcgen05_tmem_manager_t &tmem =
       m_sim->gpgpu_ctx->the_gpgpusim->g_the_gpu->get_tcgen05_tmem_manager();
   for (functionalCoreSim *core : g.cores) {
@@ -4101,8 +4114,9 @@ bool yasai_func_run::serial_only(const char **reason) {
   return false;
 }
 
-bool yasai_func_run::run_round(group &g) {
+bool yasai_func_run::run_round(group &g, bool sampled) {
   bool live = false;
+  const uint64_t events = yasai_stall::begin_round(g.stall);
   if (m_csize > 1) yasai_func::set_cluster(&g.state);
   for (unsigned r = 0; r < g.cores.size(); r++) {
     yasai_func::set_current_rank(r);
@@ -4110,32 +4124,42 @@ bool yasai_func_run::run_round(group &g) {
   }
   yasai_func::set_cluster(nullptr);
   yasai_func::set_current_rank(0);
+  if (live) {
+    g.verdict = yasai_stall::end_round(g.stall, events, sampled);
+  } else {
+    yasai_stall::t_reads = nullptr;
+    g.verdict = yasai_stall::verdict::none;
+  }
   return live;
 }
 
-void yasai_func_run::check_hang(const group &g, bool sampled) {
-  // The same switches as step(): YASAI_HANG_ROUNDS and YASAI_CTA_SAMPLE_HANG_ROUNDS.
-  static const unsigned long hang_rounds =
-      getenv("YASAI_HANG_ROUNDS") ? strtoul(getenv("YASAI_HANG_ROUNDS"), NULL, 10) : 0;
-  static const unsigned long sample_hang_rounds =
-      getenv("YASAI_CTA_SAMPLE_HANG_ROUNDS")
-          ? strtoul(getenv("YASAI_CTA_SAMPLE_HANG_ROUNDS"), NULL, 10)
-          : 20000000ul;
-  const bool hang = hang_rounds != 0 && g.rounds == hang_rounds;
-  const bool sample_hang = sampled && sample_hang_rounds != 0 && g.rounds == sample_hang_rounds;
-  if (!hang && !sample_hang) return;
+void yasai_func_run::check_hang(const group &g) {
+  if (g.verdict == yasai_stall::verdict::none) return;
+  const yasai_stall::settings &c = yasai_stall::config();
   static std::mutex dump_mu;  // one dump; the process stops after it
   std::lock_guard<std::mutex> lk(dump_mu);
-  if (hang) {
-    fprintf(stderr, "yasai: kernel %s: CTA group still live after %lu rounds\n", m_name.c_str(),
-            hang_rounds);
-  } else {
-    fprintf(stderr,
-            "yasai: sampled kernel appears to need all CTAs: %s (a CTA group is still live "
-            "after %lu rounds; name it in YASAI_CTA_SAMPLE_EXCLUDE_REGEX)\n",
-            m_name.c_str(), sample_hang_rounds);
-    printf("yasai: sampled kernel appears to need all CTAs: %s\n", m_name.c_str());
-    fflush(stdout);
+  switch (g.verdict) {
+    case yasai_stall::verdict::stall:
+      fprintf(stderr,
+              "yasai-stall: kernel %s: CTA group made no progress for %llu rounds and %.0f s "
+              "(YASAI_STALL_ROUNDS=%llu, YASAI_STALL_S=%g; %llu rounds since the CTA started)\n",
+              m_name.c_str(), (unsigned long long)g.stall.quiet,
+              yasai_stall::quiet_seconds(g.stall), (unsigned long long)c.stall_rounds, c.stall_s,
+              (unsigned long long)g.stall.rounds);
+      break;
+    case yasai_stall::verdict::sample_stall:
+      fprintf(stderr,
+              "yasai: sampled kernel appears to need all CTAs: %s (a CTA group made no progress "
+              "for %llu rounds; name it in YASAI_CTA_SAMPLE_EXCLUDE_REGEX)\n",
+              m_name.c_str(), (unsigned long long)c.sample_rounds);
+      printf("yasai: sampled kernel appears to need all CTAs: %s\n", m_name.c_str());
+      fflush(stdout);
+      break;
+    default:
+      fprintf(stderr,
+              "yasai: kernel %s: CTA group still live after %llu rounds (YASAI_GROUP_ROUNDS_MAX)\n",
+              m_name.c_str(), (unsigned long long)c.total_max);
+      break;
   }
   for (functionalCoreSim *core : g.cores) core->yasai_dump_warps(stderr);
   abort();
@@ -4166,10 +4190,9 @@ bool yasai_func_run::step_parallel() {
       group *g = m_groups[gi];
       if (g == nullptr) continue;
       for (unsigned r = 0; r < kParallelRounds;) {
-        if (run_round(*g)) {
+        if (run_round(*g, sampled)) {
           ++r;
-          ++g->rounds;
-          check_hang(*g, sampled);
+          check_hang(*g);
           continue;
         }
         retire(*g);
@@ -4205,19 +4228,13 @@ bool yasai_func_run::step() {
   if (m_par) return step_parallel();
   gpgpu_context *gpgpu_ctx = m_sim->gpgpu_ctx;
   yasai_func::scope_set(m_scope);
-  // yasai: YASAI_HANG_ROUNDS=<n> stops a CTA or cluster that is still live after n rounds and
-  // prints where each warp is (a spin on a barrier that never completes).
-  static const unsigned long hang_rounds =
-      getenv("YASAI_HANG_ROUNDS") ? strtoul(getenv("YASAI_HANG_ROUNDS"), NULL, 10) : 0;
-  // yasai: under CTA sampling the skipped CTAs never run, so a kernel whose CTAs wait for each
-  // other (cross-CTA flags, multi-CTA top-k, split-K semaphores) spins forever. A CTA group of a
-  // sampled kernel that is still live after YASAI_CTA_SAMPLE_HANG_ROUNDS rounds (default
-  // 20,000,000; 0 disables) stops the process with the kernel's name. The largest GEMM and
-  // attention CTAs of the coverage runs take a few hundred thousand rounds.
-  static const unsigned long sample_hang_rounds =
-      getenv("YASAI_CTA_SAMPLE_HANG_ROUNDS")
-          ? strtoul(getenv("YASAI_CTA_SAMPLE_HANG_ROUNDS"), NULL, 10)
-          : 20000000ul;
+  // yasai: a CTA group that makes no progress stops the process with the warps' positions
+  // (yasai_stall.h: YASAI_STALL_ROUNDS and YASAI_STALL_S). Under CTA sampling the skipped CTAs
+  // never run, so a kernel whose CTAs wait for each other (cross-CTA flags, multi-CTA top-k,
+  // split-K semaphores) spins forever; a sampled kernel's group without progress for
+  // YASAI_CTA_SAMPLE_HANG_ROUNDS rounds (default 20,000,000; 0 disables) stops the process with
+  // the kernel's name. YASAI_GROUP_ROUNDS_MAX caps the rounds of one CTA or cluster (off by
+  // default).
   // yasai: YASAI_FUNC_PROGRESS_S=<n> prints a progress line every n wall seconds (see the
   // class comment); unset or 0 prints nothing.
   static const int progress_s = yasai_env_int("YASAI_FUNC_PROGRESS_S", 0);
@@ -4227,33 +4244,9 @@ bool yasai_func_run::step() {
   for (unsigned gi = 0; gi < m_groups.size(); gi++) {
     group *&g = m_groups[gi];
     if (g == nullptr) continue;
-    bool live = false;
-    if (m_csize > 1) yasai_func::set_cluster(&g->state);
-    for (unsigned r = 0; r < g->cores.size(); r++) {
-      yasai_func::set_current_rank(r);
-      live = g->cores[r]->yasai_round() || live;
-    }
-    yasai_func::set_cluster(nullptr);
-    yasai_func::set_current_rank(0);
-    if (live) {
+    if (run_round(*g, sampled)) {
       any = true;
-      ++g->rounds;
-      if (hang_rounds != 0 && g->rounds == hang_rounds) {
-        fprintf(stderr, "yasai: kernel %s: CTA group still live after %lu rounds\n",
-                m_name.c_str(), hang_rounds);
-        for (functionalCoreSim *core : g->cores) core->yasai_dump_warps(stderr);
-        abort();
-      }
-      if (sampled && sample_hang_rounds != 0 && g->rounds == sample_hang_rounds) {
-        fprintf(stderr,
-                "yasai: sampled kernel appears to need all CTAs: %s (a CTA group is still live "
-                "after %lu rounds; name it in YASAI_CTA_SAMPLE_EXCLUDE_REGEX)\n",
-                m_name.c_str(), sample_hang_rounds);
-        printf("yasai: sampled kernel appears to need all CTAs: %s\n", m_name.c_str());
-        fflush(stdout);
-        for (functionalCoreSim *core : g->cores) core->yasai_dump_warps(stderr);
-        abort();
-      }
+      check_hang(*g);
       continue;
     }
     retire(*g);
@@ -4351,6 +4344,16 @@ void yasai_func_run::finish() {
   }
   yasai_func::kernel_end(m_name, m_grid, m_block);
   yasai_func::scope_set(nullptr);
+  if (yasai_stall::config().stats) {
+    std::lock_guard<std::mutex> lk(m_stall_mu);
+    fprintf(stderr,
+            "yasai-stall-stats: kernel %s ctas_done %lu max_quiet_rounds %llu max_quiet_s %.3f "
+            "max_silent_rounds %llu max_cta_rounds %llu track_rounds %llu\n",
+            m_name.c_str(), m_ctas_done, (unsigned long long)m_stall_max_quiet,
+            m_stall_max_quiet_s, (unsigned long long)m_stall_max_silent,
+            (unsigned long long)m_stall_max_rounds,
+            (unsigned long long)yasai_stall::config().track_rounds);
+  }
 
   //******PRINTING*******
   printf("GPGPU-Sim: Done functional simulation (%u instructions simulated).\n",
@@ -4450,13 +4453,18 @@ void functionalCoreSim::execute(int inst_count, unsigned ctaid_cp) {
   initializeCTA(ctaid_cp);
 
   int count = 0;
+  // yasai: the same stall judgement as the group rounds of yasai_func_run (yasai_stall.h); this
+  // path runs one CTA at a time and is never CTA-sampled.
+  yasai_stall::tracker stall;
   while (true) {
     bool someOneLive = false;
     bool allAtBarrier = true;
+    const uint64_t stall_events = yasai_stall::begin_round(stall);
     for (unsigned i = 0; i < m_warp_count; i++) {
       executeWarp(i, allAtBarrier, someOneLive);
       count++;
     }
+    yasai_stall::t_reads = nullptr;
 
     if (inst_count > 0 && count > inst_count &&
         (m_kernel->get_uid() == m_gpu->checkpoint_kernel) &&
@@ -4469,14 +4477,23 @@ void functionalCoreSim::execute(int inst_count, unsigned ctaid_cp) {
     yasai_release_cluster_waiters();
     if (allAtBarrier) {
       for (unsigned i = 0; i < m_warp_count; i++)
-        if (i >= m_yasai_wait_bar.size() || m_yasai_wait_bar[i] == -1)
+        if ((i >= m_yasai_wait_bar.size() || m_yasai_wait_bar[i] == -1) && m_warpAtBarrier[i]) {
           m_warpAtBarrier[i] = false;
+          yasai_stall::note();  // a released barrier is progress
+        }
     }
-    // yasai: YASAI_HANG_ROUNDS, as for clusters (cuda_sim::gpgpu_cuda_ptx_sim_main_func).
-    static const unsigned long hang_rounds =
-        getenv("YASAI_HANG_ROUNDS") ? strtoul(getenv("YASAI_HANG_ROUNDS"), NULL, 10) : 0;
-    if (hang_rounds != 0 && (unsigned long)(count / m_warp_count) == hang_rounds) {
-      fprintf(stderr, "yasai: CTA %u still live after %lu rounds\n", ctaid_cp, hang_rounds);
+    const yasai_stall::verdict v = yasai_stall::end_round(stall, stall_events, false);
+    if (v != yasai_stall::verdict::none) {
+      const yasai_stall::settings &c = yasai_stall::config();
+      if (v == yasai_stall::verdict::stall)
+        fprintf(stderr,
+                "yasai-stall: CTA %u made no progress for %llu rounds and %.0f s "
+                "(YASAI_STALL_ROUNDS=%llu, YASAI_STALL_S=%g)\n",
+                ctaid_cp, (unsigned long long)stall.quiet, yasai_stall::quiet_seconds(stall),
+                (unsigned long long)c.stall_rounds, c.stall_s);
+      else
+        fprintf(stderr, "yasai: CTA %u still live after %llu rounds (YASAI_GROUP_ROUNDS_MAX)\n",
+                ctaid_cp, (unsigned long long)c.total_max);
       yasai_dump_warps(stderr);
       abort();
     }
@@ -4564,7 +4581,10 @@ bool functionalCoreSim::yasai_round() {
   yasai_release_cluster_waiters();
   if (allAtBarrier) {
     for (unsigned i = 0; i < m_warp_count; i++)
-      if (i >= m_yasai_wait_bar.size() || m_yasai_wait_bar[i] == -1) m_warpAtBarrier[i] = false;
+      if ((i >= m_yasai_wait_bar.size() || m_yasai_wait_bar[i] == -1) && m_warpAtBarrier[i]) {
+        m_warpAtBarrier[i] = false;
+        yasai_stall::note();  // yasai: a released barrier is progress (yasai_stall.h)
+      }
   }
   return true;
 }
@@ -4643,6 +4663,7 @@ void functionalCoreSim::yasai_cluster_barrier(const warp_inst_t &inst, unsigned 
     if (c->barrier_arrived >= total) {
       c->barrier_arrived = 0;
       c->barrier_phase++;
+      yasai_stall::note();  // a completed barrier.cluster phase is progress
     }
   }
   if (arrive) return;
@@ -4660,6 +4681,7 @@ void functionalCoreSim::yasai_release_cluster_waiters() {
         c->barrier_phase > m_yasai_cbar_phase[w]) {
       m_yasai_wait_bar[w] = -1;
       m_warpAtBarrier[w] = false;
+      yasai_stall::note();  // a released warp is progress
     }
 }
 
@@ -4858,6 +4880,7 @@ void functionalCoreSim::yasai_barrier(const warp_inst_t &inst, unsigned w) {
   }
   if (arrived >= need) {
     arrived = 0;
+    yasai_stall::note();  // a completed named barrier is progress (yasai_stall.h)
     for (unsigned k = 0; k < m_warp_count; k++)
       if (m_yasai_wait_bar[k] == int(id)) {
         m_yasai_wait_bar[k] = -1;
