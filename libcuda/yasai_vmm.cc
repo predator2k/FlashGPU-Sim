@@ -24,6 +24,9 @@ gpgpu_context *GPGPU_Context();
 CUctx_st *GPGPUSim_Context(gpgpu_context *ctx);
 /// Waits for the queued kernels and copies before a mapping is removed (cuda_runtime_api.cc).
 void yasai_wait_before_unmap(const char *call, uint64_t lo, size_t bytes);
+/// Prints a warning when queued kernels or copies use a range that cuMemUnmap removes without
+/// waiting (cuda_runtime_api.cc).
+void yasai_warn_unmap_users(const char *call, uint64_t lo, size_t bytes);
 /// Simulated GPU of the current context (defined in cuda_runtime_api.cc).
 gpgpu_t *yasai_current_gpu();
 
@@ -349,7 +352,8 @@ int cuMemMap(unsigned long long ptr, size_t size, size_t offset, unsigned long l
 /// cuMemUnmap.
 int cuMemUnmap(unsigned long long ptr, size_t size) {
   yasai_lazy::observe(0, 0, ptr, size);  // yasai: pending kernels that use the range run first
-  yasai_wait_before_unmap("cuMemUnmap", ptr, size);  // yasai: and so do the queued copies and kernels
+  // yasai: no wait for queued copies and kernels, as on a GPU; a warning line when some use the range.
+  yasai_warn_unmap_users("cuMemUnmap", ptr, size);
   return shared_devmem::unmap(ptr, size) ? kSuccess : kInvalidValue;
 }
 

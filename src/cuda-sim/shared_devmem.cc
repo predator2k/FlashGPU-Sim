@@ -743,6 +743,12 @@ bool unmap(uint64_t va, size_t size) {
       ap = it->second.p;
   }
   if (ap) convert_phys(ap);
+  // yasai: cuMemUnmap does not wait for queued work (as on a GPU), so a copy or a simulation turn
+  // may be using the range right now; the quiesce lets it finish its current turn or copy and
+  // keeps new ones out while the range goes, so an access sees the mapping either whole or gone
+  // (yasai_strict_addr then reports it), never pages that change under it. It comes before
+  // st().mu (lock order).
+  quiesce q;
   devmem_lock lock;
   state &s = st();
   auto it = s.maps.find(va);

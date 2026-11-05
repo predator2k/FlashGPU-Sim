@@ -409,8 +409,9 @@ static stream_manager *yasai_stream_manager(gpgpu_context *ctx) {
 }
 
 // yasai: waits until the kernels and copies queued on every stream before the call have run,
-// before an API removes a mapping that they may still read or write: cudaIpcCloseMemHandle,
-// cuMemUnmap and cudaHostUnregister, as cudaFree and cudaFreeHost do. A queued copy or kernel
+// before an API removes a mapping that they may still read or write: cudaIpcCloseMemHandle and
+// cudaHostUnregister, as cudaFree and cudaFreeHost do (cuMemUnmap does not wait, see
+// yasai_warn_unmap_users). A queued copy or kernel
 // that ran after the removal found no registered range at the address and read the simulator's
 // empty storage, i.e. zeros (miles weight sync through CUDA IPC, 2026-11-04: SGLang queued the
 // copy_ of every parameter, PyTorch's IPC storage deleter closed the handle at once, and 17 of 18
@@ -435,6 +436,29 @@ void yasai_wait_before_unmap(const char *call, uint64_t lo, size_t bytes) {
               call, (unsigned long long)lo, bytes, copies + kernels, copies, kernels);
   }
   sm->yasai_wait_device();
+}
+
+// yasai: cuMemUnmap removes the mapping at the call without waiting for queued work. On an RTX
+// 5090 (sm_120, 2026-11-04, tests/ipc_d2d_close.cu case vmm_d2d_unmap) cuMemUnmap returns at once
+// and a D2D copy queued before it that reads the range fails at the next synchronize with
+// cudaErrorIllegalAddress (700); the simulator used to wait here, which was more lenient than the
+// GPU. The simulator's host runs far ahead of its device, so a program meets this race here much
+// more often than on a GPU: when queued operations use [lo, lo + bytes), one warning line names
+// the call, the range and their number (in every YASAI_STRICT_ADDR mode), and the access itself
+// then meets an unmapped range, which yasai_strict_addr reports as an illegal address.
+//   call: the API; lo, bytes: the range it removes
+void yasai_warn_unmap_users(const char *call, uint64_t lo, size_t bytes) {
+  gpgpu_context *ctx = GPGPU_Context();
+  stream_manager *sm = yasai_stream_manager(ctx);
+  if (sm->yasai_host_sync() || bytes == 0) return;
+  unsigned copies = 0, kernels = 0;
+  sm->yasai_count_users(lo, lo + bytes, &copies, &kernels);
+  if (copies + kernels)
+    fprintf(stderr,
+            "yasai-unmap-wait: warn: %s [0x%llx, +%zu) does not wait for %u queued operations that "
+            "use it (%u copies or memsets, %u kernels by parameter); on a GPU they fail with an "
+            "illegal address (700)\n",
+            call, (unsigned long long)lo, bytes, copies + kernels, copies, kernels);
 }
 
 // yasai: runtime functions defined further down that the driver forwards and their helpers
