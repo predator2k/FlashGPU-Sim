@@ -3081,9 +3081,9 @@ using flash_gpgpu_sim::wgmma_wait_group_impl;
       dim3 ctaid = get_ctaid();
       dim3 tid = get_tid();
       printf(
-          "%u [thd=%u][i=%u] : ctaid=(%u,%u,%u) tid=(%u,%u,%u) icount=%u "
+          "%llu [thd=%u][i=%u] : ctaid=(%u,%u,%u) tid=(%u,%u,%u) icount=%u "
           "[pc=%llu] (%s:%u - %s)  [0x%llx]\n",
-          m_gpu->gpgpu_ctx->func_sim->g_ptx_sim_num_insn, get_uid(), pI->uid(),
+          (unsigned long long)m_gpu->gpgpu_ctx->func_sim->g_ptx_sim_num_insn, get_uid(), pI->uid(),
           ctaid.x, ctaid.y, ctaid.z, tid.x, tid.y, tid.z, get_icount(), pc,
           pI->source_file(), pI->source_line(), pI->get_source(),
           m_last_set_operand_value.u64);
@@ -3208,9 +3208,9 @@ using flash_gpgpu_sim::wgmma_wait_group_impl;
       dim3 ctaid = get_ctaid();
       dim3 tid = get_tid();
       GPPRINTF(LIVENESS,
-              "GPGPU-Sim PTX: %u instructions simulated : ctaid=(%u,%u,%u) "
+              "GPGPU-Sim PTX: %llu instructions simulated : ctaid=(%u,%u,%u) "
               "tid=(%u,%u,%u)\n",
-              m_gpu->gpgpu_ctx->func_sim->g_ptx_sim_num_insn, ctaid.x, ctaid.y,
+              (unsigned long long)m_gpu->gpgpu_ctx->func_sim->g_ptx_sim_num_insn, ctaid.x, ctaid.y,
               ctaid.z, tid.x, tid.y, tid.z);
       fflush(stdout);
     }
@@ -4278,10 +4278,10 @@ void yasai_func_run::progress(int period_s) {
   if (now < m_progress_next_s) return;
   m_progress_next_s = now + period_s;
   // Instructions are the process-wide functional count since this kernel started, so they
-  // include kernels running concurrently with it (unsigned difference, as the counter wraps).
-  const unsigned insn = m_sim->g_ptx_sim_num_insn - m_insn_start;
+  // include kernels running concurrently with it.
+  const unsigned long long insn = m_sim->g_ptx_sim_num_insn - m_insn_start;
   printf("yasai: progress kernel %s: CTAs issued %lu done %lu skipped %lu of %lu, "
-         "instructions %u since start, %.0f s\n",
+         "instructions %llu since start, %.0f s\n",
          m_name.c_str(), m_ctas_issued, m_ctas_done, m_ctas_skipped, m_ctas_total, insn,
          now - m_start_s);
   fflush(stdout);
@@ -4356,8 +4356,8 @@ void yasai_func_run::finish() {
   }
 
   //******PRINTING*******
-  printf("GPGPU-Sim: Done functional simulation (%u instructions simulated).\n",
-         m_sim->g_ptx_sim_num_insn);
+  printf("GPGPU-Sim: Done functional simulation (%llu instructions simulated).\n",
+         (unsigned long long)m_sim->g_ptx_sim_num_insn);
   if (m_sim->gpgpu_ptx_instruction_classification) {
     StatDisp(m_sim->g_inst_classification_stat[m_sim->g_ptx_kernel_count]);
     StatDisp(m_sim->g_inst_op_classification_stat[m_sim->g_ptx_kernel_count]);
@@ -4384,8 +4384,8 @@ void yasai_func_run::finish() {
       "\n\ngpgpu_simulation_time = %u days, %u hrs, %u min, %u sec (%u sec)\n",
       (unsigned)days, (unsigned)hrs, (unsigned)minutes, (unsigned)sec,
       (unsigned)elapsed_time);
-  printf("gpgpu_simulation_rate = %u (inst/sec)\n",
-         (unsigned)(m_sim->g_ptx_sim_num_insn / elapsed_time));
+  printf("gpgpu_simulation_rate = %llu (inst/sec)\n",
+         (unsigned long long)(m_sim->g_ptx_sim_num_insn / elapsed_time));
   fflush(stdout);
 }
 
