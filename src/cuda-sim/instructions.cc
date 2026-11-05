@@ -2545,12 +2545,13 @@ void bfe_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   ptx_reg_t src = thread->get_operand_value(src1, dst, i_type, thread, 1);
   ptx_reg_t b = thread->get_operand_value(src2, dst, i_type, thread, 1);
   ptx_reg_t c = thread->get_operand_value(src3, dst, i_type, thread, 1);
-  // yasai: the PTX ISA's definition, which a GPU follows (value sweep, key_values.cu): pos and len are the
-  // low 8 bits of their operands, the field is cut at msb, and the bits above the field are the sign bit
-  // a[min(pos + len - 1, msb)] (0 for unsigned types and for len 0). The shifts by 32 - len and by pos were
-  // undefined for len 0 and for pos beyond msb.
-  const unsigned pos = b.u32 & 0xFF;
-  const unsigned len = c.u32 & 0xFF;
+  // yasai: the PTX ISA's definition, which a GPU follows for bfe.u32 and bfe.s32 (value sweep, key_values.cu): pos and len are the low 8 bits of their operands, the field is cut at msb, and the
+  // bits above the field are the sign bit a[min(pos + len - 1, msb)] (0 for unsigned types and for len 0). The shifts by 32 - len and by pos were undefined for len 0 and for pos beyond msb.
+  // A GPU's bfe.u64 takes all 32 bits of pos and len (0 of 4,096 cases differ under that rule), unlike the ISA's text, as bfi.b64 does. bfe.s64 has no measurement (the census holds none) and
+  // keeps the ISA's text.
+  const bool whole = i_type == U64_TYPE;
+  const unsigned pos = whole ? b.u32 : (b.u32 & 0xFF);
+  const unsigned len = whole ? c.u32 : (c.u32 & 0xFF);
   const unsigned long long x = is32 ? (unsigned long long)src.u32 : (unsigned long long)src.u64;
   const unsigned kept = pos > msb ? 0 : std::min(len, msb + 1 - pos);
   unsigned long long r = 0;
