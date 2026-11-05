@@ -346,6 +346,54 @@ static void yasai_write_arrive_state(const ptx_instruction *pI, ptx_thread_info 
   thread->set_operand_value(state_op, token, B64_TYPE, thread, pI);
 }
 
+unsigned yasai_mbar_window_addr(const ptx_instruction *pI, ptx_thread_info *thread,
+                                const operand_info &op) {
+  uint64_t v = thread->get_operand_value(op, op, B64_TYPE, thread, 0).u64;
+  if (op.is_memory_operand() && op.get_symbol()->is_reg()) {
+    const int t = op.get_symbol()->type()->get_key().scalar_type();
+    if (t == U32_TYPE || t == B32_TYPE || t == S32_TYPE) v &= 0xFFFFFFFFull;
+  }
+  const yasai_func::ClusterState *cl = yasai_func::cluster();
+  const uint64_t window = cl != nullptr ? (uint64_t(16) << 24) : SHARED_MEM_SIZE_MAX;
+  const unsigned smid = thread->get_hw_sid();
+  uint64_t a = 0;
+  bool ok = false;
+  if (v < window) {
+    a = v;
+    ok = true;
+  } else if (v >= SHARED_GENERIC_START && v < GLOBAL_HEAP_START && isspace_shared(smid, v)) {
+    a = generic_to_shared(smid, v);
+    ok = true;
+  }
+  if (ok && cl != nullptr) {
+    unsigned rank;
+    uint64_t off;
+    yasai_func::dsmem_decode(a, rank, off);
+    ok = rank < cl->size;
+  }
+  if (!ok) {
+    const dim3 ct = thread->get_ctaid(), tid = thread->get_tid();
+    const uint64_t lo = cl != nullptr ? SHARED_GENERIC_START
+                                      : SHARED_GENERIC_START + uint64_t(smid) * SHARED_MEM_SIZE_MAX;
+    const uint64_t hi = cl != nullptr ? SHARED_GENERIC_START + (uint64_t(cl->size) << 24)
+                                      : lo + SHARED_MEM_SIZE_MAX;
+    fprintf(stderr,
+            "yasai-strictaddr: mbarrier address 0x%llx in kernel %s, pc 0x%llx, cta (%u,%u,%u) "
+            "tid (%u,%u,%u): %s is neither a shared-window address (below 0x%llx) nor a generic "
+            "address of the shared window of this CTA%s [0x%llx, 0x%llx); it names no barrier; "
+            "aborting (in every YASAI_STRICT_ADDR mode)\n",
+            (unsigned long long)v, thread->get_kernel().name().c_str(),
+            (unsigned long long)pI->get_PC(), ct.x, ct.y, ct.z, tid.x, tid.y, tid.z,
+            pI->get_source(), (unsigned long long)window,
+            cl != nullptr ? " or of another CTA of its cluster" : "", (unsigned long long)lo,
+            (unsigned long long)hi);
+    fflush(stderr);
+    fflush(stdout);
+    abort();
+  }
+  return unsigned(a);
+}
+
 void handle_mbarrier_inst(const ptx_instruction *pIin,
                           ptx_thread_info *thread) {
   ptx_instruction *pI = const_cast<ptx_instruction *>(pIin);
@@ -363,28 +411,22 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
     return reg.u32;
   };
 
-  // Helper to check if membar_level indicates shared memory scope.
-  // .shared::cta is parsed as CTA_OPTION and sets membar_level.
-  // .shared (without ::cta) is parsed as SHARED_DIRECTIVE which sets
-  // Only support shared memory in the same CTA for now.
-  auto is_shared_level = [&](uint32_t *addr = nullptr) {
-    bool is_shared =
-        (pI->membar_level() == CTA_OPTION) || (pI->get_space() == shared_space);
-
-    if (is_shared && addr != nullptr) {
-      // Convert relative shared memory offset to absolute generic address
-      addr_t absolute_addr = shared_to_generic(thread->get_hw_sid(), *addr);
-      if (!isspace_shared(thread->get_hw_sid(), absolute_addr)) {
-        printf("GPGPU-Sim ERROR: mbarrier address 0x%x (absolute 0x%llx) is "
-               "not in SM %u's shared memory.\n"
-               "Distributed shared memory for mbarrier is not supported.\n",
-               *addr, (unsigned long long)absolute_addr, thread->get_hw_sid());
-        fflush(stdout);
-        abort();
-      }
-    }
-    return is_shared;
-  };
+  // yasai: the barrier's shared-window address, resolved once for both the functional state and
+  // the per-lane info below (yasai_mbar_window_addr: generic addresses of the forms without a
+  // state space are converted, any address outside the windows stops). This replaces a check of
+  // the modifiers (.cta or .shared): ".cta" is also the scope of try_wait and arrive, so a generic
+  // address with .cta passed it as an offset, and the generic init (no modifier) asserted.
+  //   arrive, arrive.expect_tx, try_wait/test_wait: [addr] is the second operand (src1);
+  //   init, expect_tx, complete_tx, inval: the first (dst).
+  uint32_t bar_addr = 0;
+  {
+    bool second = bar_op == TRY_WAIT_OPTION;
+    if (bar_op == ARRIVE_OPTION || bar_op == EXPECT_TX_OPTION)
+      second = parse_mbarrier_arrive_expect_tx_options(pI).first;
+    if (bar_op == INIT_OPTION || bar_op == TRY_WAIT_OPTION || bar_op == COMPLETE_TX_OPTION ||
+        bar_op == ARRIVE_OPTION || bar_op == EXPECT_TX_OPTION || bar_op == INVAL_OPTION)
+      bar_addr = yasai_mbar_window_addr(pI, thread, second ? pI->src1() : pI->dst());
+  }
 
   // Helper to set per-thread mbarrier info
   auto set_thread_mbarrier_info = [&](unsigned addr, unsigned count,
@@ -405,11 +447,10 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
   if (thread->isInFunctionalSimulationMode()) {
     const uint64_t cta_key = ctaid;
     if (bar_op == INIT_OPTION) {
-      yasai_func::mbar_init(cta_key, get_u32_value(pI->dst()),
-                            get_u32_value(pI->src1()));
+      yasai_func::mbar_init(cta_key, bar_addr, get_u32_value(pI->src1()));
     } else if (bar_op == TRY_WAIT_OPTION) {
       const bool done = yasai_func::mbar_phase_done(
-          cta_key, get_u32_value(pI->src1()), get_u32_value(pI->src2()) & 1u);
+          cta_key, bar_addr, get_u32_value(pI->src2()) & 1u);
       ptx_reg_t p;
       p.u64 = 0;
       p.pred =
@@ -425,35 +466,30 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
             pI->dst().get_symbol()->uid(), (unsigned)p.pred,
             (unsigned)thread->get_reg(pI->dst().get_symbol()).pred);
     } else if (bar_op == COMPLETE_TX_OPTION) {
-      yasai_func::mbar_complete_tx(cta_key, get_u32_value(pI->dst()),
-                                   get_u32_value(pI->src1()));
+      yasai_func::mbar_complete_tx(cta_key, bar_addr, get_u32_value(pI->src1()));
     } else if (bar_op == ARRIVE_OPTION || bar_op == EXPECT_TX_OPTION) {
       auto [is_arrive, is_expect_tx] =
           parse_mbarrier_arrive_expect_tx_options(pI);
       if (is_arrive && is_expect_tx) {
-        const uint32_t a = get_u32_value(pI->src1());
-        yasai_func::mbar_expect_tx(cta_key, a, get_u32_value(pI->src2()));
-        yasai_func::mbar_arrive(cta_key, a, 1);
+        yasai_func::mbar_expect_tx(cta_key, bar_addr, get_u32_value(pI->src2()));
+        yasai_func::mbar_arrive(cta_key, bar_addr, 1);
       } else if (is_arrive) {
         const uint32_t n =
             pI->get_num_operands() == 3 ? get_u32_value(pI->src2()) : 1;
-        yasai_func::mbar_arrive(cta_key, get_u32_value(pI->src1()), n);
+        yasai_func::mbar_arrive(cta_key, bar_addr, n);
       } else {
-        yasai_func::mbar_expect_tx(cta_key, get_u32_value(pI->dst()),
-                                   get_u32_value(pI->src1()));
+        yasai_func::mbar_expect_tx(cta_key, bar_addr, get_u32_value(pI->src1()));
       }
     } else if (bar_op == INVAL_OPTION) {
-      yasai_func::mbar_inval(cta_key, get_u32_value(pI->dst()));
+      yasai_func::mbar_inval(cta_key, bar_addr);
     }
   }
 
   if (bar_op == INIT_OPTION) {
     assert(pI->get_num_operands() == 2);
     // So weird, pI->dst() is always the first operand.
-    const operand_info &addr_op = pI->dst();
     const operand_info &expected_count_op = pI->src1();
-    auto addr = get_u32_value(addr_op);
-    assert(is_shared_level(&addr) && "Only support shared mbarrier");
+    auto addr = bar_addr;  // yasai: resolved above (generic addresses converted)
     auto expected_count = get_u32_value(expected_count_op);
     assert(expected_count > 0 && "expected count must be positive");
     GPPRINTF_GPU_CORE(
@@ -472,10 +508,8 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
            "mbarrier.try_wait expects predicate, address, parity, and optional "
            "suspendTimeHint");
 
-    const operand_info &addr_op = pI->src1();
     const operand_info &parity_op = pI->src2();
-    auto addr = get_u32_value(addr_op);
-    assert(is_shared_level(&addr) && "Only support shared mbarrier");
+    auto addr = bar_addr;  // yasai: resolved above (generic addresses converted)
     auto parity = get_u32_value(parity_op) & 1;
     const bool has_time_hint = pI->get_num_operands() == 4;
     const uint32_t time_hint_ns = has_time_hint ? get_u32_value(pI->src3()) : 0;
@@ -497,9 +531,8 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
   } else if (bar_op == COMPLETE_TX_OPTION) {
 
     assert(pI->get_num_operands() == 2);
-    const operand_info &addr_op = pI->dst();
     const operand_info &tx_count_op = pI->src1();
-    auto addr = get_u32_value(addr_op);
+    auto addr = bar_addr;  // yasai: resolved above (generic addresses converted)
     auto completed_tx_count = get_u32_value(tx_count_op);
     if (completed_tx_count == 0) {
       printf("GPGPU-Sim: mbarrier.complete_tx with completed_tx_count 0\n");
@@ -530,7 +563,7 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
       assert(pI->get_num_operands() == 3);
       yasai_write_arrive_state(pI, thread);
 
-      addr = get_u32_value(pI->src1());
+      addr = bar_addr;
       expected_tx_count = get_u32_value(pI->src2());
 
       GPPRINTF_GPU_CORE(
@@ -547,7 +580,7 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
       assert(pI->get_num_operands() == 3 || pI->get_num_operands() == 2);
       yasai_write_arrive_state(pI, thread);
 
-      addr = get_u32_value(pI->src1());
+      addr = bar_addr;
       if (pI->get_num_operands() == 3) {
         arrival_count = get_u32_value(pI->src2());
       }
@@ -568,7 +601,7 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
     } else if (is_expect_tx) {
       assert(pI->get_num_operands() == 2);
 
-      addr = get_u32_value(pI->dst());
+      addr = bar_addr;
       expected_tx_count = get_u32_value(pI->src1());
 
       GPPRINTF_GPU_CORE(
@@ -587,8 +620,7 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
   } else if (bar_op == INVAL_OPTION) {
 
     assert(pI->get_num_operands() == 1);
-    const operand_info &addr_op = pI->dst();
-    auto addr = get_u32_value(addr_op);
+    auto addr = bar_addr;  // yasai: resolved above (generic addresses converted)
     GPPRINTF_GPU_CORE(
         thread->get_gpu(), thread->get_hw_sid(), MBAR,
         "CTA %d Thread %d (lane %u) mbarrier inval at address 0x%x\n", ctaid,
