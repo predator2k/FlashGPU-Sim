@@ -128,6 +128,10 @@ class ptx_recognizer {
   void shared_window_space();
   // yasai: records the function's .reqnctapercluster shape.
   void req_ncta_per_cluster(int x, int y, int z);
+  // yasai: records the function's .reqntid shape, which a launch must match.
+  void req_ntid(int x, int y, int z);
+  // yasai: records the function's .maxclusterrank, which a launch's cluster must not exceed.
+  void max_cluster_rank(int n);
   // yasai: appends one label to the pending .branchtargets list.
   //   identifier: label name
   void add_branchtarget_label(const char *identifier);

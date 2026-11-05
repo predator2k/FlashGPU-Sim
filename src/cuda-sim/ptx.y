@@ -415,15 +415,16 @@ block_spec: MAXNTID_DIRECTIVE INT_OPERAND COMMA INT_OPERAND COMMA INT_OPERAND {r
 										recognizer->func_header_info_int(",", 1);
 										recognizer->maxnt_id($2, $4, 1);}
 	| MINNCTAPERSM_DIRECTIVE INT_OPERAND { recognizer->func_header_info_int(".minnctapersm", $2); printf("GPGPU-Sim PTX: Warning: .minnctapersm ignored. \n"); }
-	| MAXCLUSTERRANK_DIRECTIVE INT_OPERAND { /* yasai: cluster launch hint, ignored */ }
+	| MAXCLUSTERRANK_DIRECTIVE INT_OPERAND { /* yasai: checked at launch */ recognizer->max_cluster_rank($2); }
 	| MAXNNREG_DIRECTIVE INT_OPERAND { /* yasai: register cap per thread (Triton warp-specialized kernels); ptxas applies it to the register count, functional execution ignores it */ }
 	| REQNCTAPERCLUSTER_DIRECTIVE INT_OPERAND { /* yasai: compile-time cluster shape */ recognizer->req_ncta_per_cluster($2, 1, 1); }
 	| REQNCTAPERCLUSTER_DIRECTIVE INT_OPERAND COMMA INT_OPERAND { /* yasai */ recognizer->req_ncta_per_cluster($2, $4, 1); }
 	| REQNCTAPERCLUSTER_DIRECTIVE INT_OPERAND COMMA INT_OPERAND COMMA INT_OPERAND { /* yasai */ recognizer->req_ncta_per_cluster($2, $4, $6); }
 	| EXPLICITCLUSTER_DIRECTIVE { /* yasai */ }
 	| MAXNCTAPERSM_DIRECTIVE INT_OPERAND { recognizer->func_header_info_int(".maxnctapersm", $2); printf("GPGPU-Sim PTX: Warning: .maxnctapersm ignored. \n"); }
-	| REQNTID_DIRECTIVE INT_OPERAND { recognizer->func_header_info_int(".reqntid", $2); printf("GPGPU-Sim PTX: Warning: .reqntid ignored. \n"); }
-	| REQNTID_DIRECTIVE INT_OPERAND COMMA INT_OPERAND COMMA INT_OPERAND { recognizer->func_header_info_int(".reqntid", $2); printf("GPGPU-Sim PTX: Warning: .reqntid ignored. \n"); }
+	| REQNTID_DIRECTIVE INT_OPERAND { /* yasai: checked at launch */ recognizer->req_ntid($2, 1, 1); }
+	| REQNTID_DIRECTIVE INT_OPERAND COMMA INT_OPERAND { /* yasai */ recognizer->req_ntid($2, $4, 1); }
+	| REQNTID_DIRECTIVE INT_OPERAND COMMA INT_OPERAND COMMA INT_OPERAND { /* yasai */ recognizer->req_ntid($2, $4, $6); }
 	;
 
 block_spec_list: block_spec
