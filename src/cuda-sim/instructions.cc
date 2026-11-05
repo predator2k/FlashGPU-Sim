@@ -1641,6 +1641,8 @@ void add_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     }
     case F32_TYPE:
       data.f32 = src1_data.f32 + src2_data.f32;
+      // yasai: add.sat.f32 (value sweep, key_values.cu): clamped to [0, 1]; NaN and -0 give +0.
+      if (pI->saturation_mode()) data.f32 = data.f32 > 0.0f ? (data.f32 < 1.0f ? data.f32 : 1.0f) : 0.0f;
       GPPRINTF_INST_EXEC(PTX_INST_EXEC, "%.3f = %.3f + %.3f\n", data.f32, src1_data.f32,
                          src2_data.f32);
       break;
@@ -8570,6 +8572,7 @@ void sub_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     }
     case F32_TYPE:
       data.f32 = src1_data.f32 - src2_data.f32;
+      if (pI->saturation_mode()) data.f32 = data.f32 > 0.0f ? (data.f32 < 1.0f ? data.f32 : 1.0f) : 0.0f;  // yasai: as add.sat.f32
       break;
     case F64_TYPE:
     case FF64_TYPE:
