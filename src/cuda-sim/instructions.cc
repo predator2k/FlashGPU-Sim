@@ -402,7 +402,7 @@ static inline void fix(unsigned t, char op, const ptx_reg_t &a, const ptx_reg_t 
 static inline void fix_cvt(unsigned from, unsigned to, bool sat, const ptx_reg_t &src, ptx_reg_t &d) {
   const bool from_narrow = from == F32_TYPE || from == F16_TYPE;
   if (to == F32_TYPE && from_narrow && is_nan32(d.u32)) d.u32 = (sat && from == F32_TYPE) ? 0u : 0x7fffffffu;
-  else if (to == F16_TYPE && from_narrow && is_nan16(d.u16, false)) d.u16 = 0x7fffu;
+  else if (to == F16_TYPE && from_narrow && (is_nan16(d.u16, false) || (from == F32_TYPE && is_nan32(src.u32)))) d.u16 = 0x7fffu;  // an f32 NaN whose payload lies below f16's bits read as inf
   else if ((to == F64_TYPE || to == FF64_TYPE) && (from == F64_TYPE || from == FF64_TYPE) && is_nan64(d.u64))
     d.u64 = quiet64(src.u64);
 }
@@ -4586,6 +4586,8 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
         data, from_width, to_width, to_sign, rounding_mode, saturation_mode);
     // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
     yasai_nan::fix_cvt(from_type, to_type, saturation_mode != 0, data, result);
+    // yasai: cvt.ftz.f64.f32 of any NaN (value sweep, key_values.cu); cvt.f64.f32 without .ftz keeps the payload.
+    if ((to_type == F64_TYPE || to_type == FF64_TYPE) && from_type == F32_TYPE && pI->is_ftz() && std::isnan(data.f32)) result.u64 = 0x7fffffffe0000000ull;
     data = result;
   }
 
