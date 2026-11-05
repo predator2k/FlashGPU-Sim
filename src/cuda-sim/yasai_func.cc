@@ -616,7 +616,12 @@ uint16_t minifloat_encode_f16(float f) {
 
 unsigned minifloat_encode(MiniFloat f, float x, bool satfinite, bool toward_zero, bool round_up) {
   if (f == kUE8M0) {
-    if (std::isnan(x) || x <= 0.0f) return std::isnan(x) ? 0xFF : 0;
+    // yasai: the sign is ignored: an RTX 5090 and a GB10 give a negative input the code of its magnitude
+    // (tests/minifloat_probe.cu), and Transformer Engine's scales come from max.xorsign.abs, whose result may be negative.
+    if (std::isnan(x)) return 0xFF;
+    x = std::fabs(x);
+    if (x == 0.0f) return 0;
+    if (std::isinf(x)) return satfinite ? 0xFE : 0xFF;
     int e;
     const float m = std::frexp(x, &e);  // x = m * 2^e, m in [0.5, 1)
     int exp2 = e - 1;                    // x = (2m) * 2^(e-1), 2m in [1, 2)
