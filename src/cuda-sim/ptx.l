@@ -298,14 +298,14 @@ breakaddr  TC; BEGIN(NOT_OPCODE); yylval->int_value = BREAKADDR_OP; return OPCOD
 \.callprototype TC; return CALLPROTOTYPE_DIRECTIVE;
 \.calltargets TC; return CALLTARGETS_DIRECTIVE;
 \.const\[[0-9]+\] TC; yylval->int_value = atoi(yytext+7); return CONST_DIRECTIVE;
-\.const TC; yylval->int_value = 0; return CONST_DIRECTIVE;
+\.const TC; if (YY_START == INITIAL && recognizer->m_yasai_paren == 0) BEGIN(NOT_OPCODE); yylval->int_value = 0; return CONST_DIRECTIVE;
 \.entry TC; return ENTRY_DIRECTIVE;
 \.extern TC; return EXTERN_DIRECTIVE;
 \.file	 TC; BEGIN(INITIAL); return FILE_DIRECTIVE;
 \.func   TC; BEGIN(IN_FUNC_DECL); return FUNC_DIRECTIVE; // blocking opcode parsing in case the function has the same name as an opcode (e.g. sin(), cos())
-\.global TC; return GLOBAL_DIRECTIVE;
+\.global TC; if (YY_START == INITIAL && recognizer->m_yasai_paren == 0) BEGIN(NOT_OPCODE); return GLOBAL_DIRECTIVE;
 \.global.volatile TC; return GLOBAL_DIRECTIVE; //TODO: fix this!
-\.local  TC; return LOCAL_DIRECTIVE;
+\.local  TC; if (YY_START == INITIAL && recognizer->m_yasai_paren == 0) BEGIN(NOT_OPCODE); return LOCAL_DIRECTIVE;
 \.loc[ \t][^\n]*  TC; /* skip .loc debug directive */
 \.maxnctapersm TC; return MAXNCTAPERSM_DIRECTIVE;
 \.maxnreg TC; return MAXNNREG_DIRECTIVE;
@@ -315,16 +315,16 @@ breakaddr  TC; BEGIN(NOT_OPCODE); yylval->int_value = BREAKADDR_OP; return OPCOD
 \.maxclusterrank TC; return MAXCLUSTERRANK_DIRECTIVE; /* yasai: cluster launch hints, ignored */
 \.reqnctapercluster TC; return REQNCTAPERCLUSTER_DIRECTIVE; /* yasai */
 \.explicitcluster TC; return EXPLICITCLUSTER_DIRECTIVE; /* yasai */
-\.param  TC; return PARAM_DIRECTIVE;
+\.param  TC; if (YY_START == INITIAL && recognizer->m_yasai_paren == 0) BEGIN(NOT_OPCODE); return PARAM_DIRECTIVE;
 \.pragma TC; return PRAGMA_DIRECTIVE;
-\.reg    TC; if (YY_START == INITIAL) BEGIN(NOT_OPCODE); return REG_DIRECTIVE; /* yasai: a declared register may spell an opcode (.reg .b32 neg) */
+\.reg    TC; if (YY_START == INITIAL && recognizer->m_yasai_paren == 0) BEGIN(NOT_OPCODE); return REG_DIRECTIVE; /* yasai: a declared register may spell an opcode (.reg .b32 neg) */
 \.reqntid TC; return REQNTID_DIRECTIVE;
 \.section TC; return SECTION_DIRECTIVE;
 \.section[ \t]+\.debug_[a-z]+ TC; BEGIN(IN_DEBUG_SECTION); /* skip debug sections */
 \.debug_abbrev TC; return DEBUG_DIRECTIVE;
 \.debug_info TC; return DEBUG_DIRECTIVE;
 \.debug_line TC; return DEBUG_DIRECTIVE;
-\.shared  TC; return SHARED_DIRECTIVE;
+\.shared  TC; if (YY_START == INITIAL && recognizer->m_yasai_paren == 0) BEGIN(NOT_OPCODE); return SHARED_DIRECTIVE; /* yasai: as .reg, a declared name may spell an opcode (.shared .b64 bar); not inside parentheses (an entry's .param list with .ptr .shared) */
 \.sreg   TC; return SREG_DIRECTIVE;
 \.sstarr TC; return SSTARR_DIRECTIVE;
 \.struct TC; return STRUCT_DIRECTIVE;
@@ -715,8 +715,8 @@ breakaddr  TC; BEGIN(NOT_OPCODE); yylval->int_value = BREAKADDR_OP; return OPCOD
 "]"	TC; return RIGHT_SQUARE_BRACKET;
 "<"     TC; return LEFT_ANGLE_BRACKET;
 ">"	TC; return RIGHT_ANGLE_BRACKET;
-"("	TC; return LEFT_PAREN;
-")"	TC; return RIGHT_PAREN;
+"("	TC; recognizer->m_yasai_paren++; return LEFT_PAREN;
+")"	TC; if (recognizer->m_yasai_paren > 0) recognizer->m_yasai_paren--; return RIGHT_PAREN;
 ":"	TC; BEGIN(INITIAL); return COLON;
 ";"	TC; BEGIN(INITIAL); return SEMI_COLON;
 "!"	TC; return EXCLAMATION;

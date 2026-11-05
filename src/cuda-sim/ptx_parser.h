@@ -148,6 +148,9 @@ class ptx_recognizer {
     return s;
   }
   bool m_yasai_wmma_shared = false;  // yasai: see note_wmma_shared()
+  // yasai: parentheses open at this point of the lexer (the declaration directives switch the lexer to
+  // names only at depth 0, so an entry's parameter list with .ptr .shared keeps the body's first opcode).
+  int m_yasai_paren = 0;
   // yasai: marks the current instruction's packed small-float format (E4M3X2_TYPE and so on).
   void note_packed_minifloat(int kind);
   void start_function(int entry_point);
