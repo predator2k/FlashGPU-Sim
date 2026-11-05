@@ -309,6 +309,101 @@ static inline float packed_half_to_f32(uint16_t bits, bool bf16) {
   return bf16 ? f32_from_bf16_bits(bits) : f32_from_f16_bits(bits);
 }
 
+// ---- yasai: NaN results as an RTX 5090 writes them -------------------------------------------------
+// Measured with tests/nan_probe.cu (622 cases) and tests/absneg_probe.cu on an RTX 5090 (driver
+// 580.159.03); the rules per instruction class are in fakeenv's agll/nan_design.txt. Applied only on the
+// result path of the arithmetic instructions listed there (fix and fix_cvt are called by those
+// instructions), never in the generic register write, so mov, ld, st, selp, slct, the bit operations,
+// prmt, shfl and copysign keep a NaN's bits.
+//   * f32, f16, bf16 and each half or lane of f16x2, bf16x2, f32x2: a NaN result is the canonical NaN
+//     (0x7fffffff, 0x7fff), whatever the operands' payloads and signs; abs and neg too (ptxas compiles them
+//     as FADD with |x| or -x in every use the probe tried, so the GPU writes the canonical NaN).
+//   * f64: the result is a NaN operand, quieted, with its sign and payload; add, sub and mul take b over
+//     a, div takes a over b, fma takes b over c over a; a unary instruction (rcp.rn, sqrt, rsqrt, abs, neg,
+//     cvt.rni and the other integer roundings of f64) takes a, so abs.f64 and neg.f64 of a NaN keep its sign,
+//     unlike IEEE 754's abs and negate; an invalid operation without a NaN operand gives 0xfff8000000000000;
+//     rcp.approx.ftz.f64 of a NaN gives 0x7fffffff00000000.
+namespace yasai_nan {
+
+static inline bool is_nan32(uint32_t x) { return (x & 0x7f800000u) == 0x7f800000u && (x & 0x007fffffu) != 0; }
+static inline bool is_nan64(uint64_t x) {
+  return (x & 0x7ff0000000000000ull) == 0x7ff0000000000000ull && (x & 0x000fffffffffffffull) != 0;
+}
+static inline bool is_nan16(uint16_t x, bool bf16) {
+  return bf16 ? ((x & 0x7f80u) == 0x7f80u && (x & 0x007fu) != 0) : ((x & 0x7c00u) == 0x7c00u && (x & 0x03ffu) != 0);
+}
+static inline uint64_t quiet64(uint64_t x) { return x | 0x0008000000000000ull; }
+
+/// The f64 NaN result of op on the operands' bits a, b, c (op: '+' add, sub, mul; '/' div; 'f' fma;
+/// '1' one operand; 'r' rcp.approx.ftz).
+static inline uint64_t pick64(char op, uint64_t a, uint64_t b, uint64_t c) {
+  switch (op) {
+    case '+':
+      if (is_nan64(b)) return quiet64(b);
+      if (is_nan64(a)) return quiet64(a);
+      break;
+    case '/':
+      if (is_nan64(a)) return quiet64(a);
+      if (is_nan64(b)) return quiet64(b);
+      break;
+    case 'f':
+      if (is_nan64(b)) return quiet64(b);
+      if (is_nan64(c)) return quiet64(c);
+      if (is_nan64(a)) return quiet64(a);
+      break;
+    case 'r':
+      return 0x7fffffff00000000ull;
+    default:
+      if (is_nan64(a)) return quiet64(a);
+      break;
+  }
+  return 0xfff8000000000000ull;
+}
+
+/// Rewrites the result d of an arithmetic instruction of PTX type t when it is a NaN (see above).
+///   t: the instruction's type; op: as for pick64; a, b, c: the operands (unused ones any value)
+///   bf16: whether a 16-bit type is bf16 (F16X2_TYPE with .bf16x2, or BF16_TYPE)
+static inline void fix(unsigned t, char op, const ptx_reg_t &a, const ptx_reg_t &b, const ptx_reg_t &c,
+                       ptx_reg_t &d, bool bf16 = false) {
+  switch (t) {
+    case F32_TYPE:
+      if (is_nan32(d.u32)) d.u32 = 0x7fffffffu;
+      break;
+    case F64_TYPE:
+    case FF64_TYPE:
+      if (is_nan64(d.u64)) d.u64 = pick64(op, a.u64, b.u64, c.u64);
+      break;
+    case F32X2_TYPE:
+      for (int h = 0; h < 2; ++h)
+        if (is_nan32(uint32_t(d.u64 >> (32 * h))))
+          d.u64 = (d.u64 & ~(0xffffffffull << (32 * h))) | (0x7fffffffull << (32 * h));
+      break;
+    case F16_TYPE:
+    case BF16_TYPE:
+      if (is_nan16(d.u16, bf16 || t == BF16_TYPE)) d.u16 = 0x7fffu;
+      break;
+    case F16X2_TYPE:
+      for (int h = 0; h < 2; ++h)
+        if (is_nan16(uint16_t(d.u32 >> (16 * h)), bf16)) d.u32 = (d.u32 & ~(0xffffu << (16 * h))) | (0x7fffu << (16 * h));
+      break;
+    default:
+      break;
+  }
+}
+
+/// Rewrites the result d of cvt from type from (source bits src) to type to when it is a NaN: f32 or f16
+/// from f32 or f16 the canonical NaN, f64 from f64 the source quieted, a .sat f32 result from f32 +0;
+/// f32 to f64 and f64 to f32 keep the NaN's sign and payload as they are.
+static inline void fix_cvt(unsigned from, unsigned to, bool sat, const ptx_reg_t &src, ptx_reg_t &d) {
+  const bool from_narrow = from == F32_TYPE || from == F16_TYPE;
+  if (to == F32_TYPE && from_narrow && is_nan32(d.u32)) d.u32 = (sat && from == F32_TYPE) ? 0u : 0x7fffffffu;
+  else if (to == F16_TYPE && from_narrow && is_nan16(d.u16, false)) d.u16 = 0x7fffu;
+  else if ((to == F64_TYPE || to == FF64_TYPE) && (from == F64_TYPE || from == FF64_TYPE) && is_nan64(d.u64))
+    d.u64 = quiet64(src.u64);
+}
+
+}  // namespace yasai_nan
+
 void ptx_thread_info::set_reg(const symbol *reg, const ptx_reg_t &value) {
   assert(reg != NULL);
   if (reg->name() == "_") return;
@@ -1244,6 +1339,8 @@ void abs_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       break;
   }
 
+  // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+  yasai_nan::fix(i_type, '1', a, a, a, d);
   thread->set_operand_value(dst, d, i_type, thread, pI);
 }
 
@@ -1498,6 +1595,8 @@ void add_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   }
   fesetround(orig_rm);
 
+  // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+  yasai_nan::fix(i_type, '+', src1_data, src2_data, src2_data, data);
   thread->set_operand_value(dst, data, i_type, thread, pI, overflow, carry);
 }
 
@@ -1811,6 +1910,7 @@ void atom_callback(const inst_t *inst, ptx_thread_info *thread) {
           break;
         case F32_TYPE:
           op_result.f32 = data.f32 + src2_data.f32;
+          if (std::isnan(op_result.f32)) op_result.u32 = 0x7fffffffu;  // yasai: canonical NaN (yasai_nan)
           data_ready = true;
           break;
         default:
@@ -3157,6 +3257,8 @@ void cos_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       break;
   }
 
+  // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+  yasai_nan::fix(i_type, '1', a, a, a, d);
   thread->set_operand_value(dst, d, i_type, thread, pI);
 }
 
@@ -4028,6 +4130,9 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     // Pack two f16 values into one 32-bit register
     // Low 16 bits: second f16 (from src2)
     // High 16 bits: first f16 (from src1)
+    // yasai: a NaN half is the canonical NaN, as an RTX 5090 writes it (yasai_nan)
+    if (std::isnan(src2_data.f32)) f16_low = 0x7fff;
+    if (std::isnan(src1_data.f32)) f16_high = 0x7fff;
     ptx_reg_t result;
     result.u32 = (static_cast<uint32_t>(f16_high) << 16) | static_cast<uint32_t>(f16_low);
 
@@ -4078,8 +4183,10 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       for (int h = 0; h < 2; ++h) {
         float x = v[h];
         if (pI->is_relu() && !std::isnan(x) && x < 0.0f) x = 0.0f;
-        r |= (yasai_func::minifloat_encode(fmt, x, saturation_mode != 0, rz, rp) & mask)
-             << (width * h);
+        uint32_t code = yasai_func::minifloat_encode(fmt, x, saturation_mode != 0, rz, rp) & mask;
+        // yasai: e2m1 has no NaN; an RTX 5090 writes 0x7 (+6.0) for a NaN of either sign (yasai_nan)
+        if (fmt == yasai_func::kE2M1 && std::isnan(x)) code = 0x7u;
+        r |= code << (width * h);
       }
       out.u32 = r;
     }
@@ -4150,13 +4257,17 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     switch (to_type) {
       case BF16_TYPE:
         if ((fu & 0x7fffffffu) > 0x7f800000u)
-          out.u16 = uint16_t((fu >> 16) | 0x40u);  // quiet NaN
+          out.u16 = 0x7fffu;  // yasai: the canonical NaN, as an RTX 5090 writes it (yasai_nan)
         else
           out.u16 = uint16_t((fu + 0x7fffu + ((fu >> 16) & 1u)) >> 16);
         break;
-      case TF32_TYPE: out.u32 = (fu + 0xfffu + ((fu >> 13) & 1u)) & 0xffffe000u; break;
+      case TF32_TYPE:  // yasai: a NaN gives 0x7fffe000, as an RTX 5090 writes it (yasai_nan)
+        out.u32 = std::isnan(f) ? 0x7fffe000u : ((fu + 0xfffu + ((fu >> 13) & 1u)) & 0xffffe000u);
+        break;
       case F32_TYPE: out.f32 = f; break;
-      case F16_TYPE: out.u16 = half_float::detail::float2half<std::round_to_nearest>(f); break;
+      case F16_TYPE:  // yasai: a NaN gives the canonical NaN (yasai_nan)
+        out.u16 = std::isnan(f) ? 0x7fffu : half_float::detail::float2half<std::round_to_nearest>(f);
+        break;
       case F64_TYPE: case FF64_TYPE: out.f64 = double(f); break;
       case S32_TYPE: out.s32 = int32_t(nearbyintf(f)); break;
       case U32_TYPE: out.u32 = uint32_t(nearbyintf(f)); break;
@@ -4212,6 +4323,8 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   if (g_cvt_fn[src_fmt][dst_fmt] != NULL) {
     ptx_reg_t result = g_cvt_fn[src_fmt][dst_fmt](
         data, from_width, to_width, to_sign, rounding_mode, saturation_mode);
+    // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+    yasai_nan::fix_cvt(from_type, to_type, saturation_mode != 0, data, result);
     data = result;
   }
 
@@ -4369,6 +4482,8 @@ void div_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       assert(0);
       break;
   }
+  // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+  yasai_nan::fix(i_type, '/', src1_data, src2_data, src2_data, data);
   thread->set_operand_value(dst, data, i_type, thread, pI);
 }
 
@@ -4561,6 +4676,31 @@ void ex2_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
   unsigned i_type = pI->get_type();
 
+  // yasai: ex2.approx.f16, .f16x2, .ftz.bf16 and .ftz.bf16x2 (they reached the assert below): each half
+  // as 2^x rounded toward zero to the half format (an RTX 5090's results were never above the rounded-to-
+  // nearest value: tests/half_ops.cu); .ftz flushes subnormal inputs and results; a NaN gives 0x7fff
+  // (yasai_nan). The GPU's approximation may still differ in the last bit (a known gap, as for
+  // ex2.approx.f32).
+  if (i_type == F16_TYPE || i_type == BF16_TYPE || i_type == F16X2_TYPE) {
+    const bool scalar = i_type != F16X2_TYPE;
+    const bool bf16 = i_type == BF16_TYPE || pI->is_bf16x2();
+    const unsigned io = scalar ? B16_TYPE : B32_TYPE;
+    const uint32_t a = thread->get_operand_value(src1, dst, io, thread, 1).u32;
+    uint32_t r = 0;
+    for (int h = 0; h < (scalar ? 1 : 2); ++h) {
+      float x = packed_half_to_f32(uint16_t(a >> (16 * h)), bf16);
+      if (pI->is_ftz() && std::fpclassify(x) == FP_SUBNORMAL) x = std::copysign(0.0f, x);
+      uint16_t v = packed_half_from_f32(std::exp2(x), bf16, false, RZ_OPTION);
+      const uint16_t em = bf16 ? 0x7f80u : 0x7c00u;
+      if (pI->is_ftz() && (v & em) == 0) v &= 0x8000u;
+      r |= uint32_t(v) << (16 * h);
+    }
+    data.u64 = 0;
+    data.u32 = r;
+    thread->set_operand_value(dst, data, scalar ? B16_TYPE : F16X2_TYPE, thread, pI);
+    return;
+  }
+
   src1_data = thread->get_operand_value(src1, dst, i_type, thread, 1);
 
   switch (i_type) {
@@ -4573,6 +4713,8 @@ void ex2_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       break;
   }
 
+  // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+  yasai_nan::fix(i_type, '1', src1_data, src1_data, src1_data, data);
   thread->set_operand_value(dst, data, i_type, thread, pI);
 }
 
@@ -5182,6 +5324,8 @@ void lg2_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       break;
   }
 
+  // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+  yasai_nan::fix(i_type, '1', a, a, a, d);
   thread->set_operand_value(dst, d, i_type, thread, pI);
 }
 
@@ -5431,6 +5575,11 @@ static void yasai_fused_add(const ptx_instruction *pI, ptx_thread_info *thread, 
     case FF64_TYPE: {
       double c = thread->get_operand_value(other, dst, type, thread, 1).f64;
       d.f64 = yasai_fma::f64(neg_prod ? -a.f64 : a.f64, b.f64, neg_c ? -c : c, RN_OPTION, sat);
+      if (std::isnan(d.f64)) {  // yasai: the NaN operand as DFMA picks it (yasai_nan)
+        ptx_reg_t cr;
+        cr.f64 = c;
+        d.u64 = yasai_nan::pick64('f', a.u64, b.u64, cr.u64);
+      }
       break;
     }
     case F32X2_TYPE: {
@@ -5483,6 +5632,8 @@ static void yasai_fused_add(const ptx_instruction *pI, ptx_thread_info *thread, 
       return;
     }
   }
+  // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+  yasai_nan::fix(type, 'f', a, b, d, d);
   thread->set_operand_value(dst, d, type, thread, pI);
 }
 
@@ -5673,10 +5824,26 @@ void mad_def(const ptx_instruction *pI, ptx_thread_info *thread,
       d.u64 = ((uint64_t)rhi_b << 32) | (uint64_t)rlo_b;
       break;
     }
+    case BF16_TYPE: {
+      // yasai: scalar fma.rn{.relu}{.sat}.bf16 (it reached the assert below): the exact a * b + c folded
+      // to odd and rounded once to bf16, as fma.rn.bf16x2 does per half; a NaN gives 0x7fff.
+      assert(use_carry == false);
+      const float x = f32_from_bf16_bits(uint16_t(a.u32)), y = f32_from_bf16_bits(uint16_t(b.u32));
+      const float z = f32_from_bf16_bits(uint16_t(c.u32));
+      float v = yasai_fma::to_f32_odd(yasai_fma::fused_odd(x, y, z, RN_OPTION));
+      if (pI->saturation_mode()) v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+      ptx_reg_t r;
+      r.u64 = 0;
+      r.u16 = packed_half_from_f32(v, true, pI->is_relu(), RN_OPTION);
+      thread->set_operand_value(dst, r, B16_TYPE, thread, pI);
+      return;
+    }
     default:
       assert(0);
       break;
   }
+  // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+  yasai_nan::fix(i_type, 'f', a, b, c, d, pI->is_bf16x2());
   thread->set_operand_value(dst, d, i_type, thread, pI, overflow, carry);
 }
 
@@ -6288,6 +6455,8 @@ void mul_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       abort();
   }
 
+  // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+  yasai_nan::fix(i_type, '+', a, b, b, d);
   thread->set_operand_value(dst, d, i_type, thread, pI);
 }
 
@@ -6330,6 +6499,8 @@ void neg_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       break;
   }
 
+  // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+  yasai_nan::fix(to_type, '1', src1_data, src1_data, src1_data, data);
   thread->set_operand_value(dst, data, to_type, thread, pI);
 }
 
@@ -6614,6 +6785,8 @@ void rcp_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       break;
   }
 
+  // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+  yasai_nan::fix(i_type, pI->is_ftz() ? 'r' : '1', src1_data, src1_data, src1_data, data);
   thread->set_operand_value(dst, data, i_type, thread, pI);
 }
 
@@ -6714,6 +6887,8 @@ void rsqrt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       break;
   }
 
+  // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+  yasai_nan::fix(i_type, '1', a, a, a, d);
   thread->set_operand_value(dst, d, i_type, thread, pI);
 }
 
@@ -7594,6 +7769,8 @@ void sin_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       break;
   }
 
+  // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+  yasai_nan::fix(i_type, '1', a, a, a, d);
   thread->set_operand_value(dst, d, i_type, thread, pI);
 }
 
@@ -7615,6 +7792,8 @@ void tanh_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       break;
   }
 
+  // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+  yasai_nan::fix(i_type, '1', a, a, a, d);
   thread->set_operand_value(dst, d, i_type, thread, pI);
 }
 
@@ -7698,6 +7877,8 @@ void sqrt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       break;
   }
 
+  // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+  yasai_nan::fix(i_type, '1', a, a, a, d);
   thread->set_operand_value(dst, d, i_type, thread, pI);
 }
 
@@ -7937,6 +8118,8 @@ static bool yasai_mixed_f32_binop(const ptx_instruction *pI, ptx_thread_info *th
   ptx_reg_t d;
   d.u64 = 0;
   d.f32 = r;
+  // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+  yasai_nan::fix(F32_TYPE, '+', d, d, d, d);
   thread->set_operand_value(dst, d, F32_TYPE, thread, pI);
   return true;
 }
@@ -8035,6 +8218,8 @@ void sub_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       break;
   }
 
+  // yasai: NaN results as an RTX 5090 writes them (yasai_nan)
+  yasai_nan::fix(i_type, '+', src1_data, src2_data, src2_data, data);
   thread->set_operand_value(dst, data, i_type, thread, pI, overflow, carry);
 }
 
