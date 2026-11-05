@@ -2928,7 +2928,8 @@ int tensorcore_op(int inst_opcode) {
       (inst_opcode == WGMMA_MMA_ASYNC_SP_OP) ||
       (inst_opcode == WGMMA_FENCE_OP) ||
       (inst_opcode == WGMMA_COMMIT_GROUP_OP) ||
-      (inst_opcode == WGMMA_WAIT_GROUP_OP) || (inst_opcode == SETMAXNREG_OP))
+      (inst_opcode == WGMMA_WAIT_GROUP_OP) || (inst_opcode == SETMAXNREG_OP) ||
+      (inst_opcode == MOVMATRIX_OP))  // yasai: movmatrix_impl handles the whole warp
     return 1;
   else
     return 0;

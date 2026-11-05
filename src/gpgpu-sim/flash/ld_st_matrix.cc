@@ -34,11 +34,71 @@ static LdMatrixShapeSpec get_shape_spec(int matrix_shape) {
 }
 
 // Common implementation for ldmatrix and stmatrix
+// yasai: ldmatrix.sync.aligned.m8n16.{x1,x2,x4}.shared.b8x16.b4x16_p64 d, [a]. Every source row holds 16
+// 4-bit elements packed in 8 bytes (low nibble first) followed by 8 bytes of padding; the row of
+// matrix i is at the address in lane 8 * i + r. Each element is unpacked into the low nibble of a byte
+// (high nibble zero), and lane 4 * r + c receives bytes 4c to 4c + 3 of row r of every matrix, one
+// register per matrix. Measured on a GB10 (tests/gaps_m1.cu, cases ldm_b4x1/x2/x4). The .b6x16_p32
+// form and the m16n16 shapes are not implemented and stop.
+static bool yasai_ldmatrix_b4x16(const ptx_instruction *pI, core_t *core,
+                                 warp_inst_t &inst) {
+  bool b4 = false, b6 = false, m8n16 = false;
+  int num = 0;
+  for (auto option : pI->get_options()) {
+    if (option == B4X16_P64_OPTION) b4 = true;
+    else if (option == B6X16_P32_OPTION) b6 = true;
+    else if (option == M8N16_OPTION) m8n16 = true;
+    else if (option == X1_OPTION) num = 1;
+    else if (option == X2_OPTION) num = 2;
+    else if (option == X4_OPTION) num = 4;
+  }
+  if (!b4 && !b6 && !m8n16) return false;
+  if (b6 || !b4 || !m8n16 || num == 0 || pI->dst().get_vect_nelem() != (unsigned)num) {
+    fprintf(stderr, "yasai-ldmatrix: %s is not implemented (only m8n16.x1/x2/x4 .b8x16.b4x16_p64)\n",
+            pI->to_string().c_str());
+    fflush(stderr);
+    abort();
+  }
+  inst.space.set_type(shared_space);
+  const unsigned tid0 = (core->get_gpu()->is_functional_sim() ? inst.warp_id_func()
+                                                              : inst.warp_id()) *
+                        core->get_warp_size();
+  const operand_info &addr_op = pI->src1();
+  uint32_t row_addr[32];  // every lane's address first, so that d may name the address register
+  for (unsigned lane = 0; lane < 32; lane++) {
+    ptx_thread_info *t = core->get_thread_info()[tid0 + lane];
+    row_addr[lane] = t->get_operand_value(addr_op, addr_op, U32_TYPE, t, 0).u32;
+  }
+  ptx_reg_t regs[4][32];
+  for (unsigned lane = 0; lane < 32; lane++) {
+    ptx_thread_info *t = core->get_thread_info()[tid0 + lane];
+    const unsigned r = lane / 4, c = lane % 4;
+    for (int i = 0; i < num; i++) {
+      unsigned char packed[2];
+      t->m_shared_mem->read(row_addr[8 * i + r] + 2 * c, 2, reinterpret_cast<char *>(packed));
+      regs[i][lane].u64 = 0;
+      for (int k = 0; k < 4; k++) {
+        const unsigned nib = (packed[k / 2] >> (4 * (k % 2))) & 0xf;
+        regs[i][lane].u32 |= nib << (8 * k);
+      }
+    }
+  }
+  for (unsigned lane = 0; lane < 32; lane++) {
+    ptx_thread_info *t = core->get_thread_info()[tid0 + lane];
+    t->set_vector_operand_values(pI->dst(), regs[0][lane], regs[1][lane], regs[2][lane],
+                                 regs[3][lane]);
+  }
+  return true;
+}
+
 template <MatrixDirection Direction>
 static void handle_ld_st_matrix_inst_impl(const ptx_instruction *pI,
                                           core_t *core, warp_inst_t &inst) {
   constexpr bool is_load = (Direction == MatrixDirection::LOAD);
   const char *inst_name = is_load ? "ldmatrix" : "stmatrix";
+  if constexpr (is_load) {
+    if (yasai_ldmatrix_b4x16(pI, core, inst)) return;  // yasai
+  }
 
   // Matrix load/store encodes shared memory as an opcode modifier rather than
   // through the generic memory operand. Ensure the dynamic instruction enters
