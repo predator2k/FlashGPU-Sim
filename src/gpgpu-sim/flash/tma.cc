@@ -2483,6 +2483,11 @@ static void reduce_add_f32_mem(memory_space *src_mem, uint64_t src_addr,
   dst_mem->read(dst_addr, size_in_bytes, dst.data());
   for (size_t i = 0; i < dst.size(); ++i) {
     dst[i] += src[i];
+    // yasai: a NaN result is the canonical NaN (a GB10 and an RTX 5090, value sweep, ptx_key_values2.py).
+    if (std::isnan(dst[i])) {
+      const uint32_t canonical = 0x7fffffffu;
+      memcpy(&dst[i], &canonical, 4);
+    }
   }
   dst_mem->write(dst_addr, size_in_bytes, dst.data(), thread, pI);
 }
