@@ -6954,38 +6954,38 @@ int read_byte(int mode, int control, int d_sel_index, signed long long value) {
   int prmt_rc16_mode[4][4] = {
       {0, 1, 0, 1}, {2, 3, 2, 3}, {0, 1, 0, 1}, {2, 3, 2, 3}};
 
+  // yasai: a selector nibble names a byte of {b, a} (bits 2:0); with bit 3 the result byte repeats that byte's top bit
+  // (tests/prmt_probe.cu on a GB10). The tables of the named modes give the index of a byte, not its value.
+  const uint64_t bytes = static_cast<uint64_t>(value);
   if (!prmt_mode_present(mode)) {
-    if (control & 0x8) {
-      returnval = 0xff;
-    } else {
-      returnval = (value >> (8 * control)) & 0xff;
-    }
+    const int selected = int((bytes >> (8 * (control & 0x7))) & 0xff);
+    returnval = (control & 0x8) ? ((selected & 0x80) ? 0xff : 0) : selected;
   } else {
     switch (mode) {
       case PRMT_F4E_MODE:
-        returnval = prmt_f4e_mode[control][d_sel_index];
+        returnval = int((bytes >> (8 * prmt_f4e_mode[control][d_sel_index])) & 0xff);
         break;
       case PRMT_B4E_MODE:
-        returnval = prmt_b4e_mode[control][d_sel_index];
+        returnval = int((bytes >> (8 * prmt_b4e_mode[control][d_sel_index])) & 0xff);
         break;
       case PRMT_RC8_MODE:
-        returnval = prmt_rc8_mode[control][d_sel_index];
+        returnval = int((bytes >> (8 * prmt_rc8_mode[control][d_sel_index])) & 0xff);
         break;
       case PRMT_ECL_MODE:
-        returnval = prmt_ecl_mode[control][d_sel_index];
+        returnval = int((bytes >> (8 * prmt_ecl_mode[control][d_sel_index])) & 0xff);
         break;
       case PRMT_ECR_MODE:
-        returnval = prmt_ecr_mode[control][d_sel_index];
+        returnval = int((bytes >> (8 * prmt_ecr_mode[control][d_sel_index])) & 0xff);
         break;
       case PRMT_RC16_MODE:
-        returnval = prmt_rc16_mode[control][d_sel_index];
+        returnval = int((bytes >> (8 * prmt_rc16_mode[control][d_sel_index])) & 0xff);
         break;
         // Change the default from printing "ERROR" to just asserting
       default:
         assert(false);
     }
   }
-  return (returnval << 8 * d_sel_index);
+  return int(uint32_t(returnval) << (8 * d_sel_index));
 }
 
 void prmt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
@@ -7002,7 +7002,8 @@ void prmt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   src2_data = thread->get_operand_value(src2, dst, i_type, thread, 1);
   src3_data = thread->get_operand_value(src3, dst, i_type, thread, 1);
 
-  tmpdata.s64 = src1_data.s32 | (src2_data.s64 << 32);
+  // yasai: both operands as bytes of 64 bits; src1_data.s32 sign-extended into the bytes of b.
+  tmpdata.u64 = uint64_t(src1_data.u32) | (uint64_t(src2_data.u32) << 32);
   int ctl[4];
 
   if (!prmt_mode_present(mode)) {
