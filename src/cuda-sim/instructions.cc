@@ -3197,6 +3197,67 @@ void mma_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst) {
   }
 }
 
+// yasai: the signature of a function in bytes, as yasai_call_proto::text() writes a prototype.
+//   f: the function
+static std::string yasai_signature_text(const function_info *f) {
+  std::string t;
+  if (f->has_return()) t += "(" + std::to_string(f->get_return_var()->get_size_in_bytes()) + ") ";
+  t += "_ (";
+  for (unsigned i = 0; i < f->num_args(); i++) {
+    if (i) t += ", ";
+    t += std::to_string(f->get_arg(i)->get_size_in_bytes());
+  }
+  return t + ")";
+}
+
+// yasai: checks an indirect call (a register target) against the callee it reaches. On a GPU each
+// of these is undefined behavior; the simulator used to go on with wrong bytes or an empty body.
+//   * The callee has no body (only a declaration) and is not one of the functions the simulator
+//     implements itself (vprintf, __assertfail, the CDP runtime calls): the call would jump to an
+//     empty function.
+//   * The call names a .calltargets list that does not hold the callee.
+//   * The call names a .callprototype whose return and parameter sizes in bytes differ from the
+//     callee's (only sizes are compared: ".param .align 8 .b8 _[16]" matches a 16-byte parameter,
+//     .b64 matches .f64), so call_impl would copy the wrong bytes into the callee's parameters.
+// Each case prints one "yasai-icall:" line naming the call and the callee, then stops the process.
+//   pI: the call; f: the callee
+static void yasai_check_indirect_call(const ptx_instruction *pI, function_info *f) {
+  const std::string &name = f->get_name();
+  const bool builtin = name == "vprintf" || name == "__assertfail" ||
+                       name == "cudaGetParameterBufferV2" || name == "cudaLaunchDeviceV2" ||
+                       name == "cudaStreamCreateWithFlags";
+  if (f->get_function_size() == 0 && !builtin) {
+    printf("yasai-icall: indirect call at %s:%u reaches %s, which has no body\n", pI->source_file(),
+           pI->source_line(), name.c_str());
+    fflush(stdout);
+    abort();
+  }
+  if (const yasai_call_targets *tl = pI->yasai_targets()) {
+    bool listed = false;
+    for (const std::string &n : tl->funcs) listed = listed || n == name;
+    if (!listed) {
+      printf("yasai-icall: indirect call at %s:%u reaches %s, which .calltargets %s does not list\n",
+             pI->source_file(), pI->source_line(), name.c_str(), tl->name.c_str());
+      fflush(stdout);
+      abort();
+    }
+  }
+  if (const yasai_call_proto *p = pI->yasai_proto()) {
+    bool same = p->has_ret == f->has_return() && p->arg_bytes.size() == f->num_args();
+    if (same && p->has_ret) same = p->ret_bytes == f->get_return_var()->get_size_in_bytes();
+    for (unsigned i = 0; same && i < f->num_args(); i++)
+      same = p->arg_bytes[i] == f->get_arg(i)->get_size_in_bytes();
+    if (!same) {
+      printf("yasai-icall: indirect call at %s:%u through prototype %s %s reaches %s %s (sizes in "
+             "bytes differ)\n",
+             pI->source_file(), pI->source_line(), p->name.c_str(), p->text().c_str(), name.c_str(),
+             yasai_signature_text(f).c_str());
+      fflush(stdout);
+      abort();
+    }
+  }
+}
+
 void call_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   static std::atomic<unsigned> call_uid_next{1};  // yasai: calls on pool threads
 
@@ -3223,6 +3284,7 @@ void call_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   // through function tables).
   if (target_func->get_function_size() == 0 && yasai_func::g_lazy_load_name != nullptr)
     yasai_func::g_lazy_load_name(target_func->get_name().c_str());
+  if (!target.is_function_address()) yasai_check_indirect_call(pI, target_func);
   // yasai: "PDOM analysis already done" was printed for every executed call by every thread
   // (about 2e9 lines for __assertfail in one run, two 110 GB logs); it is printed only with
   // YASAI_PDOM_VERBOSE=1.

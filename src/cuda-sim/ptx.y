@@ -369,6 +369,8 @@ class ptx_recognizer;
 %type <int_value> function_decl_header
 %type <string_value> tex_component
 %type <ptr_value> function_decl
+%type <int_value> proto_type
+%type <int_value> proto_dim
 
 %{
   	#include "ptx_parser.h"
@@ -381,7 +383,14 @@ class ptx_recognizer;
 	int ptx_error( yyscan_t yyscanner, ptx_recognizer* recognizer, const char *s );
 %}
 
+%start module
+
 %%
+
+/* yasai: the target lists of indirect calls name functions that may be defined after them; they
+   are checked once the whole module is parsed. */
+module: input { recognizer->end_module(); }
+	;
 
 input:	/* empty */
 	| input directive_statement
@@ -461,8 +470,10 @@ ptr_align_spec: ALIGN_DIRECTIVE INT_OPERAND
 statement_block: LEFT_BRACE statement_list RIGHT_BRACE 
 
 statement_list: directive_statement { recognizer->add_directive(); }
-    | statement_list prototype_block {printf("Prototype statement detected. WARNING: this is not supported yet on GPGPU-SIM\n"); }
-    | prototype_block { /* yasai: a block that starts with a call prototype (NCCL's indirect calls) */ }
+    | callprototype_statement { /* yasai: prototype of indirect calls */ }
+    | statement_list callprototype_statement { /* yasai: prototype of indirect calls */ }
+    | calltargets_statement { /* yasai: target list of indirect calls */ }
+    | statement_list calltargets_statement { /* yasai: target list of indirect calls */ }
 	| instruction_statement { recognizer->add_instruction(); }
 	| branchtargets_statement { /* yasai: label list of brx.idx */ }
 	| statement_list branchtargets_statement { /* yasai: label list of brx.idx */ }
@@ -635,23 +646,59 @@ literal_list: literal_operand
 	| literal_list COMMA literal_operand
 	| literal_list COMMA IDENTIFIER { recognizer->add_function_address_literal($3); };
 
-// TODO: This is currently hardcoded to handle and ignore one specific case
-// that all prototype statements follow in the PTX from Pytorch. As a
-// workaround, this parses and ignores both the prototype declaration 
-// and calling of the prototype (which conveniently comes right after the 
-// declaration for all cases.) This should be changed to handle both 
-// declaring the prototype, and actually calling it.
-prototype_block: prototype_decl prototype_call
+/* yasai: "<name>: .callprototype [(<ret>)] _ [(<params>)];" (PTX ISA, call): the prototype of the
+   indirect calls of this function body that name it after their arguments. A parameter is
+   ".param [.align N] <type> _[[N]]" or ".reg <type> _"; only its size in bytes is kept. Before,
+   only "(.param .b32|.b64 _) _ (.param .b32|.b64 _)" parsed, and only a call without arguments
+   right after it became an instruction: the calls with arguments or a return value parsed with
+   no action and were dropped silently. */
+callprototype_statement: IDENTIFIER COLON CALLPROTOTYPE_DIRECTIVE { recognizer->start_callprototype($1); } proto_ret IDENTIFIER proto_args SEMI_COLON { recognizer->end_callprototype(); }
+	;
 
-prototype_decl: IDENTIFIER COLON CALLPROTOTYPE_DIRECTIVE LEFT_PAREN prototype_param RIGHT_PAREN IDENTIFIER LEFT_PAREN prototype_param RIGHT_PAREN SEMI_COLON 
-	      
-prototype_call: OPCODE LEFT_PAREN IDENTIFIER RIGHT_PAREN COMMA operand COMMA LEFT_PAREN IDENTIFIER RIGHT_PAREN COMMA IDENTIFIER SEMI_COLON
-	      | OPCODE IDENTIFIER COMMA LEFT_PAREN IDENTIFIER RIGHT_PAREN COMMA IDENTIFIER SEMI_COLON
-	      | OPCODE IDENTIFIER COMMA LEFT_PAREN RIGHT_PAREN COMMA IDENTIFIER SEMI_COLON { recognizer->add_indirect_call($1, $2); }
+/* nvcc writes "()_" for no return value. */
+proto_ret: /* empty */
+	| LEFT_PAREN RIGHT_PAREN
+	| LEFT_PAREN proto_param_list RIGHT_PAREN { recognizer->proto_params_are_return(); }
+	;
 
-prototype_param: /* empty */
-	       | PARAM_DIRECTIVE B64_TYPE IDENTIFIER
-	       | PARAM_DIRECTIVE B32_TYPE IDENTIFIER
+proto_args: /* empty */
+	| LEFT_PAREN RIGHT_PAREN
+	| LEFT_PAREN proto_param_list RIGHT_PAREN
+	;
+
+proto_param_list: proto_param
+	| proto_param_list COMMA proto_param
+	;
+
+proto_param: PARAM_DIRECTIVE proto_align proto_type IDENTIFIER proto_dim { recognizer->add_proto_param($3 * $5); }
+	| REG_DIRECTIVE proto_type IDENTIFIER { recognizer->add_proto_param($2); }
+	;
+
+proto_align: /* empty */
+	| ALIGN_DIRECTIVE INT_OPERAND
+	;
+
+proto_dim: /* empty */ { $$ = 1; }
+	| LEFT_SQUARE_BRACKET INT_OPERAND RIGHT_SQUARE_BRACKET { $$ = $2; }
+	;
+
+/* yasai: size in bytes of a parameter type of a .callprototype. */
+proto_type: B8_TYPE { $$ = 1; } | U8_TYPE { $$ = 1; } | S8_TYPE { $$ = 1; }
+	| B16_TYPE { $$ = 2; } | U16_TYPE { $$ = 2; } | S16_TYPE { $$ = 2; } | F16_TYPE { $$ = 2; } | BF16_TYPE { $$ = 2; }
+	| B32_TYPE { $$ = 4; } | U32_TYPE { $$ = 4; } | S32_TYPE { $$ = 4; } | F32_TYPE { $$ = 4; }
+	| F16X2_TYPE { $$ = 4; } | BF16X2_TYPE { $$ = 4; }
+	| B64_TYPE { $$ = 8; } | U64_TYPE { $$ = 8; } | S64_TYPE { $$ = 8; } | F64_TYPE { $$ = 8; }
+	| BB128_TYPE { $$ = 16; }
+	;
+
+/* yasai: "<name>: .calltargets f1, f2, ...;" lists the functions an indirect call that names it
+   may reach. */
+calltargets_statement: IDENTIFIER COLON CALLTARGETS_DIRECTIVE calltarget_list SEMI_COLON { recognizer->add_calltargets($1); }
+	;
+
+calltarget_list: IDENTIFIER { recognizer->add_calltarget_func($1); }
+	| calltarget_list COMMA IDENTIFIER { recognizer->add_calltarget_func($3); }
+	;
 
 /* yasai: "<tlist>: .branchtargets <label>, <label>, ...;" declares the target list of brx.idx. */
 branchtargets_statement: IDENTIFIER COLON BRANCHTARGETS_DIRECTIVE branchtarget_list SEMI_COLON { recognizer->add_branchtargets($1); }
@@ -665,11 +712,16 @@ instruction_statement:  instruction SEMI_COLON
 	| IDENTIFIER COLON { recognizer->add_label($1); }
 	| pred_spec instruction SEMI_COLON;
 
-instruction: opcode_spec LEFT_PAREN operand RIGHT_PAREN { recognizer->set_return(); } COMMA operand COMMA call_arg_list
-	| opcode_spec operand COMMA LEFT_PAREN operand_list RIGHT_PAREN
-	| opcode_spec operand COMMA LEFT_PAREN RIGHT_PAREN
+instruction: opcode_spec LEFT_PAREN operand RIGHT_PAREN { recognizer->set_return(); } COMMA operand COMMA call_arg_list call_tail
+	| opcode_spec operand COMMA LEFT_PAREN operand_list RIGHT_PAREN call_tail
+	| opcode_spec operand COMMA LEFT_PAREN RIGHT_PAREN call_tail
 	| opcode_spec operand_list 
 	| opcode_spec
+	;
+
+/* yasai: an indirect call names its .callprototype or .calltargets after the arguments. */
+call_tail: /* empty */
+	| COMMA IDENTIFIER { recognizer->set_call_tail($2); }
 	;
 
 /* yasai: the arguments of a call with a return value; nvcc writes "call (retval0), f, ();" (the

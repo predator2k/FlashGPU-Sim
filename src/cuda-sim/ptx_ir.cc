@@ -1360,6 +1360,18 @@ arg_buffer_t copy_arg_to_buffer(ptx_thread_info *thread,
   }
 }
 
+// yasai: see ptx_ir.h.
+std::string yasai_call_proto::text() const {
+  std::string t;
+  if (has_ret) t += "(" + std::to_string(ret_bytes) + ") ";
+  t += "_ (";
+  for (size_t i = 0; i < arg_bytes.size(); i++) {
+    if (i) t += ", ";
+    t += std::to_string(arg_bytes[i]);
+  }
+  return t + ")";
+}
+
 void copy_args_into_buffer_list(const ptx_instruction *pI,
                                 ptx_thread_info *thread,
                                 const function_info *target_func,
