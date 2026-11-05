@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include "../gpgpu-sim/flash/mma/yasai_mma_dot.h"
 #include "instructions.h"
 #include "yasai_func.h"
 #include "yasai_stall.h"
@@ -2960,10 +2961,10 @@ static void yasai_wmma_bf16_mma(const ptx_instruction *pI, core_t *core, warp_in
     for (int k = 0; k < 8; k++) {
       int row, col, offset;
       mapping(lane, LOAD_C, ROW, F32_TYPE, k, 16, row, col, offset);
-      float sum = 0.0f;
-      for (int kk = 0; kk < 16; kk++) sum += A[row][kk] * B[kk][col];
       dv[offset].u64 = 0;
-      dv[offset].f32 = sum + C[row][col];
+      // yasai: the GPUs' accumulation (gpgpu-sim/flash/mma/yasai_mma_dot.h), as mma.sync.
+      dv[offset].f32 = yasai_mma::dot(
+          16, [&](int kk) { return double(A[row][kk]); }, [&](int kk) { return double(B[kk][col]); }, C[row][col], -126, -126);
     }
     thread->set_wmma_vector_operand_values(pI->dst(), dv[0], dv[1], dv[2], dv[3], dv[4], dv[5], dv[6], dv[7]);
   }

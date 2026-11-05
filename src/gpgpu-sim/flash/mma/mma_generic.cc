@@ -19,6 +19,7 @@
 
 #include "../../../cuda-sim/yasai_func.h"
 #include "tensor_mma.h"
+#include "yasai_mma_dot.h"
 
 #include <cmath>
 #include <cstdint>
@@ -128,6 +129,19 @@ void read_regs(ptx_thread_info *t, const operand_info &op, ptx_reg_t *out,
 // accumulator type and writes the D fragments back.
 //   pI   the mma instruction; M, N, K its shape; tid the first thread of the
 //   warp.
+// yasai: smallest normal exponent of an mma operand format, for yasai_mma_dot.h. @param t PTX type. @return The exponent.
+static int yasai_minifloat_min_exp(unsigned t) {
+  switch (t) {
+    case F16_TYPE: return -14;
+    case E5M2_TYPE: return -14;
+    case E4M3_TYPE: return -6;
+    case E3M2_TYPE: return -2;
+    case E2M3_TYPE: return 0;
+    case E2M1_TYPE: return 0;
+    default: return -126;
+  }
+}
+
 void tensor_mma_generic_impl(const ptx_instruction *pI, core_t *core,
                              warp_inst_t inst, int M, int N, int K,
                              unsigned tid) {
@@ -308,6 +322,13 @@ void tensor_mma_generic_impl(const ptx_instruction *pI, core_t *core,
         d.s32 = int32_t(uint32_t(uint64_t(acc)));
         continue;
       }
+      // yasai: without block scales an f32 accumulator takes the GPUs' accumulation (yasai_mma_dot.h). A NaN result is canonical in every format (value sweep, ptx_key_values2.py).
+      if (!block_scale && dtype != F64_TYPE && !c_f16) {
+        const int min_exp = yasai_minifloat_min_exp(atype);
+        d.f32 = yasai_mma::dot(
+            K, [&](int k) { return A[m * K + k]; }, [&](int k) { return B[k * N + n]; }, float(C[m * N + n]), min_exp, yasai_minifloat_min_exp(btype));
+        continue;
+      }
       double acc = C[m * N + n];
       for (int k = 0; k < K; k++)
         acc += A[m * K + k] * B[k * N + n] * SA[m * sv + k / kblk] *
@@ -315,9 +336,9 @@ void tensor_mma_generic_impl(const ptx_instruction *pI, core_t *core,
       if (dtype == F64_TYPE)
         d.f64 = acc;
       else if (c_f16)
-        d.u32 = yasai_func::minifloat_encode_f16(float(acc));
+        d.u32 = std::isnan(acc) ? 0x7fffu : yasai_func::minifloat_encode_f16(float(acc));
       else
-        d.f32 = float(acc);
+        d.f32 = std::isnan(acc) ? yasai_mma::canonical_nan() : float(acc);
     }
   }
   for (unsigned lane = 0; lane < 32; lane++) {

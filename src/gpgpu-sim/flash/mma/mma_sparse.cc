@@ -279,7 +279,9 @@ void tensor_mma_sp_impl(const ptx_instruction *pI, core_t *core, warp_inst_t ins
       double acc = C[m * N + n];
       for (int k = 0; k < K; k++)
         acc += A[m * K + k] * B[k * N + n] * SA[m * sv + k / kblk] * SB[(k / kblk) * N + n];
-      if (c_f16) d.u32 = yasai_func::minifloat_encode_f16(float(acc));
+      // yasai: a NaN result is canonical (value sweep, ptx_key_values2.py).
+      if (c_f16) d.u32 = std::isnan(acc) ? 0x7fffu : yasai_func::minifloat_encode_f16(float(acc));
+      else if (std::isnan(acc)) d.u32 = 0x7fffffffu;
       else d.f32 = float(acc);
     }
   }
