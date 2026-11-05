@@ -5561,7 +5561,8 @@ static void yasai_fused_add(const ptx_instruction *pI, ptx_thread_info *thread, 
   const bool neg_prod = pI->yasai_fuse_neg() != (is_sub && pos == 2);
   const bool neg_c = is_sub && pos == 1;
   const bool sat = pI->saturation_mode();
-  const ptx_reg_t a = thread->get_reg(pI->yasai_fuse_a()), b = thread->get_reg(pI->yasai_fuse_b());
+  const ptx_reg_t a = thread->yasai_fma_saved(pI->yasai_fuse_slot(), 0),
+                  b = thread->yasai_fma_saved(pI->yasai_fuse_slot(), 1);
   ptx_reg_t d;
   d.u64 = 0;
   switch (type) {
@@ -6302,6 +6303,15 @@ void mul24_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 }
 
 void mul_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  // yasai: a contracted mul keeps its source values, read as the instruction's type, for the add
+  // that fuses its product (yasai_contract.h). The packed path reads its sources as bits, so they
+  // are read here once more as the type.
+  const int save_slot = pI->yasai_save_slot();
+  if (save_slot >= 0 && (pI->get_type() == F16X2_TYPE || pI->get_type() == BF16_TYPE)) {
+    const ptx_reg_t sa = thread->get_operand_value(pI->src1(), pI->dst(), pI->get_type(), thread, 1);
+    const ptx_reg_t sb = thread->get_operand_value(pI->src2(), pI->dst(), pI->get_type(), thread, 1);
+    thread->yasai_fma_save(save_slot, sa, sb);
+  }
   if (yasai_packed_binop(pI, thread, '*')) return;  // yasai
   ptx_reg_t data;
 
@@ -6313,6 +6323,7 @@ void mul_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   unsigned i_type = pI->get_type();
   ptx_reg_t a = thread->get_operand_value(src1, dst, i_type, thread, 1);
   ptx_reg_t b = thread->get_operand_value(src2, dst, i_type, thread, 1);
+  if (save_slot >= 0) thread->yasai_fma_save(save_slot, a, b);  // yasai: see above
 
   unsigned rounding_mode = pI->rounding_mode();
 

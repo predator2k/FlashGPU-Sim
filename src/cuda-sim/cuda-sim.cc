@@ -80,6 +80,7 @@ typedef void *yyscan_t;
 #include "ptx_sim.h"
 
 #include "dyn_ptx_inst.h"
+#include "yasai_contract.h"
 #include "yasai_func.h"
 #include "yasai_lazy.h"
 
@@ -707,6 +708,9 @@ void function_info::ptx_assemble() {
 
   recognize_dynamic_shared_mem();
   flash_gpgpu_sim::run_ptx_reorder(this);
+  // yasai: save slots of the contracted (mul, add) pairs in the final instruction order
+  // (yasai_contract.h).
+  yasai_contract::assign_slots(m_instructions, m_name.c_str());
 
   fflush(stdout);
   std::list<ptx_instruction *>::iterator i;
@@ -2946,12 +2950,6 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
     }
     ~ftz_scope() { t_ftz_inst = saved; }
   } ftz_ctx(pI);
-  // yasai: a contracted mul keeps its source values for the add that fuses it (yasai_contract.h).
-  if (pI->yasai_save_a() != nullptr) {
-    set_reg(pI->yasai_save_a(), get_operand_value(pI->src1(), pI->dst(), pI->get_type(), this, 1));
-    set_reg(pI->yasai_save_b(), get_operand_value(pI->src2(), pI->dst(), pI->get_type(), this, 1));
-  }
-
   set_npc(pc + pI->inst_size());
 
   try {

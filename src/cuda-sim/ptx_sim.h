@@ -437,6 +437,21 @@ class ptx_thread_info {
   void print_reg_thread(char *fname);
   void resume_reg_thread(char *fname, symbol_table *symtab);
   ptx_reg_t get_reg(const symbol *reg);
+  // yasai: the source values of a contracted mul (yasai_contract.h), kept in save slot slot until
+  // the add or sub that fuses the product reads them. The slots are per thread rather than per call
+  // frame: a mul and the adds that fuse it are in one basic block, so no slot is live across a call.
+  void yasai_fma_save(int slot, const ptx_reg_t &a, const ptx_reg_t &b) {
+    const size_t i = 2 * size_t(slot);
+    if (i + 1 >= m_yasai_fma_save.size()) m_yasai_fma_save.resize(i + 2);
+    m_yasai_fma_save[i] = a;
+    m_yasai_fma_save[i + 1] = b;
+  }
+  // yasai: source k (0 for a, 1 for b) of the mul saved in slot slot; a zero value when this thread
+  // never saved into the slot (as a register read before its first write).
+  ptx_reg_t yasai_fma_saved(int slot, int k) const {
+    const size_t i = 2 * size_t(slot) + k;
+    return i < m_yasai_fma_save.size() ? m_yasai_fma_save[i] : ptx_reg_t();
+  }
   ptx_reg_t get_operand_value(const operand_info &op, operand_info dstInfo,
                               unsigned opType, ptx_thread_info *thread,
                               int derefFlag);
@@ -629,6 +644,8 @@ class ptx_thread_info {
   std::vector<yasai_cp_async_copy> m_cp_async_open;  ///< issued since the last commit_group
   std::list<std::vector<yasai_cp_async_copy>>
       m_cp_async_committed;  ///< committed groups, oldest first
+  // yasai: save slots of contracted muls, two values per slot (yasai_fma_save).
+  std::vector<ptx_reg_t> m_yasai_fma_save;
 
  private:
   bool m_functionalSimulationMode;

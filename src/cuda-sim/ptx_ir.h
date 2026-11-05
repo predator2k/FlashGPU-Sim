@@ -1338,26 +1338,27 @@ class ptx_instruction : public warp_inst_t {
   // yasai: the instruction names a rounding modifier (.rn, .rz, .rm, .rp or an integer form);
   // rounding_mode() answers RN for both an absent modifier and .rn.
   bool has_rounding_modifier() const { return m_yasai_rnd_explicit; }
-  // yasai: contraction of a mul and an add (yasai_contract.h). A contracted mul writes its two
-  // source values into the hidden registers yasai_save_a/b before it executes; a contracted add or
-  // sub takes the product at source position yasai_fuse_src (1 or 2; 0: none), negated when
-  // yasai_fuse_neg (a neg between), from yasai_fuse_a/b.
-  const symbol *yasai_save_a() const { return m_yasai_save_a; }
-  const symbol *yasai_save_b() const { return m_yasai_save_b; }
-  void yasai_set_save(const symbol *a, const symbol *b) {
-    m_yasai_save_a = a;
-    m_yasai_save_b = b;
-  }
+  // yasai: contraction of a mul and an add (yasai_contract.h). The analysis of the parsed function
+  // gives each contracted mul a pair id (yasai_save_id) and each add or sub that fuses its product
+  // the same id (yasai_fuse_id), the product's source position yasai_fuse_src (1 or 2; 0: none) and
+  // yasai_fuse_neg (a neg between). After the function's final instruction order is known
+  // (ptx_assemble), each pair gets a save slot: the mul writes its two source values into the
+  // thread's slot yasai_save_slot as it reads them, and the add reads them from slot
+  // yasai_fuse_slot. -1: none.
+  int yasai_save_id() const { return m_yasai_save_id; }
+  int yasai_save_slot() const { return m_yasai_save_slot; }
+  void yasai_set_save_id(int id) { m_yasai_save_id = id; }
+  void yasai_set_save_slot(int slot) { m_yasai_save_slot = slot; }
   int yasai_fuse_src() const { return m_yasai_fuse_src; }
   bool yasai_fuse_neg() const { return m_yasai_fuse_neg; }
-  const symbol *yasai_fuse_a() const { return m_yasai_fuse_a; }
-  const symbol *yasai_fuse_b() const { return m_yasai_fuse_b; }
-  void yasai_set_fuse(int src, bool neg, const symbol *a, const symbol *b) {
+  int yasai_fuse_id() const { return m_yasai_fuse_id; }
+  int yasai_fuse_slot() const { return m_yasai_fuse_slot; }
+  void yasai_set_fuse(int src, bool neg, int id) {
     m_yasai_fuse_src = src;
     m_yasai_fuse_neg = neg;
-    m_yasai_fuse_a = a;
-    m_yasai_fuse_b = b;
+    m_yasai_fuse_id = id;
   }
+  void yasai_set_fuse_slot(int slot) { m_yasai_fuse_slot = slot; }
   // yasai: barrier.cluster.arrive / barrier.cluster.wait (bar_type ARRIVE / SYNC).
   bool is_cluster_barrier() const { return m_opcode == BAR_OP && m_yasai_cluster_scope; }
   // yasai: the instruction carries .cluster or .shared::cluster.
@@ -1488,12 +1489,12 @@ class ptx_instruction : public warp_inst_t {
   bool m_relu = false;    // yasai: see is_relu()
   bool m_yasai_ftz = false;  // yasai: see is_ftz()
   bool m_yasai_rnd_explicit = false;           // yasai: see has_rounding_modifier()
-  const symbol *m_yasai_save_a = nullptr;      // yasai: see yasai_save_a()
-  const symbol *m_yasai_save_b = nullptr;      // yasai: see yasai_save_b()
+  int m_yasai_save_id = -1;                    // yasai: see yasai_save_id()
+  int m_yasai_save_slot = -1;                  // yasai: see yasai_save_slot()
   int m_yasai_fuse_src = 0;                    // yasai: see yasai_fuse_src()
   bool m_yasai_fuse_neg = false;               // yasai: see yasai_fuse_neg()
-  const symbol *m_yasai_fuse_a = nullptr;      // yasai: see yasai_fuse_a()
-  const symbol *m_yasai_fuse_b = nullptr;      // yasai: see yasai_fuse_b()
+  int m_yasai_fuse_id = -1;                    // yasai: see yasai_fuse_id()
+  int m_yasai_fuse_slot = -1;                  // yasai: see yasai_fuse_slot()
   bool m_yasai_cluster_scope = false;  // yasai: see has_cluster_scope()
   bool m_yasai_weak_store = false;     // yasai: see is_weak_store()
   bool m_bf16x2 = false;  // yasai: see is_bf16x2()
