@@ -4,10 +4,13 @@
 #include "yasai_fatbin_units.h"
 
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -23,6 +26,8 @@
 
 namespace yasai_jit {
 namespace {
+
+bool write_file(const std::string &path, const void *p, size_t n);
 
 /// Magic number of a fat binary (fatbinary.h: FATBIN_MAGIC).
 const uint32_t kFatbinMagic = 0xBA55ED50u;
@@ -63,6 +68,128 @@ const std::string &work_dir() {
     yasai_system(("mkdir -p '" + dir + "'").c_str());
   }
   return dir;
+}
+
+/// Whether YASAI_JIT_WORK is set, so that other processes may share the work directory.
+bool shared_work() {
+  static const bool s = [] {
+    const char *w = getenv("YASAI_JIT_WORK");
+    return w != NULL && *w != 0;
+  }();
+  return s;
+}
+
+/// Suffix of this process's temporary products, "<host>.<pid>" (PID namespaces of two containers
+/// that share the directory can give two processes one PID).
+std::string tmp_suffix() {
+  char host[64] = "host";
+  gethostname(host, sizeof host - 1);
+  host[sizeof host - 1] = 0;
+  return std::string(host) + "." + std::to_string(getpid());
+}
+
+/// Holds an exclusive flock on <target>.lock while it lives, when the work directory is shared
+/// (shared_work()); otherwise does nothing. The descriptor is close-on-exec, so the cuobjdump
+/// processes that yasai_system starts do not hold the lock, and it goes with this process.
+struct product_lock {
+  int fd = -1;  ///< lock file descriptor, -1 when not shared
+  /// @param target Product path (a file or directory under the work directory).
+  explicit product_lock(const std::string &target) {
+    if (!shared_work()) return;
+    const std::string lf = target + ".lock";
+    fd = open(lf.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+    if (fd < 0) {
+      fprintf(stderr, "yasai_jit: cannot open %s: %s\n", lf.c_str(), strerror(errno));
+      abort();
+    }
+    while (flock(fd, LOCK_EX) != 0) {
+      if (errno == EINTR) continue;
+      fprintf(stderr, "yasai_jit: cannot lock %s: %s\n", lf.c_str(), strerror(errno));
+      abort();
+    }
+  }
+  ~product_lock() {
+    if (fd < 0) return;
+    flock(fd, LOCK_UN);
+    close(fd);
+  }
+  product_lock(const product_lock &) = delete;
+  product_lock &operator=(const product_lock &) = delete;
+};
+
+/// Name of the file list that marks a directory product complete.
+const char *const kFilesList = "yasai_jit_files.txt";
+
+/// Writes the file list of a directory product: the kind ("settled": names as settle_listing
+/// returned them, in cuobjdump -lptx order; "plain": file names), then one name per line.
+///   dir    the product directory (still its temporary name)
+///   kind   "settled" or "plain"
+///   names  file names relative to dir
+void write_files_list(const std::string &dir, const std::string &kind,
+                      const std::vector<std::string> &names) {
+  std::string text = kind + "\n";
+  for (const std::string &n : names) text += n + "\n";
+  const std::string path = dir + "/" + kFilesList;
+  std::ofstream out(path.c_str(), std::ios::binary);
+  out.write(text.data(), (std::streamsize)text.size());
+  out.close();
+  if (!out.good()) {
+    fprintf(stderr, "yasai_jit: cannot write %s\n", path.c_str());
+    abort();
+  }
+}
+
+/// Reads the file list of a complete directory product; false when it has none.
+///   dir    the product directory
+///   kind   receives the kind
+///   names  receives the names
+bool read_files_list(const std::string &dir, std::string *kind, std::vector<std::string> *names) {
+  std::ifstream in((dir + "/" + kFilesList).c_str());
+  if (!in.good() || !std::getline(in, *kind)) return false;
+  names->clear();
+  for (std::string l; std::getline(in, l);)
+    if (!l.empty()) names->push_back(l);
+  return true;
+}
+
+/// Renames a finished temporary product into place. A directory that exists without a file list
+/// (left by an earlier version) is moved aside first.
+///   tmp     the temporary product
+///   target  its final name
+void publish(const std::string &tmp, const std::string &target) {
+  struct stat sb;
+  if (stat(target.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) {
+    const std::string aside = target + ".stale." + tmp_suffix();
+    if (rename(target.c_str(), aside.c_str()) != 0) {
+      fprintf(stderr, "yasai_jit: cannot move %s aside: %s\n", target.c_str(), strerror(errno));
+      abort();
+    }
+  }
+  if (rename(tmp.c_str(), target.c_str()) != 0) {
+    fprintf(stderr, "yasai_jit: cannot rename %s to %s: %s\n", tmp.c_str(), target.c_str(),
+            strerror(errno));
+    abort();
+  }
+}
+
+/// Whether a file exists.
+///   path  file
+bool exists(const std::string &path) {
+  struct stat sb;
+  return stat(path.c_str(), &sb) == 0;
+}
+
+/// Writes a file product through a temporary file and a rename (shared work directory only).
+///   path  the product
+///   p     data
+///   n     number of bytes
+void write_product_file(const std::string &path, const void *p, size_t n) {
+  const std::string tmp = path + ".tmp." + tmp_suffix();
+  if (!write_file(tmp, p, n)) {
+    fprintf(stderr, "yasai_jit: cannot write %s\n", tmp.c_str());
+    abort();
+  }
+  publish(tmp, path);
 }
 
 /// FNV-1a 64-bit hash of a byte range, as 16 hex digits.
@@ -323,31 +450,89 @@ std::string arch_of_ptx_file(const std::string &ptx_file) {
   return base.substr(sm + 1, end == std::string::npos ? std::string::npos : end - sm - 1);
 }
 
-std::vector<std::string> ptx_files_of_library(const std::string &path, unsigned max_capability) {
-  std::lock_guard<std::mutex> lock(jit_mutex());
-  const std::string dir = work_dir() + "/lib-" +
-                          hash_hex((const unsigned char *)path.data(), path.size());
+namespace {
+
+/// Extracts the PTX files of a library into dir (extract_ptx, then settle_listing when cuobjdump
+/// -lptx lists the files) and returns their paths.
+///   path   the library
+///   dir    output directory
+///   kind   receives "settled" (names as settle_listing returned them) or "plain"
+///   names  receives the names relative to dir
+std::vector<std::string> extract_library(const std::string &path, const std::string &dir,
+                                         std::string *kind, std::vector<std::string> *names) {
   std::vector<std::string> files = extract_ptx(path, dir);
+  *kind = "plain";
+  names->clear();
+  for (const std::string &f : files) names->push_back(f.substr(dir.size() + 1));
   // yasai: files are named after their source files, so translation units compiled from
   // sources of one name overwrite each other; settle_listing extracts those again from their
   // own fat binaries and records every file's fat binary (yasai_fatbin_units.h).
-  {
-    const std::string list = dir + "/yasai_lptx.txt";
-    const std::string cmd = "$CUDA_INSTALL_PATH/bin/cuobjdump -lptx '" + path +
-                            "' 2>/dev/null | cut -d ':' -f 2 | awk '{$1=$1}1' > '" + list + "'";
-    yasai_system(cmd.c_str());
-    std::vector<std::vector<std::string>> names(1);
-    std::ifstream in(list);
-    for (std::string l; std::getline(in, l);)
-      if (!l.empty()) names[0].push_back(l);
-    if (!names[0].empty()) {
-      const std::vector<std::vector<std::string>> settled =
-          yasai_fatbin::settle_listing({path}, names, dir, yasai_system);
-      std::set<std::string> seen;
-      files.clear();
-      for (const std::string &n : settled[0])
-        if (seen.insert(n).second) files.push_back(dir + "/" + n);
+  const std::string list = dir + "/yasai_lptx.txt";
+  const std::string cmd = "$CUDA_INSTALL_PATH/bin/cuobjdump -lptx '" + path +
+                          "' 2>/dev/null | cut -d ':' -f 2 | awk '{$1=$1}1' > '" + list + "'";
+  yasai_system(cmd.c_str());
+  std::vector<std::vector<std::string>> listed(1);
+  std::ifstream in(list);
+  for (std::string l; std::getline(in, l);)
+    if (!l.empty()) listed[0].push_back(l);
+  if (!listed[0].empty()) {
+    const std::vector<std::vector<std::string>> settled =
+        yasai_fatbin::settle_listing({path}, listed, dir, yasai_system);
+    *kind = "settled";
+    *names = settled[0];
+    std::set<std::string> seen;
+    files.clear();
+    for (const std::string &n : settled[0])
+      if (seen.insert(n).second) files.push_back(dir + "/" + n);
+  }
+  return files;
+}
+
+/// Paths of a library's PTX files from its file list in dir; a settled list is recorded again
+/// under dir, so that unit_of_ptx_file finds the files in this process.
+///   path   the library
+///   dir    the complete product directory
+///   kind   the list's kind
+///   names  the list's names
+std::vector<std::string> library_files_of_list(const std::string &path, const std::string &dir,
+                                               const std::string &kind,
+                                               const std::vector<std::string> &names) {
+  if (kind == "settled") yasai_fatbin::record_listing({path}, {names}, dir);
+  std::set<std::string> seen;
+  std::vector<std::string> files;
+  for (const std::string &n : names)
+    if (seen.insert(n).second) files.push_back(dir + "/" + n);
+  return files;
+}
+
+}  // namespace
+
+std::vector<std::string> ptx_files_of_library(const std::string &path, unsigned max_capability) {
+  std::lock_guard<std::mutex> lock(jit_mutex());
+  std::string key = path;
+  if (shared_work()) {
+    // yasai: in a shared directory the same path can name different files (two containers).
+    struct stat sb;
+    if (stat(path.c_str(), &sb) == 0)
+      key += "|" + std::to_string((long long)sb.st_size) + "|" +
+             std::to_string((long long)sb.st_mtim.tv_sec * 1000000000ll + sb.st_mtim.tv_nsec);
+  }
+  const std::string dir = work_dir() + "/lib-" +
+                          hash_hex((const unsigned char *)key.data(), key.size());
+  std::string kind;
+  std::vector<std::string> names, files;
+  if (!shared_work()) {
+    files = extract_library(path, dir, &kind, &names);
+  } else {
+    product_lock plock(dir);
+    if (!read_files_list(dir, &kind, &names)) {
+      const std::string tmp = dir + ".tmp." + tmp_suffix();
+      yasai_system(("rm -rf '" + tmp + "'").c_str());
+      extract_library(path, tmp, &kind, &names);
+      write_files_list(tmp, kind, names);
+      publish(tmp, dir);
     }
+    files = library_files_of_list(path, dir, kind, names);
   }
   // rank: (0, -arch, plain) for architectures within the capability, (1, arch, plain) above it
   auto rank = [max_capability](const std::string &f) {
@@ -391,8 +576,27 @@ std::string ptx_for_image(const void *image, unsigned max_capability, std::strin
     const size_t n = header_size + fat_size;
     const std::string h = hash_hex(p, n);
     const std::string file = work_dir() + "/" + h + ".fatbin";
-    write_file(file, p, n);
-    const std::vector<std::string> sel = select_arch(extract_ptx(file, work_dir() + "/" + h), max_capability);
+    std::vector<std::string> extracted;
+    if (!shared_work()) {
+      write_file(file, p, n);
+      extracted = extract_ptx(file, work_dir() + "/" + h);
+    } else {
+      // yasai: one product, the fat binary and its extracted PTX, under the lock of the file.
+      product_lock plock(file);
+      const std::string dir = work_dir() + "/" + h;
+      std::string kind;
+      std::vector<std::string> names;
+      if (!read_files_list(dir, &kind, &names)) {
+        if (!exists(file)) write_product_file(file, p, n);
+        const std::string tmp = dir + ".tmp." + tmp_suffix();
+        yasai_system(("rm -rf '" + tmp + "'").c_str());
+        for (const std::string &f : extract_ptx(file, tmp)) names.push_back(f.substr(tmp.size() + 1));
+        write_files_list(tmp, "plain", names);
+        publish(tmp, dir);
+      }
+      for (const std::string &nm : names) extracted.push_back(dir + "/" + nm);
+    }
+    const std::vector<std::string> sel = select_arch(extracted, max_capability);
     if (!sel.empty()) {
       *how = "fat binary " + h + ", embedded PTX " + sel[0];
       result = sel[0];
@@ -402,11 +606,29 @@ std::string ptx_for_image(const void *image, unsigned max_capability, std::strin
       // its cubins are extracted and looked up in the JIT caches (ptx_for_cubin), where the
       // DSL's own PTX lands with CUTE_DSL_KEEP=ptx and CUTE_DSL_DUMP_DIR.
       const std::string edir = work_dir() + "/" + h + "-elf";
-      yasai_system(("mkdir -p '" + edir + "' && cd '" + edir +
-                    "' && $CUDA_INSTALL_PATH/bin/cuobjdump -xelf all '" + file +
-                    "' > /dev/null 2>&1").c_str());
       std::vector<std::string> cubins;
-      find_files(edir, ".cubin", &cubins);
+      if (!shared_work()) {
+        yasai_system(("mkdir -p '" + edir + "' && cd '" + edir +
+                      "' && $CUDA_INSTALL_PATH/bin/cuobjdump -xelf all '" + file +
+                      "' > /dev/null 2>&1").c_str());
+        find_files(edir, ".cubin", &cubins);
+      } else {
+        product_lock plock(edir);
+        std::string kind;
+        std::vector<std::string> names;
+        if (!read_files_list(edir, &kind, &names)) {
+          const std::string tmp = edir + ".tmp." + tmp_suffix();
+          yasai_system(("rm -rf '" + tmp + "' && mkdir -p '" + tmp + "' && cd '" + tmp +
+                        "' && $CUDA_INSTALL_PATH/bin/cuobjdump -xelf all '" + file +
+                        "' > /dev/null 2>&1").c_str());
+          std::vector<std::string> found;
+          find_files(tmp, ".cubin", &found);
+          for (const std::string &f : found) names.push_back(f.substr(tmp.size() + 1));
+          write_files_list(tmp, "plain", names);
+          publish(tmp, edir);
+        }
+        for (const std::string &nm : names) cubins.push_back(edir + "/" + nm);
+      }
       std::sort(cubins.begin(), cubins.end());
       for (const std::string &c : cubins) {
         std::string bytes;
@@ -431,7 +653,12 @@ std::string ptx_for_image(const void *image, unsigned max_capability, std::strin
       const size_t len = strlen((const char *)p);
       const std::string h = hash_hex(p, len);
       result = work_dir() + "/" + h + ".ptx";
-      write_file(result, p, len);
+      if (!shared_work()) {
+        write_file(result, p, len);
+      } else {
+        product_lock plock(result);
+        if (!exists(result)) write_product_file(result, p, len);
+      }
       *how = "PTX image " + h;
     } else {
       *how = "unknown image format";

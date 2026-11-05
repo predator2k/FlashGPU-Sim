@@ -15,7 +15,17 @@
 //                       $TRITON_CACHE_DIR or $HOME/.triton/cache, plus $HOME/.cache/flashinfer and
 //                       $HOME/.deep_gemm); every directory is searched recursively.
 //   YASAI_JIT_WORK      directory for extracted and written PTX files (default
-//                       $TMPDIR/yasai-jit-<pid>).
+//                       $TMPDIR/yasai-jit-<host>-<pid>, one per process). Several processes may
+//                       share one YASAI_JIT_WORK (the ranks of one run): every product (lib-<key>/,
+//                       <h>.fatbin with <h>/, <h>-elf/, <h>.ptx) is made under an exclusive flock
+//                       on <product>.lock, into <product>.tmp.<host>.<pid>, and renamed into place
+//                       when complete; a directory product is complete when it holds its file list
+//                       yasai_jit_files.txt, which later processes read instead of running
+//                       cuobjdump. The library key then also holds the file's size and
+//                       modification time, so that two libraries of one path in different
+//                       containers do not share a directory. A process killed while it holds a
+//                       lock releases it; its .tmp stays unused and the next process makes the
+//                       product again.
 //   YASAI_JIT_DEBUG     nonzero: print how each image was resolved.
 #ifndef YASAI_JIT_IMAGE_H
 #define YASAI_JIT_IMAGE_H
