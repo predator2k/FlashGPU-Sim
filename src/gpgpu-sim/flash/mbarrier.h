@@ -160,5 +160,30 @@ private:
 // Forward declarations for mbarrier_impl
 class ptx_instruction;
 class ptx_thread_info;
+class operand_info;
 void handle_mbarrier_inst(const ptx_instruction *pI, ptx_thread_info *thread);
+
+// yasai: the shared-window address of the mbarrier operand op of pI, executed by thread: the value
+// the forms with a state space (.shared, .shared::cta, .shared::cluster) carry, an offset in the
+// CTA's shared memory with the owner's rank in bits 24 and up while a cluster executes
+// (yasai_func::dsmem_encode). The forms without a state space take a generic address (PTX ISA,
+// mbarrier: generic addressing; FlashInfer's XQA kernel_mha initialises its barriers with
+// "mbarrier.init.b64 [%rd], n" on a cvta.shared address):
+//   * a value below the window size (1 MiB, or 16 ranks of 16 MiB while a cluster executes) is
+//     a window address already and is returned unchanged;
+//   * a generic address in this CTA's generic shared window becomes its offset;
+//   * while a cluster executes, a generic address in the window of another CTA of the cluster
+//     becomes that CTA's .shared::cluster address (yasai_func::mbar_canonical maps it to the CTA);
+//   * any other value stops the simulation with one yasai-strictaddr line in every
+//     YASAI_STRICT_ADDR mode: it names no barrier, the GPU's behaviour is undefined, and a
+//     simulation that went on would wait on or arrive at a barrier nobody initialised.
+// The operand is read with 64 bits (a 32-bit address register keeps its 32 bits): reading 32 bits
+// kept 0xC0000000 + smid * 1 MiB + offset of a generic address, a key other than the offset's, so
+// a generic init and a .shared arrive at one barrier reached two barriers.
+//   pI: the mbarrier, cp.async.mbarrier.arrive or tcgen05.commit instruction
+//   thread: the executing thread
+//   op: the barrier address operand of pI
+//   return: the shared-window address (the key of the barrier with the CTA)
+unsigned yasai_mbar_window_addr(const ptx_instruction *pI, ptx_thread_info *thread,
+                                const operand_info &op);
 #endif

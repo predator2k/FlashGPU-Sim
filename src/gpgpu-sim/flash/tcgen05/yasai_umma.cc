@@ -34,6 +34,7 @@
 #include "../../../cuda-sim/ptx_sim.h"
 #include "../../../cuda-sim/yasai_func.h"
 #include "../../gpu-sim.h"
+#include "../mbarrier.h"
 #include "tmem.h"
 
 #include <cassert>
@@ -897,7 +898,8 @@ void commit(const ptx_instruction *pI, ptx_thread_info *t) {
   if (t->get_laneid() != 0)
     return;
   const operand_info &bar = pI->operand_lookup(0);
-  const uint32_t addr = t->get_operand_value(bar, bar, B32_TYPE, t, 0).u32;
+  // yasai: without .shared::cluster the address is generic (yasai_mbar_window_addr converts it)
+  const uint32_t addr = yasai_mbar_window_addr(pI, t, bar);
   if (has(pI, TCGEN05_MULTICAST_CLUSTER_OPTION) && pI->get_num_operands() > 1 &&
       yasai_func::cluster() != nullptr) {
     const operand_info &m = pI->operand_lookup(1);

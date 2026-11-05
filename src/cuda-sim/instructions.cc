@@ -2210,11 +2210,12 @@ void cp_async_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     // yasai: the arrive is triggered once all prior cp.async of the thread are complete.
     yasai_cp_async_complete(thread, pI, 0, true);
     assert(pI->get_num_operands() == 1);
-    assert(pI->membar_level() == CTA_OPTION);
     assert(pI->get_type() == B64_TYPE);
+    // yasai: .shared::cta, .shared or no state space (a generic address, converted by
+    // yasai_mbar_window_addr); the assertion on .shared::cta stopped the .shared form that
+    // FlashInfer's XQA kernel_mha uses.
     const operand_info &addr_op = pI->operand_lookup(0);
-    const uint32_t addr =
-        thread->get_operand_value(addr_op, addr_op, U32_TYPE, thread, 0).u32;
+    const uint32_t addr = yasai_mbar_window_addr(pI, thread, addr_op);
     inst_t::mbarrier_info_t info;
     info.bar_id = addr;
     const_cast<ptx_instruction *>(pI)->set_mbarrier_info(
