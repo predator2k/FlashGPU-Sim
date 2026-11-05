@@ -2523,7 +2523,13 @@ void cp_async_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
 void bfe_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   unsigned i_type = pI->get_type();
-  unsigned msb = (i_type == U32_TYPE || i_type == S32_TYPE) ? 31 : 63;
+  const bool is32 = i_type == U32_TYPE || i_type == S32_TYPE;
+  const bool is_signed = i_type == S32_TYPE || i_type == S64_TYPE;
+  if (!is32 && i_type != U64_TYPE && i_type != S64_TYPE) {
+    printf("Operand type not supported for BFE instruction.\n");
+    abort();
+  }
+  const unsigned msb = is32 ? 31 : 63;
   const operand_info &dst = pI->dst();
   const operand_info &src1 = pI->src1();
   const operand_info &src2 = pI->src2();
@@ -2531,57 +2537,19 @@ void bfe_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   ptx_reg_t src = thread->get_operand_value(src1, dst, i_type, thread, 1);
   ptx_reg_t b = thread->get_operand_value(src2, dst, i_type, thread, 1);
   ptx_reg_t c = thread->get_operand_value(src3, dst, i_type, thread, 1);
+  // yasai: the PTX ISA's definition, which a GPU follows (value sweep, key_values.cu): pos and len are the
+  // low 8 bits of their operands, the field is cut at msb, and the bits above the field are the sign bit
+  // a[min(pos + len - 1, msb)] (0 for unsigned types and for len 0). The shifts by 32 - len and by pos were
+  // undefined for len 0 and for pos beyond msb.
+  const unsigned pos = b.u32 & 0xFF;
+  const unsigned len = c.u32 & 0xFF;
+  const unsigned long long x = is32 ? (unsigned long long)src.u32 : (unsigned long long)src.u64;
+  const unsigned kept = pos > msb ? 0 : std::min(len, msb + 1 - pos);
+  unsigned long long r = 0;
+  if (kept != 0) r = (x >> pos) & (kept >= 64 ? ~0ull : (1ull << kept) - 1);
+  if (is_signed && len != 0 && ((x >> std::min(pos + len - 1, msb)) & 1ull) && kept < 64) r |= ~0ull << kept;
   ptx_reg_t data;
-  unsigned pos = b.u32 & 0xFF;
-  unsigned len = c.u32 & 0xFF;
-  switch (i_type) {
-    case U32_TYPE: {
-      unsigned mask;
-      data.u32 = src.u32 >> pos;
-      mask = 0xFFFFFFFF >> (32 - len);
-      data.u32 &= mask;
-      break;
-    }
-    case U64_TYPE: {
-      unsigned long mask;
-      data.u64 = src.u64 >> pos;
-      mask = 0xFFFFFFFFFFFFFFFF >> (64 - len);
-      data.u64 &= mask;
-      break;
-    }
-    case S32_TYPE: {
-      unsigned mask;
-      unsigned min = MY_MIN_I(pos + len - 1, msb);
-      unsigned sbit = len == 0 ? 0 : (src.s32 >> min) & 0x1;
-      data.s32 = src.s32 >> pos;
-      if (sbit > 0) {
-        mask = 0xFFFFFFFF << len;
-        data.s32 |= mask;
-      } else {
-        mask = 0xFFFFFFFF >> (32 - len);
-        data.s32 &= mask;
-      }
-      break;
-    }
-    case S64_TYPE: {
-      unsigned long mask;
-      unsigned min = MY_MIN_I(pos + len - 1, msb);
-      unsigned sbit = len == 0 ? 0 : (src.s64 >> min) & 0x1;
-      data.s64 = src.s64 >> pos;
-      if (sbit > 0) {
-        mask = 0xFFFFFFFFFFFFFFFF << len;
-        data.s64 |= mask;
-      } else {
-        mask = 0xFFFFFFFFFFFFFFFF >> (64 - len);
-        data.s64 &= mask;
-      }
-      break;
-    }
-    default:
-      printf("Operand type not supported for BFE instruction.\n");
-      abort();
-      return;
-  }
+  data.u64 = is32 ? (r & 0xFFFFFFFFull) : r;
   thread->set_operand_value(dst, data, i_type, thread, pI);
 }
 
@@ -2620,11 +2588,15 @@ void bfi_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   // above of bfi.b64 (FlashMLA's combine kernel packs four bf16 values with bfi.b64).
   data = src2_data;
   if (i_type == B32_TYPE) data.u64 &= 0xFFFFFFFFull;
-  unsigned pos = src3_data.u32 & 0xFF;
-  unsigned len = src4_data.u32 & 0xFF;
-  for (i = 0; i < (int)len && pos + i < (unsigned)max; i++) {
-    const unsigned long long bit = 1ull << (pos + i);
-    data.u64 = (data.u64 & ~bit) | (((src1_data.u64 >> i) & 1ull) << (pos + i));
+  // yasai: bfi.b32 takes the low 8 bits of pos and len, the PTX ISA's definition. A GPU's bfi.b64 takes all
+  // 32 bits of both (value sweep, key_values.cu: pos 0x80000000 leaves b as it is, and len 0x100 inserts up
+  // to the top), unlike the ISA's text; the measurement decides.
+  const unsigned long long pos = i_type == B64_TYPE ? src3_data.u32 : (src3_data.u32 & 0xFF);
+  const unsigned long long len = i_type == B64_TYPE ? src4_data.u32 : (src4_data.u32 & 0xFF);
+  for (unsigned long long k = 0; k < len && pos + k < (unsigned long long)max; k++) {
+    i = int(k);
+    const unsigned long long bit = 1ull << (pos + k);
+    data.u64 = (data.u64 & ~bit) | (((src1_data.u64 >> i) & 1ull) << (pos + k));
   }
   thread->set_operand_value(dst, data, i_type, thread, pI);
 }
