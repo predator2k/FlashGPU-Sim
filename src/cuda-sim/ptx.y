@@ -244,6 +244,7 @@ class ptx_recognizer;
 %token  SYS_OPTION
 %token  EXIT_OPTION
 %token  ABS_OPTION
+%token  XORSIGN_OPTION
 %token  TO_OPTION
 %token  CA_OPTION;
 %token  CG_OPTION;
@@ -750,6 +751,7 @@ option: type_spec
 	| FULL_OPTION { recognizer->add_option(FULL_OPTION); }
 	| EXIT_OPTION { recognizer->add_option(EXIT_OPTION); }
 	| ABS_OPTION { recognizer->add_option(ABS_OPTION); }
+	| XORSIGN_OPTION { recognizer->add_option(XORSIGN_OPTION); }
 	| atomic_operation_spec ;
 	| TO_OPTION { recognizer->add_option(TO_OPTION); }
 	| HALF_OPTION { recognizer->add_option(HALF_OPTION); }
