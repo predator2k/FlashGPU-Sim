@@ -305,7 +305,7 @@ static inline uint16_t bf16_bits_from_f32(float f, unsigned rounding_mode) {
 static inline uint16_t packed_half_from_f32(float f, bool bf16, bool relu,
                                             unsigned rounding_mode) {
   if (std::isnan(f)) return 0x7FFF;  // canonical NaN of f16 and bf16 results
-  if (relu && f < 0.0f) f = 0.0f;
+  if (relu && std::signbit(f)) f = 0.0f;  // -0 too (value sweep, key_values.cu)
   return bf16 ? bf16_bits_from_f32(f, rounding_mode) : f16_bits_from_f32(f, rounding_mode);
 }
 
@@ -4428,7 +4428,7 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       uint32_t r = 0;
       for (int h = 0; h < 2; ++h) {
         float x = v[h];
-        if (pI->is_relu() && !std::isnan(x) && x < 0.0f) x = 0.0f;
+        if (pI->is_relu() && !std::isnan(x) && std::signbit(x)) x = 0.0f;  // -0 too
         uint32_t code = yasai_func::minifloat_encode(fmt, x, saturation_mode != 0, rz, rp) & mask;
         // yasai: e2m1 has no NaN; an RTX 5090 writes 0x7 (+6.0) for a NaN of either sign (yasai_nan)
         if (fmt == yasai_func::kE2M1 && std::isnan(x)) code = 0x7u;
@@ -4502,7 +4502,7 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     else if (rounding_mode == RMI_OPTION) f = floorf(f);
     else if (rounding_mode == RPI_OPTION) f = ceilf(f);
     if (saturation_mode) f = cuda_math::__saturatef(f);
-    if (pI->is_relu() && !std::isnan(f) && f < 0.0f) f = 0.0f;  // yasai: cvt .relu
+    if (pI->is_relu() && !std::isnan(f) && std::signbit(f)) f = 0.0f;  // yasai: cvt .relu; -0 too (value sweep, key_values.cu)
     ptx_reg_t out;
     out.u64 = 0;
     uint32_t fu;
