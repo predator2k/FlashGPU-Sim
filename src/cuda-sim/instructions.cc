@@ -3456,17 +3456,25 @@ void cnot_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   thread->set_operand_value(dst, d, i_type, thread, pI);
 }
 
-// yasai: the angle of sin.approx and cos.approx as a GB10 and an RTX 5090 reduce it, in radians, for a finite x (tests/trig_ends_probe.cu, the value sweep): |x| * (2 / pi), with 2 / pi as an
-// f32 and the product cut toward zero to f32, is cut to 23 fraction bits modulo 4, so |x| below (pi / 2) 2^-23 is angle 0 (sin gives a zero of x's sign), and from (pi / 2) 2^25 on
-// the angle is 0 (sin gives zero and cos gives 1). The GPU's sine and cosine of that angle have no bitwise model here: libm's differ from them by at most 1e-4 for |x| below 2^10, and
-// by more at large |x|, where the angle's reduction differs too.
-static inline double yasai_trig_angle(float x) {
+// yasai: sin.approx and cos.approx of a finite x, with the angle reduced as a GB10 and an RTX 5090 reduce it (tests/trig_ends_probe.cu, the value sweep): |x| * (2 / pi), with 2 / pi as an f32 and
+// the product cut toward zero to f32, is cut to 23 fraction bits modulo 4. So |x| below (pi / 2) 2^-23 is angle 0 (sin gives a zero of x's sign), a quarter turn gives exactly 0 or 1, and from
+// (pi / 2) 2^25 on the angle is 0 (sin gives zero and cos gives 1). The GPU's sine and cosine of that angle have no bitwise model here: libm's are within 1e-4 of them for |x| below 2^10, and
+// farther at large |x|, where the reduction differs too. x: the input; cosine: which of the two.
+static inline float yasai_trig_approx(float x, bool cosine) {
   const double p = double(std::fabs(x)) * double(0.63661975f);
   float t = float(p);
   if (double(t) > p) t = std::nextafterf(t, 0.0f);
-  if (t >= 33554432.0f) return 0.0;
-  const uint64_t k = uint64_t(double(t) * 8388608.0) % (1ull << 25);
-  return double(k) * 1.5707963267948966 / 8388608.0;
+  const uint64_t k = t >= 33554432.0f ? 0 : uint64_t(double(t) * 8388608.0) % (1ull << 25);
+  const unsigned quadrant = unsigned(k >> 23);
+  const double a = double(k & 0x7FFFFFull) * 1.5707963267948966 / 8388608.0;
+  const double sa = sin(a), ca = cos(a);
+  double r;
+  if (cosine) {
+    r = quadrant == 0 ? ca : quadrant == 1 ? 0.0 - sa : quadrant == 2 ? -ca : sa;
+    return float(r);
+  }
+  r = quadrant == 0 ? sa : quadrant == 1 ? ca : quadrant == 2 ? -sa : -ca;
+  return float(std::signbit(x) ? -r : r);
 }
 
 void cos_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
@@ -3479,7 +3487,7 @@ void cos_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
   switch (i_type) {
     case F32_TYPE:
-      d.f32 = std::isfinite(a.f32) ? float(cos(yasai_trig_angle(a.f32))) : cos(a.f32);  // yasai
+      d.f32 = std::isfinite(a.f32) ? yasai_trig_approx(a.f32, true) : cos(a.f32);  // yasai
       break;
     default:
       printf("Execution error: type mismatch with instruction\n");
@@ -8168,8 +8176,7 @@ void sin_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
   switch (i_type) {
     case F32_TYPE:
-      // yasai: odd in x, so a tiny negative x gives -0 (yasai_trig_angle).
-      d.f32 = std::isfinite(a.f32) ? float(std::signbit(a.f32) ? -sin(yasai_trig_angle(a.f32)) : sin(yasai_trig_angle(a.f32))) : sin(a.f32);
+      d.f32 = std::isfinite(a.f32) ? yasai_trig_approx(a.f32, false) : sin(a.f32);  // yasai
       break;
     default:
       printf("Execution error: type mismatch with instruction\n");
