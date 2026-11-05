@@ -291,6 +291,11 @@ static inline uint16_t bf16_bits_from_f32(float f, unsigned rounding_mode) {
   std::memcpy(&u, &f, 4);
   if ((u & 0x7FFFFFFFu) > 0x7F800000u) return 0x7FFF;
   if (rounding_mode == RZ_OPTION || rounding_mode == RZI_OPTION) return uint16_t(u >> 16);
+  // yasai: .rm and .rp: away from zero when the discarded bits are not zero and the sign agrees.
+  if (rounding_mode == RM_OPTION || rounding_mode == RP_OPTION) {
+    const bool away = (u & 0xFFFFu) != 0 && ((u >> 31) != 0) == (rounding_mode == RM_OPTION);
+    return uint16_t((u >> 16) + (away ? 1u : 0u));
+  }
   u += 0x7FFFu + ((u >> 16) & 1u);
   return uint16_t(u >> 16);
 }
@@ -3552,6 +3557,10 @@ unsigned int saturatei(unsigned int a, unsigned int max) {
   return a;
 }
 
+namespace yasai_fma {
+static inline float to_f32_odd(double d);
+}
+
 // ---- yasai: float-to-integer conversion (cvt.{rni,rzi,rmi,rpi}{.sat}.<int>.<float>) -------------
 // As an RTX 5090 does it (tests/cvt_int_probe.cu: 7,128 cases on the 5090, driver 580.159.03, file
 // tests/cvt_int_probe_ref5090.txt): the source rounded to an integer in the instruction's mode,
@@ -4453,14 +4462,16 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       case BF16_TYPE: { uint32_t u = uint32_t(in.u16) << 16; std::memcpy(&f, &u, 4); break; }
       case F16_TYPE: f = half_float::detail::half2float<float>(in.u16); break;
       case F32_TYPE: case TF32_TYPE: f = in.f32; break;
-      case F64_TYPE: case FF64_TYPE: f = float(in.f64); break;
+      // yasai: f64 and integer sources to bf16 round once: rounded to odd in f32 first, so that the second rounding below is the instruction's (value sweep, key_values.cu:
+      // cvt.rz.bf16.s32 of 0x7fffffff is 0x4eff; float() rounded it up to 2^31 and gave 0x4f00). Other destinations keep the plain conversion.
+      case F64_TYPE: case FF64_TYPE: f = to_type == BF16_TYPE ? yasai_fma::to_f32_odd(in.f64) : float(in.f64); break;
       case S8_TYPE: f = float(in.s8); break;
       case S16_TYPE: f = float(in.s16); break;
-      case S32_TYPE: f = float(in.s32); break;
+      case S32_TYPE: f = to_type == BF16_TYPE ? yasai_fma::to_f32_odd(double(in.s32)) : float(in.s32); break;
       case S64_TYPE: f = float(in.s64); break;
       case U8_TYPE: f = float(in.u8); break;
       case U16_TYPE: f = float(in.u16); break;
-      case U32_TYPE: f = float(in.u32); break;
+      case U32_TYPE: f = to_type == BF16_TYPE ? yasai_fma::to_f32_odd(double(in.u32)) : float(in.u32); break;
       case U64_TYPE: f = float(in.u64); break;
       default:
         printf("GPGPU-Sim PTX: ERROR ** unsupported cvt source %s for bf16/tf32\n",
@@ -4484,6 +4495,11 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       default:
         break;
     }
+    // yasai: .rni, .rzi, .rmi, .rpi to a floating-point destination round to an integer (value sweep, key_values.cu: cvt.rpi.bf16.bf16 of 0xbf90 is 0xbf80).
+    if (rounding_mode == RNI_OPTION) f = nearbyintf(f);
+    else if (rounding_mode == RZI_OPTION) f = truncf(f);
+    else if (rounding_mode == RMI_OPTION) f = floorf(f);
+    else if (rounding_mode == RPI_OPTION) f = ceilf(f);
     if (saturation_mode) f = cuda_math::__saturatef(f);
     if (pI->is_relu() && !std::isnan(f) && f < 0.0f) f = 0.0f;  // yasai: cvt .relu
     ptx_reg_t out;
@@ -4492,10 +4508,11 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     std::memcpy(&fu, &f, 4);
     switch (to_type) {
       case BF16_TYPE:
+        // yasai: the canonical NaN, as an RTX 5090 writes it (yasai_nan); from f64 a GPU writes 0x7fc0 with the source's sign, whatever the payload (value sweep, key_values.cu).
         if ((fu & 0x7fffffffu) > 0x7f800000u)
-          out.u16 = 0x7fffu;  // yasai: the canonical NaN, as an RTX 5090 writes it (yasai_nan)
+          out.u16 = (from_type == F64_TYPE || from_type == FF64_TYPE) ? uint16_t(0x7fc0u | ((in.u64 >> 48) & 0x8000u)) : uint16_t(0x7fffu);
         else
-          out.u16 = uint16_t((fu + 0x7fffu + ((fu >> 16) & 1u)) >> 16);
+          out.u16 = bf16_bits_from_f32(f, rounding_mode);  // the instruction's rounding; an integer modifier has left an exact value
         break;
       case TF32_TYPE:  // yasai: a NaN gives 0x7fffe000, as an RTX 5090 writes it (yasai_nan)
         out.u32 = std::isnan(f) ? 0x7fffe000u : ((fu + 0xfffu + ((fu >> 13) & 1u)) & 0xffffe000u);
