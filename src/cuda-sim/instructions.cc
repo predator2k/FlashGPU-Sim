@@ -1978,7 +1978,12 @@ void atom_callback(const inst_t *inst, ptx_thread_info *thread) {
           data_ready = true;
           break;
         case F32_TYPE:
-          op_result.f32 = data.f32 + src2_data.f32;
+          {
+            // yasai: atom.add.f32 of a global word flushes subnormal operands and a subnormal result to a zero of their sign, as the PTX ISA says and a GPU does (value sweep,
+            // ptx_key_values2.py: 1e-45 + 1e-45 is 0); yasai_rmw::apply does the same for the words of the host window. atom.shared.add.f32 keeps its subnormals on a GPU.
+            const auto flush = [space](float x) { return space != shared_space && std::fpclassify(x) == FP_SUBNORMAL ? std::copysign(0.0f, x) : x; };
+            op_result.f32 = flush(flush(data.f32) + flush(src2_data.f32));
+          }
           if (std::isnan(op_result.f32)) op_result.u32 = 0x7fffffffu;  // yasai: canonical NaN (yasai_nan)
           data_ready = true;
           break;
@@ -2172,6 +2177,18 @@ void cvt_pack_impl(const ptx_instruction *pI, ptx_thread_info *thread);
 #include "yasai_rmw.inc"
 
 static uint64_t yasai_atom_add_fp(const ptx_instruction *pI, uint64_t a, uint64_t b) {
+  // yasai: atom.shared.add.f64: the memory word's NaN, else the operand's, both quieted (a GB10 and an RTX 5090, value sweep, ptx_key_values2.py), unlike atom.global.add.f64 in yasai_rmw::apply.
+  if (pI->get_type() == F64_TYPE && pI->get_space().get_type() == shared_space) {
+    double x, y;
+    memcpy(&x, &a, 8);
+    memcpy(&y, &b, 8);
+    const double r = x + y;
+    if (std::isnan(r)) {
+      if (std::isnan(x)) return a | 0x0008000000000000ull;
+      if (std::isnan(y)) return b | 0x0008000000000000ull;
+      return 0xfff8000000000000ull;
+    }
+  }
   unsigned word_bytes;
   return yasai_rmw::apply(ATOMIC_ADD, pI->get_type(), pI->is_bf16x2(), a, b, 0, &word_bytes);
 }
