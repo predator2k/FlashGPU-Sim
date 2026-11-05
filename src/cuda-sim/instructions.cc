@@ -4029,26 +4029,16 @@ ptx_reg_t f2f(ptx_reg_t x, unsigned from_width, unsigned to_width, int to_sign,
         y.f32 = cuda_math::__internal_nearbyintf(x.f32);
 #endif
         break;
+      // yasai: a subnormal source is kept, as on a GPU (value sweep, key_values.cu: cvt.rmi.f32.f32 of -1e-45 is -1, cvt.rpi.f32.f32 of 1e-45 is 1, cvt.sat.f32.f32 of 1e-45 is itself);
+      // the branches here flushed it to zero, which is .ftz's work, and .ftz is applied by the operand accessor.
       case RMI_OPTION:
-        if ((x.u32 & 0x7f800000) == 0) {
-          y.u32 = x.u32 & 0x80000000;  // round denorm. FP to 0, keeping sign
-        } else {
-          y.f32 = floorf(x.f32);
-        }
+        y.f32 = floorf(x.f32);
         break;
       case RPI_OPTION:
-        if ((x.u32 & 0x7f800000) == 0) {
-          y.u32 = x.u32 & 0x80000000;  // round denorm. FP to 0, keeping sign
-        } else {
-          y.f32 = ceilf(x.f32);
-        }
+        y.f32 = ceilf(x.f32);
         break;
       default:
-        if ((x.u32 & 0x7f800000) == 0) {
-          y.u32 = x.u32 & 0x80000000;  // round denorm. FP to 0, keeping sign
-        } else {
-          y.f32 = x.f32;
-        }
+        y.f32 = x.f32;
         break;
     }
 #if CUDART_VERSION >= 3000
