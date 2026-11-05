@@ -258,13 +258,15 @@ breakaddr  TC; BEGIN(NOT_OPCODE); yylval->int_value = BREAKADDR_OP; return OPCOD
 \.m32n8k16\.global TC; yylval->int_value = M32N8K16; return CONFIGURATION;
 \.m8n32k16\.global TC;  yylval->int_value = M8N32K16; return CONFIGURATION;
 
-\.m16n16k16\.shared TC; yylval->int_value = M16N16K16; return CONFIGURATION;
-	/* yasai: .shared::cta is .shared (PTX ISA: .shared without a sub-qualifier defaults to ::cta) */
-\.m16n16k16\.shared::cta TC; yylval->int_value = M16N16K16; return CONFIGURATION;
-\.m32n8k16\.shared::cta TC; yylval->int_value = M32N8K16; return CONFIGURATION;
-\.m8n32k16\.shared::cta TC;  yylval->int_value = M8N32K16; return CONFIGURATION;
-\.m32n8k16\.shared TC; yylval->int_value = M32N8K16; return CONFIGURATION;
-\.m8n32k16\.shared TC;  yylval->int_value = M8N32K16; return CONFIGURATION;
+\.m16n16k16\.shared TC; recognizer->note_wmma_shared(); yylval->int_value = M16N16K16; return CONFIGURATION;
+	/* yasai: the .shared forms record the state space (wmma_spec read global for every form before), and
+	   .shared::cta is .shared (PTX ISA 5.1.7: "If no sub-qualifier is specified with the .shared state
+	   space, then it defaults to ::cta.") */
+\.m16n16k16\.shared::cta TC; recognizer->note_wmma_shared(); yylval->int_value = M16N16K16; return CONFIGURATION;
+\.m32n8k16\.shared::cta TC; recognizer->note_wmma_shared(); yylval->int_value = M32N8K16; return CONFIGURATION;
+\.m8n32k16\.shared::cta TC; recognizer->note_wmma_shared();  yylval->int_value = M8N32K16; return CONFIGURATION;
+\.m32n8k16\.shared TC; recognizer->note_wmma_shared(); yylval->int_value = M32N8K16; return CONFIGURATION;
+\.m8n32k16\.shared TC; recognizer->note_wmma_shared();  yylval->int_value = M8N32K16; return CONFIGURATION;
 
 \.m16n16k16 TC; yylval->int_value = M16N16K16; return CONFIGURATION;
 \.m32n8k16 TC; yylval->int_value = M32N8K16; return CONFIGURATION;

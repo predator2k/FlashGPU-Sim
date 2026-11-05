@@ -934,8 +934,8 @@ prmt_spec: PRMT_F4E_MODE { recognizer->add_option( PRMT_F4E_MODE); }
 	|  PRMT_ECR_MODE { recognizer->add_option( PRMT_ECR_MODE); }
 	;
 
-wmma_spec: WMMA_DIRECTIVE LAYOUT CONFIGURATION{recognizer->add_space_spec(global_space,0);recognizer->add_ptr_spec(global_space); recognizer->add_wmma_option($1);recognizer->add_wmma_option($2);recognizer->add_wmma_option($3);}
-	| WMMA_DIRECTIVE LAYOUT LAYOUT CONFIGURATION{recognizer->add_wmma_option($1);recognizer->add_wmma_option($2);recognizer->add_wmma_option($3);recognizer->add_wmma_option($4);}
+wmma_spec: WMMA_DIRECTIVE LAYOUT CONFIGURATION{{ const bool sh = recognizer->take_wmma_shared(); recognizer->add_space_spec(sh ? shared_space : global_space,0);recognizer->add_ptr_spec(sh ? shared_space : global_space); } recognizer->add_wmma_option($1);recognizer->add_wmma_option($2);recognizer->add_wmma_option($3);}
+	| WMMA_DIRECTIVE LAYOUT LAYOUT CONFIGURATION{recognizer->take_wmma_shared();recognizer->add_wmma_option($1);recognizer->add_wmma_option($2);recognizer->add_wmma_option($3);recognizer->add_wmma_option($4);}
 	;
 
 mma_spec: CONFIGURATION LAYOUT LAYOUT scalar_type scalar_type scalar_type scalar_type{recognizer->add_mma_option($1);recognizer->add_mma_option($2);recognizer->add_mma_option($3);}
@@ -961,8 +961,8 @@ mma_mid_option: TCGEN05_KIND_F8F6F4_OPTION { recognizer->add_option(TCGEN05_KIND
 	| TCGEN05_SCALE_VEC_4X_OPTION { recognizer->add_option(TCGEN05_SCALE_VEC_4X_OPTION); }
 	;
 
-vp_spec: WMMA_DIRECTIVE LAYOUT CONFIGURATION{recognizer->add_space_spec(global_space,0);recognizer->add_ptr_spec(global_space);recognizer->add_wmma_option($1);recognizer->add_wmma_option($2);recognizer->add_wmma_option($3);}
-	| WMMA_DIRECTIVE LAYOUT LAYOUT CONFIGURATION{recognizer->add_wmma_option($1);recognizer->add_wmma_option($2);recognizer->add_wmma_option($3);recognizer->add_wmma_option($4);}
+vp_spec: WMMA_DIRECTIVE LAYOUT CONFIGURATION{{ const bool sh = recognizer->take_wmma_shared(); recognizer->add_space_spec(sh ? shared_space : global_space,0);recognizer->add_ptr_spec(sh ? shared_space : global_space); }recognizer->add_wmma_option($1);recognizer->add_wmma_option($2);recognizer->add_wmma_option($3);}
+	| WMMA_DIRECTIVE LAYOUT LAYOUT CONFIGURATION{recognizer->take_wmma_shared();recognizer->add_wmma_option($1);recognizer->add_wmma_option($2);recognizer->add_wmma_option($3);recognizer->add_wmma_option($4);}
 	;
 
 

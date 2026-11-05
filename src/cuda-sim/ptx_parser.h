@@ -140,6 +140,14 @@ class ptx_recognizer {
   // yasai: marks the current instruction as bf16x2 (the type itself is stored as f16x2); no
   // effect outside an instruction (a .reg .bf16x2 declaration).
   void note_bf16x2();
+  // yasai: the lexer saw a wmma shape with .shared or .shared::cta; take_wmma_shared() answers and clears it.
+  void note_wmma_shared() { m_yasai_wmma_shared = true; }
+  bool take_wmma_shared() {
+    const bool s = m_yasai_wmma_shared;
+    m_yasai_wmma_shared = false;
+    return s;
+  }
+  bool m_yasai_wmma_shared = false;  // yasai: see note_wmma_shared()
   // yasai: marks the current instruction's packed small-float format (E4M3X2_TYPE and so on).
   void note_packed_minifloat(int kind);
   void start_function(int entry_point);
