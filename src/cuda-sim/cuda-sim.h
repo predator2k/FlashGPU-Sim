@@ -310,7 +310,7 @@ class yasai_func_run {
   unsigned long m_ctas_issued = 0;   // CTAs started so far (all ranks of started clusters)
   unsigned long m_ctas_skipped = 0;  // CTAs that CTA sampling skipped so far
   unsigned long m_ctas_done = 0;     // CTAs retired so far
-  unsigned m_insn_start = 0;         // process instruction count (g_ptx_sim_num_insn) at start
+  uint64_t m_insn_start = 0;         // process instruction count (g_ptx_sim_num_insn) at start
   double m_start_s = 0;              // monotonic wall time (s) at the kernel's start
   double m_progress_next_s = 0;      // monotonic wall time (s) of the next progress line
   // yasai: YASAI_STALL_STATS maxima over the kernel's retired groups (under m_stall_mu).
@@ -401,7 +401,7 @@ class cuda_sim {
   int cp_count;
   int cp_cta_resume;
   int g_ptxinfo_error_detected;
-  unsigned g_ptx_sim_num_insn;
+  uint64_t g_ptx_sim_num_insn;  // yasai: 64 bits, a run passes 2^32 thread instructions
   char *cdp_latency_str;
   int g_ptx_kernel_count;  // used for classification stat collection purposes
   std::map<const void *, std::string>
