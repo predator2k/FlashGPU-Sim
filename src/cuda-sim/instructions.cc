@@ -1979,9 +1979,9 @@ void atom_callback(const inst_t *inst, ptx_thread_info *thread) {
           break;
         case F32_TYPE:
           {
-            // yasai: atom.add.f32 of a global or generic word flushes subnormal operands and a subnormal result to a zero of their sign, as the PTX ISA says and a GPU does (value sweep,
-            // ptx_key_values2.py: 1e-45 + 1e-45 is 0). atom.shared.add.f32 does not go through here: a GPU keeps its subnormals.
-            const auto flush = [](float x) { return std::fpclassify(x) == FP_SUBNORMAL ? std::copysign(0.0f, x) : x; };
+            // yasai: atom.add.f32 of a global word flushes subnormal operands and a subnormal result to a zero of their sign, as the PTX ISA says and a GPU does (value sweep,
+            // ptx_key_values2.py: 1e-45 + 1e-45 is 0); yasai_rmw::apply does the same for the words of the host window. atom.shared.add.f32 keeps its subnormals on a GPU.
+            const auto flush = [space](float x) { return space != shared_space && std::fpclassify(x) == FP_SUBNORMAL ? std::copysign(0.0f, x) : x; };
             op_result.f32 = flush(flush(data.f32) + flush(src2_data.f32));
           }
           if (std::isnan(op_result.f32)) op_result.u32 = 0x7fffffffu;  // yasai: canonical NaN (yasai_nan)

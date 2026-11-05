@@ -97,6 +97,16 @@ static uint64_t apply1(unsigned op, elem k, unsigned bytes, uint64_t a, uint64_t
         // yasai: NaN results as an RTX 5090 writes them for atom.add (tests/nan_probe.cu): f32, f16 and bf16
         // the canonical NaN; f64 the operand's NaN, else the memory word's, both unquieted, else for an
         // invalid sum 0xfff8000000000000.
+        // yasai: f32 words here are global ones: subnormal operands and a subnormal result flush to a zero of their sign, as the PTX ISA says and a GPU does (value sweep, ptx_key_values2.py).
+        if (k == elem::f32) {
+          const auto flush = [](float v) { return std::fpclassify(v) == FP_SUBNORMAL ? std::copysign(0.0f, v) : v; };
+          const float fx = flush(float(to_f(k, a))), fy = flush(float(to_f(k, b)));
+          const float fr = flush(fx + fy);
+          if (std::isnan(fr)) return 0x7fffffffull;
+          uint32_t u;
+          memcpy(&u, &fr, 4);
+          return u;
+        }
         const double x = to_f(k, a), y = to_f(k, b), r = x + y;
         if (std::isnan(r)) {
           if (k != elem::f64) return k == elem::f32 ? 0x7fffffffull : 0x7fffull;
