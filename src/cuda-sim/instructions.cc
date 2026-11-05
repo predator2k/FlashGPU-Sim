@@ -4525,9 +4525,10 @@ void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     std::memcpy(&fu, &f, 4);
     switch (to_type) {
       case BF16_TYPE:
-        // yasai: the canonical NaN, as an RTX 5090 writes it (yasai_nan); from f64 a GPU writes 0x7fc0 with the source's sign, whatever the payload (value sweep, key_values.cu).
+        // yasai: the canonical NaN, as an RTX 5090 writes it (yasai_nan); from f64 a GPU keeps the source's sign and the top 7 payload bits, and sets the quiet bit (value sweep, key_values.cu:
+        // 0x7ff0363e7f36b443 gives 0x7fc1, 0xfffc2686a136db6f gives 0xffe1).
         if ((fu & 0x7fffffffu) > 0x7f800000u)
-          out.u16 = (from_type == F64_TYPE || from_type == FF64_TYPE) ? uint16_t(0x7fc0u | ((in.u64 >> 48) & 0x8000u)) : uint16_t(0x7fffu);
+          out.u16 = (from_type == F64_TYPE || from_type == FF64_TYPE) ? uint16_t(0x7fc0u | ((in.u64 >> 48) & 0x8000u) | ((in.u64 >> 45) & 0x7fu)) : uint16_t(0x7fffu);
         else
           out.u16 = bf16_bits_from_f32(f, rounding_mode);  // the instruction's rounding; an integer modifier has left an exact value
         break;
