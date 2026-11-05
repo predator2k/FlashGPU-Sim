@@ -27,6 +27,7 @@
 
 #include "mma_trace.h"
 #include "tensor_mma.h"
+#include "yasai_mma_dot.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -198,12 +199,10 @@ void tensor_mma_f16_impl(const ptx_instruction *pI, core_t *core,
   // Step 2: Perform matrix multiplication D = A * B + C
   for (int m = 0; m < M; m++) {
     for (int n = 0; n < N; n++) {
-      float sum = 0.0f;
-      for (int k = 0; k < K; k++) {
-        // A is row-major: A[m][k], B is column-major: B[n][k]
-        sum += A_mat[m * K + k] * B_mat[n * K + k];
-      }
-      D_mat[m * N + n] = sum + C_mat[m * N + n];
+      // A is row-major: A[m][k], B is column-major: B[n][k]. yasai: the GPUs' accumulation (yasai_mma_dot.h).
+      const int min_exp = is_bf16 ? -126 : -14;
+      D_mat[m * N + n] = yasai_mma::dot(
+          K, [&](int k) { return double(A_mat[m * K + k]); }, [&](int k) { return double(B_mat[n * K + k]); }, C_mat[m * N + n], min_exp, min_exp);
     }
   }
 
@@ -359,11 +358,10 @@ void tensor_mma_f16_m8n8k4_impl(const ptx_instruction *pI, core_t *core,
     // D[comp] = A[comp] × B[comp] + C[comp]
     for (int i = 0; i < M; i++) {
       for (int j = 0; j < N; j++) {
-        float sum = C_mat[comp][i * N + j];
-        for (int k = 0; k < K; k++) {
-          sum += A_mat[comp][i * K + k] * B_mat[comp][k * N + j];
-        }
-        D_mat[comp][i * N + j] = sum;
+        // yasai: the GPUs' accumulation (yasai_mma_dot.h).
+        const int min_exp = is_bf16 ? -126 : -14;
+        D_mat[comp][i * N + j] = yasai_mma::dot(
+            K, [&](int k) { return double(A_mat[comp][i * K + k]); }, [&](int k) { return double(B_mat[comp][k * N + j]); }, C_mat[comp][i * N + j], min_exp, min_exp);
       }
     }
   }

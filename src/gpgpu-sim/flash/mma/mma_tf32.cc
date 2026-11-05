@@ -27,6 +27,7 @@
 
 #include "mma_trace.h"
 #include "tensor_mma.h"
+#include "yasai_mma_dot.h"
 
 #include <cstdio>
 
@@ -146,11 +147,9 @@ void tensor_mma_tf32_impl(const ptx_instruction *pI, core_t *core,
   // Step 2: Perform matrix multiplication D = A * B + C
   for (int m = 0; m < M; m++) {
     for (int n = 0; n < N; n++) {
-      float sum = 0.0f;
-      for (int k = 0; k < K; k++) {
-        sum += A_mat[m * K + k] * B_mat[n * K + k];
-      }
-      D_mat[m * N + n] = sum + C_mat[m * N + n];
+      // yasai: the GPUs' accumulation (yasai_mma_dot.h).
+      D_mat[m * N + n] = yasai_mma::dot(
+          K, [&](int k) { return double(A_mat[m * K + k]); }, [&](int k) { return double(B_mat[n * K + k]); }, C_mat[m * N + n], -126, -126);
     }
   }
 

@@ -33,6 +33,7 @@
 
 #include "../../../cuda-sim/yasai_func.h"
 #include "tensor_mma.h"
+#include "yasai_mma_dot.h"
 
 #include <cmath>
 #include <cstdint>
@@ -111,6 +112,19 @@ double yasai_scale_value(int t, unsigned v) {
 
 }  // namespace
 
+// yasai: smallest normal exponent of an mma operand format, for yasai_mma_dot.h. @param t PTX type. @return The exponent.
+static int yasai_sparse_min_exp(unsigned t) {
+  switch (t) {
+    case F16_TYPE: return -14;
+    case E5M2_TYPE: return -14;
+    case E4M3_TYPE: return -6;
+    case E3M2_TYPE: return -2;
+    case E2M3_TYPE: return 0;
+    case E2M1_TYPE: return 0;
+    default: return -126;
+  }
+}
+
 void tensor_mma_sp_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst, int M, int N,
                         int K, unsigned tid) {
   (void)inst;
@@ -169,6 +183,8 @@ void tensor_mma_sp_impl(const ptx_instruction *pI, core_t *core, warp_inst_t ins
   }
 
   std::vector<double> Ap(M * Kp), A(M * K, 0.0), B(K * N), C(M * N);
+  // yasai: selected[m * K + k]: the metadata selects row k of B for row m of A. The others are not terms at all.
+  std::vector<char> selected(M * K, 0);
   std::vector<uint32_t> meta(32);
   const operand_info &oa = pI->operand_lookup(1), &ob = pI->operand_lookup(2),
                      &oc = pI->operand_lookup(3), &oe = pI->operand_lookup(4),
@@ -225,14 +241,19 @@ void tensor_mma_sp_impl(const ptx_instruction *pI, core_t *core, warp_inst_t ins
       const unsigned nib = (meta[lane & 31] >> shift) & 0xF, i0 = nib & 3, i1 = (nib >> 2) & 3;
       if (u_per_e == 2) {  // tf32: one element per chunk of two
         A[m * K + 2 * c + int(i0 / 2)] = Ap[m * Kp + c];
+        selected[m * K + 2 * c + int(i0 / 2)] = 1;
       } else if (e_per_unit == 2) {  // 4-bit pairs
         for (int h = 0; h < 2; h++) {
           A[m * K + 8 * c + 2 * int(i0) + h] = Ap[m * Kp + 4 * c + h];
           A[m * K + 8 * c + 2 * int(i1) + h] = Ap[m * Kp + 4 * c + 2 + h];
+          selected[m * K + 8 * c + 2 * int(i0) + h] = 1;
+          selected[m * K + 8 * c + 2 * int(i1) + h] = 1;
         }
       } else {
         A[m * K + 4 * c + int(i0)] = Ap[m * Kp + 2 * c];
         A[m * K + 4 * c + int(i1)] = Ap[m * Kp + 2 * c + 1];
+        selected[m * K + 4 * c + int(i0)] = 1;
+        selected[m * K + 4 * c + int(i1)] = 1;
       }
     }
   }
@@ -276,10 +297,25 @@ void tensor_mma_sp_impl(const ptx_instruction *pI, core_t *core, warp_inst_t ins
         d.s32 = int32_t(uint32_t(uint64_t(acc)));
         continue;
       }
+      // yasai: without block scales the GPUs' accumulation (yasai_mma_dot.h). A row of B that the metadata leaves out reads as zero here: on both GPUs a NaN or an infinity there does not reach
+      // the result, where the zero of the decompressed A times it would give a NaN.
+      if (!block_scale) {
+        const int min_exp = yasai_sparse_min_exp(atype);
+        const auto b_selected = [&](int k) { return selected[m * K + k] ? B[k * N + n] : 0.0; };
+        if (c_f16)
+          d.u32 = yasai_mma::dot_f16(
+              K, [&](int k) { return A[m * K + k]; }, b_selected, C[m * N + n], min_exp, yasai_sparse_min_exp(btype));
+        else
+          d.f32 = yasai_mma::dot(
+              K, [&](int k) { return A[m * K + k]; }, b_selected, float(C[m * N + n]), min_exp, yasai_sparse_min_exp(btype));
+        continue;
+      }
       double acc = C[m * N + n];
       for (int k = 0; k < K; k++)
         acc += A[m * K + k] * B[k * N + n] * SA[m * sv + k / kblk] * SB[(k / kblk) * N + n];
-      if (c_f16) d.u32 = yasai_func::minifloat_encode_f16(float(acc));
+      // yasai: a NaN result is canonical (value sweep, ptx_key_values2.py).
+      if (c_f16) d.u32 = std::isnan(acc) ? 0x7fffu : yasai_func::minifloat_encode_f16(float(acc));
+      else if (std::isnan(acc)) d.u32 = 0x7fffffffu;
       else d.f32 = float(acc);
     }
   }
