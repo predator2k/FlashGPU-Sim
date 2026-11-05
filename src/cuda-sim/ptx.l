@@ -523,6 +523,7 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.exit   TC; return EXIT_OPTION;
 
 \.abs   TC; return ABS_OPTION;
+\.xorsign   TC; return XORSIGN_OPTION; /* yasai: min/max .xorsign.abs */
 
 \.init  TC; return INIT_OPTION;
 \.inval TC; return INVAL_OPTION;

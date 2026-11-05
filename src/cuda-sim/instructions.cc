@@ -1341,12 +1341,10 @@ void addp_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 }
 
 
-// yasai: packed two-way f16x2 / bf16x2 arithmetic (add, sub, mul, min, max). Each half is
-// computed in f32 and rounded once (.rn unless .rz); .sat clamps to [0, 1], .relu applies to the
-// result. min/max follow PTX: a NaN operand yields the other operand (.NaN variants are not
-// distinguished here).
-// Scalar .bf16 (add/sub/mul/min/max.bf16, FlashMLA SM100 decode) takes the same path with one
-// half.
+// yasai: packed two-way f16x2 / bf16x2 arithmetic (add, sub, mul; min and max are in yasai_minmax).
+// Each half is computed in f32 and rounded once (.rn unless .rz); .sat clamps to [0, 1], .relu
+// applies to the result.
+// Scalar .bf16 (add/sub/mul.bf16, FlashMLA SM100 decode) takes the same path with one half.
 static bool yasai_packed_binop(const ptx_instruction *pI, ptx_thread_info *thread, char op) {
   const bool scalar_bf16 = pI->get_type() == BF16_TYPE;
   if (pI->get_type() != F16X2_TYPE && !scalar_bf16) return false;
@@ -1365,8 +1363,6 @@ static bool yasai_packed_binop(const ptx_instruction *pI, ptx_thread_info *threa
       case '+': v = x + y; break;
       case '-': v = x - y; break;
       case '*': v = x * y; break;
-      case 'm': v = std::isnan(x) ? y : (std::isnan(y) ? x : std::fmin(x, y)); break;
-      case 'M': v = std::isnan(x) ? y : (std::isnan(y) ? x : std::fmax(x, y)); break;
     }
     if (pI->saturation_mode()) v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
     r |= uint32_t(packed_half_from_f32(v, bf16, pI->is_relu(), rm)) << (16 * h);
@@ -5699,8 +5695,142 @@ static ptx_reg_t minmax_f32_pair(ptx_reg_t a, ptx_reg_t b, bool maximum) {
   return a;
 }
 
+// ---- yasai: min and max of the floating-point types -----------------------------------------------
+// As an RTX 5090 and a GB10 compute them (tests/minmax_probe.cu: 64 instructions on every ordered pair or
+// triple of +0, -0, +1.5, -1.5, +2.5, -2.5, a subnormal of each sign, infinities and four NaNs, 56,448
+// lanes, the same on both devices; rules checked by tests/minmax_model.py):
+//   * two operands: a NaN operand gives the other operand, two NaN give the canonical NaN (0x7fffffff,
+//     0x7fff per half; f64 has no .NaN and gives the second operand, quieted); .NaN gives the canonical
+//     NaN for any NaN operand; -0 orders below +0 in either operand order; subnormals are kept (f32 with
+//     .ftz reads them as zeros of their sign through the operand accessor);
+//   * .xorsign.abs compares the magnitudes and gives the result the exclusive or of the operands' sign
+//     bits, a NaN's sign bit included, unless the result is the canonical NaN;
+//   * three operands (f32 only in ptxas 13.0; .abs without .xorsign clears the three signs): NaN operands
+//     are skipped, all NaN give the canonical NaN, .NaN gives it for any NaN operand.
+namespace yasai_minmax {
+
+/// A floating-point format by its bit fields.
+struct format {
+  uint64_t sign, exp, frac;
+};
+constexpr format kF32{0x80000000ull, 0x7f800000ull, 0x007fffffull};
+constexpr format kF64{0x8000000000000000ull, 0x7ff0000000000000ull, 0x000fffffffffffffull};
+constexpr format kF16{0x8000ull, 0x7c00ull, 0x03ffull};
+constexpr format kBF16{0x8000ull, 0x7f80ull, 0x007full};
+
+static inline bool is_nan(uint64_t x, const format &f) {
+  return (x & f.exp) == f.exp && (x & f.frac) != 0;
+}
+
+/// Whether a orders below b as signed values with -0 below +0 (neither is a NaN).
+static inline bool below(uint64_t a, uint64_t b, const format &f) {
+  const bool sa = (a & f.sign) != 0, sb = (b & f.sign) != 0;
+  if (sa != sb) return sa;
+  const uint64_t ma = a & ~f.sign, mb = b & ~f.sign;
+  return sa ? ma > mb : ma < mb;
+}
+
+/// The result bits of a two-operand min or max.
+///   a, b: the operands' bits, f: their format, is_f64: the f64 rule for two NaN
+///   maximum: max rather than min, nan_any: .NaN, xorsign: .xorsign.abs
+static uint64_t pair(uint64_t a, uint64_t b, const format &f, bool is_f64, bool maximum, bool nan_any,
+                     bool xorsign) {
+  const uint64_t s = (a ^ b) & f.sign;
+  if (xorsign) {
+    a &= ~f.sign;
+    b &= ~f.sign;
+  }
+  const bool an = is_nan(a, f), bn = is_nan(b, f);
+  const uint64_t canonical = f.sign - 1;
+  if (an && bn) return is_f64 ? b | ((f.frac + 1) >> 1) : canonical;
+  if (nan_any && (an || bn)) return canonical;
+  uint64_t r;
+  if (an) {
+    r = b;
+  } else if (bn) {
+    r = a;
+  } else {
+    r = (maximum ? below(a, b, f) : below(b, a, f)) ? b : a;
+  }
+  return xorsign ? r | s : r;
+}
+
+/// The result bits of a three-operand f32 min or max (is_abs: .abs).
+static uint32_t triple(uint32_t a, uint32_t b, uint32_t c, bool maximum, bool nan_any, bool is_abs) {
+  uint32_t v[3] = {a, b, c};
+  if (is_abs) {
+    for (uint32_t &x : v) x &= 0x7fffffffu;
+  }
+  bool have = false;
+  uint32_t r = 0;
+  for (uint32_t x : v) {
+    if (is_nan(x, kF32)) {
+      if (nan_any) return 0x7fffffffu;
+      continue;
+    }
+    if (!have || (maximum ? below(r, x, kF32) : below(x, r, kF32))) r = x;
+    have = true;
+  }
+  return have ? r : 0x7fffffffu;
+}
+
+/// Executes min or max for a floating-point type.
+///   pI: the instruction, thread: the executing thread, maximum: max rather than min
+///   return: false when pI's type is not a floating-point type (the integer forms stay in the caller)
+/// Handling: reads the operands, computes each lane, writes the destination.
+/// Emits: nothing.
+static bool exec(const ptx_instruction *pI, ptx_thread_info *thread, bool maximum) {
+  const unsigned t = pI->get_type();
+  const operand_info &dst = pI->dst();
+  const bool nan_any = pI->get_cmpop() == NAN_OPTION, xorsign = pI->is_xorsign();
+  ptx_reg_t d;
+  d.u64 = 0;
+  switch (t) {
+    case F32_TYPE: {
+      const uint32_t a = thread->get_operand_value(pI->src1(), dst, t, thread, 1).u32;
+      const uint32_t b = thread->get_operand_value(pI->src2(), dst, t, thread, 1).u32;
+      if (pI->get_num_operands() == 4) {
+        const uint32_t c = thread->get_operand_value(pI->src3(), dst, t, thread, 1).u32;
+        d.u32 = triple(a, b, c, maximum, nan_any, pI->is_abs());
+      } else {
+        d.u32 = uint32_t(pair(a, b, kF32, false, maximum, nan_any, xorsign));
+      }
+      break;
+    }
+    case F64_TYPE:
+    case FF64_TYPE: {
+      const uint64_t a = thread->get_operand_value(pI->src1(), dst, t, thread, 1).u64;
+      const uint64_t b = thread->get_operand_value(pI->src2(), dst, t, thread, 1).u64;
+      d.u64 = pair(a, b, kF64, true, maximum, nan_any, xorsign);
+      break;
+    }
+    case F16_TYPE:
+    case BF16_TYPE:
+    case F16X2_TYPE: {
+      const bool scalar = t != F16X2_TYPE;
+      const format &f = (t == BF16_TYPE || pI->is_bf16x2()) ? kBF16 : kF16;
+      const unsigned in_type = scalar ? B16_TYPE : B32_TYPE;
+      const uint32_t a = thread->get_operand_value(pI->src1(), dst, in_type, thread, 1).u32;
+      const uint32_t b = thread->get_operand_value(pI->src2(), dst, in_type, thread, 1).u32;
+      for (int h = 0; h < (scalar ? 1 : 2); ++h) {
+        const uint64_t r = pair((a >> (16 * h)) & 0xffffu, (b >> (16 * h)) & 0xffffu, f, false, maximum,
+                                nan_any, xorsign);
+        d.u32 |= uint32_t(r) << (16 * h);
+      }
+      thread->set_operand_value(dst, d, scalar ? B16_TYPE : F16X2_TYPE, thread, pI);
+      return true;
+    }
+    default:
+      return false;
+  }
+  thread->set_operand_value(dst, d, t, thread, pI);
+  return true;
+}
+
+}  // namespace yasai_minmax
+
 void max_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
-  if (yasai_packed_binop(pI, thread, 'M')) return;  // yasai
+  if (yasai_minmax::exec(pI, thread, true)) return;  // yasai
   ptx_reg_t a, b, d;
   const operand_info &dst = pI->dst();
   const operand_info &src1 = pI->src1();
@@ -5729,22 +5859,6 @@ void max_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     case S64_TYPE:
       d.s64 = MY_MAX_I(a.s64, b.s64);
       break;
-    case F32_TYPE:
-      // yasai: +0 above -0 whatever the operand order (MY_MAX_F returned the second of two zeros).
-      d = minmax_f32_pair(a, b, true);
-      if (pI->get_num_operands() == 4) {
-        const ptx_reg_t c =
-            thread->get_operand_value(pI->src3(), dst, i_type, thread, 1);
-        d = minmax_f32_pair(minmax_f32_pair(a, b, true), c, true);
-        if (pI->get_cmpop() == NAN_OPTION && isNaN(c.f32)) d.u32 = 0x7fffffffu;
-      }
-      // yasai: .NaN returns the canonical NaN when an input is NaN (default: the other input).
-      if (pI->get_cmpop() == NAN_OPTION && (isNaN(a.f32) || isNaN(b.f32))) d.u32 = 0x7fffffffu;
-      break;
-    case F64_TYPE:
-    case FF64_TYPE:
-      d.f64 = MY_MAX_F(a.f64, b.f64);
-      break;
     default:
       printf("Execution error: type mismatch with instruction\n");
       assert(0);
@@ -5767,7 +5881,7 @@ void membar_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 }
 
 void min_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
-  if (yasai_packed_binop(pI, thread, 'm')) return;  // yasai
+  if (yasai_minmax::exec(pI, thread, false)) return;  // yasai
   ptx_reg_t a, b, d;
   const operand_info &dst = pI->dst();
   const operand_info &src1 = pI->src1();
@@ -5795,22 +5909,6 @@ void min_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       break;
     case S64_TYPE:
       d.s64 = MY_MIN_I(a.s64, b.s64);
-      break;
-    case F32_TYPE:
-      // yasai: -0 below +0 whatever the operand order (MY_MIN_F returned the second of two zeros).
-      d = minmax_f32_pair(a, b, false);
-      if (pI->get_num_operands() == 4) {
-        const ptx_reg_t c =
-            thread->get_operand_value(pI->src3(), dst, i_type, thread, 1);
-        d = minmax_f32_pair(minmax_f32_pair(a, b, false), c, false);
-        if (pI->get_cmpop() == NAN_OPTION && isNaN(c.f32)) d.u32 = 0x7fffffffu;
-      }
-      // yasai: .NaN returns the canonical NaN when an input is NaN (default: the other input).
-      if (pI->get_cmpop() == NAN_OPTION && (isNaN(a.f32) || isNaN(b.f32))) d.u32 = 0x7fffffffu;
-      break;
-    case F64_TYPE:
-    case FF64_TYPE:
-      d.f64 = MY_MIN_F(a.f64, b.f64);
       break;
     default:
       printf("Execution error: type mismatch with instruction\n");

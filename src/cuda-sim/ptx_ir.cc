@@ -1488,6 +1488,7 @@ ptx_instruction::ptx_instruction(
   m_uni = false;
   m_exit = false;
   m_abs = false;
+  m_xorsign = false;
   m_neg = false;
   m_to_option = false;
   m_cache_option = 0;
@@ -1797,6 +1798,9 @@ ptx_instruction::ptx_instruction(
         break;
       case ABS_OPTION:
         m_abs = true;
+        break;
+      case XORSIGN_OPTION:
+        m_xorsign = true;
         break;
       case NEG_OPTION:
         m_neg = true;
