@@ -1095,6 +1095,23 @@ struct gpgpu_recon_t {
   class ptx_instruction *target_inst;
 };
 
+// yasai: a .callprototype of an indirect call ("<name>: .callprototype (ret) _ (params);"): the
+// byte sizes of its return value and parameters (PTX ISA 9.7.15.1, call). The simulator compares
+// them with the callee's at the call (call_impl).
+struct yasai_call_proto {
+  std::string name;                 ///< label of the declaration
+  bool has_ret = false;             ///< a return value is declared
+  unsigned ret_bytes = 0;           ///< its size in bytes
+  std::vector<unsigned> arg_bytes;  ///< parameter sizes in bytes
+  /// The signature in bytes, for messages: "(4) _ (8, 4)" or "_ ()".
+  std::string text() const;
+};
+// yasai: a .calltargets list of an indirect call ("<name>: .calltargets f1, f2;").
+struct yasai_call_targets {
+  std::string name;                ///< label of the list
+  std::vector<std::string> funcs;  ///< names of the allowed callees
+};
+
 class ptx_instruction : public warp_inst_t {
  public:
   ptx_instruction(int opcode, const symbol *pred, int neg_pred, int pred_mod,
@@ -1370,6 +1387,23 @@ class ptx_instruction : public warp_inst_t {
   // yasai: a weak st (no .release, .relaxed, .acq_rel, .sc, .volatile, .mmio or .async), whose
   // store of zeros over zeros device memory may skip (host_window::try_write).
   bool is_weak_store() const { return m_yasai_weak_store; }
+  // yasai: the name after the arguments of an indirect call ("call %r, (args), <name>;"), or
+  // empty; the parser resolves it at the end of the function body (yasai_resolve_call_tail).
+  const std::string &yasai_call_tail() const { return m_yasai_call_tail; }
+  // yasai: the block (symbol table) the call is in; a prototype is visible in the block that
+  // declares it and in the blocks nested in it.
+  symbol_table *yasai_call_scope() const { return m_yasai_call_scope; }
+  void yasai_set_call_tail(const std::string &name, symbol_table *scope) {
+    m_yasai_call_tail = name;
+    m_yasai_call_scope = scope;
+  }
+  // yasai: the prototype or the target list that the call's tail names (null when none).
+  const yasai_call_proto *yasai_proto() const { return m_yasai_proto; }
+  const yasai_call_targets *yasai_targets() const { return m_yasai_targets; }
+  void yasai_resolve_call_tail(const yasai_call_proto *p, const yasai_call_targets *t) {
+    m_yasai_proto = p;
+    m_yasai_targets = t;
+  }
   // yasai: the packed 16-bit type is bf16x2 (get_type() still answers F16X2_TYPE).
   bool is_bf16x2() const { return m_bf16x2; }
   // yasai: packed small-float format of the instruction (E4M3X2_TYPE, E5M2X2_TYPE, E2M1X2_TYPE,
@@ -1503,6 +1537,10 @@ class ptx_instruction : public warp_inst_t {
   int m_yasai_fuse_slot = -1;                  // yasai: see yasai_fuse_slot()
   bool m_yasai_cluster_scope = false;  // yasai: see has_cluster_scope()
   bool m_yasai_weak_store = false;     // yasai: see is_weak_store()
+  std::string m_yasai_call_tail;                   // yasai: see yasai_call_tail()
+  symbol_table *m_yasai_call_scope = nullptr;      // yasai: see yasai_call_scope()
+  const yasai_call_proto *m_yasai_proto = nullptr;      // yasai: see yasai_proto()
+  const yasai_call_targets *m_yasai_targets = nullptr;  // yasai: see yasai_targets()
   bool m_bf16x2 = false;  // yasai: see is_bf16x2()
   int m_yasai_packed_kind = 0;  // yasai: see packed_minifloat()
   unsigned m_left_mode;
