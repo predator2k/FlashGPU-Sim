@@ -78,169 +78,170 @@ static int parse_wgmma_shape_option(const char *text) {
 %x IN_DEBUG_SECTION
 %%
 
-abs	TC; yylval->int_value = ABS_OP; return OPCODE;
-add	TC; yylval->int_value = ADD_OP; return OPCODE;
-addp	TC; yylval->int_value = ADDP_OP; return OPCODE;
-addc    TC; yylval->int_value = ADDC_OP; return OPCODE;
-and	TC; yylval->int_value = AND_OP; return OPCODE;
-andn	TC; yylval->int_value = ANDN_OP; return OPCODE;
-atom	TC; yylval->int_value = ATOM_OP; return OPCODE;
-bar.warp 	TC; yylval->int_value = NOP_OP; return OPCODE;
+abs	TC; BEGIN(NOT_OPCODE); yylval->int_value = ABS_OP; return OPCODE;
+add	TC; BEGIN(NOT_OPCODE); yylval->int_value = ADD_OP; return OPCODE;
+addp	TC; BEGIN(NOT_OPCODE); yylval->int_value = ADDP_OP; return OPCODE;
+addc    TC; BEGIN(NOT_OPCODE); yylval->int_value = ADDC_OP; return OPCODE;
+and	TC; BEGIN(NOT_OPCODE); yylval->int_value = AND_OP; return OPCODE;
+andn	TC; BEGIN(NOT_OPCODE); yylval->int_value = ANDN_OP; return OPCODE;
+atom	TC; BEGIN(NOT_OPCODE); yylval->int_value = ATOM_OP; return OPCODE;
+bar.warp 	TC; BEGIN(NOT_OPCODE); yylval->int_value = NOP_OP; return OPCODE;
 	/* yasai: nanosleep is a no-op in functional execution; multimem.* operate on the memory every
 	   device bound to a multicast object (NVLS, shared_devmem). */
-nanosleep	TC; yylval->int_value = NOP_OP; return OPCODE;
-multimem\.ld_reduce	TC; yylval->int_value = MULTIMEM_LD_REDUCE_OP; return OPCODE;
-multimem\.red	TC; yylval->int_value = MULTIMEM_RED_OP; return OPCODE;
-multimem\.st	TC; yylval->int_value = MULTIMEM_ST_OP; return OPCODE;
-bar 	TC; yylval->int_value = BAR_OP; return OPCODE;
-barrier	TC; yylval->int_value = BAR_OP; return OPCODE;
-mbarrier 	TC; yylval->int_value = MBAR_OP; return OPCODE;
-cp\.reduce\.async\.bulk TC; yylval->int_value = TMA_OP; return OPCODE;
-cp\.async\.bulk\.prefetch TC; yylval->int_value = TMA_PREFETCH_OP; return OPCODE;
-cp\.async\.bulk TC; yylval->int_value = TMA_OP; return OPCODE;
-cp\.async\.mbarrier\.arrive TC; yylval->int_value = CP_ASYNC_MBARRIER_ARRIVE_OP; return OPCODE;
-cp\.async\.commit_group TC; yylval->int_value = CP_ASYNC_COMMIT_OP; return OPCODE;
-cp\.async\.wait_all TC; yylval->int_value = CP_ASYNC_WAIT_OP; return OPCODE;
-cp\.async 		TC; yylval->int_value = CP_ASYNC_OP; return OPCODE;
-bfe     TC; yylval->int_value = BFE_OP; return OPCODE;
-bfi     TC; yylval->int_value = BFI_OP; return OPCODE;
-bfind   TC; yylval->int_value = BFIND_OP; return OPCODE;
-bra     TC; yylval->int_value = BRA_OP; return OPCODE;
-brx     TC; yylval->int_value = BRX_OP; return OPCODE;
-brev    TC; yylval->int_value = BREV_OP; return OPCODE;
-brkpt   TC; yylval->int_value = BRKPT_OP; return OPCODE;
+nanosleep	TC; BEGIN(NOT_OPCODE); yylval->int_value = NOP_OP; return OPCODE;
+multimem\.ld_reduce	TC; BEGIN(NOT_OPCODE); yylval->int_value = MULTIMEM_LD_REDUCE_OP; return OPCODE;
+multimem\.red	TC; BEGIN(NOT_OPCODE); yylval->int_value = MULTIMEM_RED_OP; return OPCODE;
+multimem\.st	TC; BEGIN(NOT_OPCODE); yylval->int_value = MULTIMEM_ST_OP; return OPCODE;
+bar 	TC; BEGIN(NOT_OPCODE); yylval->int_value = BAR_OP; return OPCODE;
+barrier	TC; BEGIN(NOT_OPCODE); yylval->int_value = BAR_OP; return OPCODE;
+mbarrier 	TC; BEGIN(NOT_OPCODE); yylval->int_value = MBAR_OP; return OPCODE;
+cp\.reduce\.async\.bulk TC; BEGIN(NOT_OPCODE); yylval->int_value = TMA_OP; return OPCODE;
+cp\.async\.bulk\.prefetch TC; BEGIN(NOT_OPCODE); yylval->int_value = TMA_PREFETCH_OP; return OPCODE;
+cp\.async\.bulk TC; BEGIN(NOT_OPCODE); yylval->int_value = TMA_OP; return OPCODE;
+cp\.async\.mbarrier\.arrive TC; BEGIN(NOT_OPCODE); yylval->int_value = CP_ASYNC_MBARRIER_ARRIVE_OP; return OPCODE;
+cp\.async\.commit_group TC; BEGIN(NOT_OPCODE); yylval->int_value = CP_ASYNC_COMMIT_OP; return OPCODE;
+cp\.async\.wait_all TC; BEGIN(NOT_OPCODE); yylval->int_value = CP_ASYNC_WAIT_OP; return OPCODE;
+cp\.async 		TC; BEGIN(NOT_OPCODE); yylval->int_value = CP_ASYNC_OP; return OPCODE;
+bfe     TC; BEGIN(NOT_OPCODE); yylval->int_value = BFE_OP; return OPCODE;
+bfi     TC; BEGIN(NOT_OPCODE); yylval->int_value = BFI_OP; return OPCODE;
+bfind   TC; BEGIN(NOT_OPCODE); yylval->int_value = BFIND_OP; return OPCODE;
+bra     TC; BEGIN(NOT_OPCODE); yylval->int_value = BRA_OP; return OPCODE;
+brx     TC; BEGIN(NOT_OPCODE); yylval->int_value = BRX_OP; return OPCODE;
+brev    TC; BEGIN(NOT_OPCODE); yylval->int_value = BREV_OP; return OPCODE;
+brkpt   TC; BEGIN(NOT_OPCODE); yylval->int_value = BRKPT_OP; return OPCODE;
 
-wmma	TC; yylval->int_value = MMA_OP; return OPCODE;
-wmma\.load	TC; yylval->int_value = MMA_LD_OP; return OPCODE;
-wmma\.store 	TC; yylval->int_value = MMA_ST_OP; return OPCODE;
+wmma	TC; BEGIN(NOT_OPCODE); yylval->int_value = MMA_OP; return OPCODE;
+wmma\.load	TC; BEGIN(NOT_OPCODE); yylval->int_value = MMA_LD_OP; return OPCODE;
+wmma\.store 	TC; BEGIN(NOT_OPCODE); yylval->int_value = MMA_ST_OP; return OPCODE;
 
-mma\.sp::ordered_metadata\.sync\.aligned	TC; yylval->int_value = TENSOR_MMA_OP; return OPCODE; /* yasai: sparse, see mma_sparse.cc */
-mma\.sp\.sync\.aligned	TC; yylval->int_value = TENSOR_MMA_OP; return OPCODE; /* yasai: sparse */
-mma\.sync\.aligned	TC; yylval->int_value = TENSOR_MMA_OP; return OPCODE;
-mma\.sync	TC; yylval->int_value = TENSOR_MMA_OP; return OPCODE;
-wgmma\.mma_async\.sp	TC; yylval->int_value = WGMMA_MMA_ASYNC_SP_OP; return OPCODE;
-wgmma\.mma_async	TC; yylval->int_value = WGMMA_MMA_ASYNC_OP; return OPCODE;
-wgmma\.fence	TC; yylval->int_value = WGMMA_FENCE_OP; return OPCODE;
-wgmma\.commit_group	TC; yylval->int_value = WGMMA_COMMIT_GROUP_OP; return OPCODE;
-wgmma\.wait_group	TC; yylval->int_value = WGMMA_WAIT_GROUP_OP; return OPCODE;
+mma\.sp::ordered_metadata\.sync\.aligned	TC; BEGIN(NOT_OPCODE); yylval->int_value = TENSOR_MMA_OP; return OPCODE; /* yasai: sparse, see mma_sparse.cc */
+mma\.sp\.sync\.aligned	TC; BEGIN(NOT_OPCODE); yylval->int_value = TENSOR_MMA_OP; return OPCODE; /* yasai: sparse */
+mma\.sync\.aligned	TC; BEGIN(NOT_OPCODE); yylval->int_value = TENSOR_MMA_OP; return OPCODE;
+mma\.sync	TC; BEGIN(NOT_OPCODE); yylval->int_value = TENSOR_MMA_OP; return OPCODE;
+wgmma\.mma_async\.sp	TC; BEGIN(NOT_OPCODE); yylval->int_value = WGMMA_MMA_ASYNC_SP_OP; return OPCODE;
+wgmma\.mma_async	TC; BEGIN(NOT_OPCODE); yylval->int_value = WGMMA_MMA_ASYNC_OP; return OPCODE;
+wgmma\.fence	TC; BEGIN(NOT_OPCODE); yylval->int_value = WGMMA_FENCE_OP; return OPCODE;
+wgmma\.commit_group	TC; BEGIN(NOT_OPCODE); yylval->int_value = WGMMA_COMMIT_GROUP_OP; return OPCODE;
+wgmma\.wait_group	TC; BEGIN(NOT_OPCODE); yylval->int_value = WGMMA_WAIT_GROUP_OP; return OPCODE;
 
 call	TC; BEGIN(NOT_OPCODE); yylval->int_value = CALL_OP; return OPCODE; // blocking opcode token in case the callee has the same name as an opcode
 callp   TC; BEGIN(NOT_OPCODE); yylval->int_value = CALLP_OP; return OPCODE;
-clz	TC; yylval->int_value = CLZ_OP; return OPCODE;
-cnot	TC; yylval->int_value = CNOT_OP; return OPCODE;
-cos	TC; yylval->int_value = COS_OP; return OPCODE;
-cvt\.pack	TC; yylval->int_value = CVT_PACK_OP; return OPCODE; /* yasai */
-cvt	TC; yylval->int_value = CVT_OP; return OPCODE;
-cvta	TC; yylval->int_value = CVTA_OP; return OPCODE;
-div	TC; yylval->int_value = DIV_OP; return OPCODE;
-dp4a	TC; yylval->int_value = DP4A_OP; return OPCODE;
-dp2a	TC; yylval->int_value = DP2A_OP; return OPCODE; /* yasai */
-copysign	TC; yylval->int_value = COPYSIGN_OP; return OPCODE; /* yasai */
-lop3	TC; yylval->int_value = LOP3_OP; return OPCODE; /* yasai */
-redux	TC; yylval->int_value = REDUX_OP; return OPCODE; /* yasai */
-bmsk	TC; yylval->int_value = BMSK_OP; return OPCODE; /* yasai */
-ex2	TC; yylval->int_value = EX2_OP; return OPCODE;
-exit	TC; yylval->int_value = EXIT_OP; return OPCODE;
-fma     TC; yylval->int_value = FMA_OP; return OPCODE;
-isspacep TC; yylval->int_value = ISSPACEP_OP; return OPCODE;
-ld      TC; yylval->int_value = LD_OP; return OPCODE;
-ld.volatile TC; yylval->int_value = LD_OP; return OPCODE;
-ldu     TC; yylval->int_value = LDU_OP; return OPCODE;
-lg2	TC; yylval->int_value = LG2_OP; return OPCODE;
-griddepcontrol TC; yylval->int_value = GRIDDEPCONTROL_OP; return OPCODE;
-mad24   TC; yylval->int_value = MAD24_OP; return OPCODE;
-mad     TC; yylval->int_value = MAD_OP; return OPCODE;
-madc	TC; yylval->int_value = MADC_OP; return OPCODE;
-madp	TC; yylval->int_value = MADP_OP; return OPCODE;
-mapa	TC; yylval->int_value = MAPA_OP; return OPCODE;
-max     TC; yylval->int_value = MAX_OP; return OPCODE;
-membar  TC; yylval->int_value = MEMBAR_OP; return OPCODE;
-min     TC; yylval->int_value = MIN_OP; return OPCODE;
-mov     TC; yylval->int_value = MOV_OP; return OPCODE;
-mul24   TC; yylval->int_value = MUL24_OP; return OPCODE;
-mul     TC; yylval->int_value = MUL_OP; return OPCODE;
-neg     TC; yylval->int_value = NEG_OP; return OPCODE;
-nandn   TC; yylval->int_value = NANDN_OP; return OPCODE;
-norn    TC; yylval->int_value = NORN_OP; return OPCODE;
-not     TC; yylval->int_value = NOT_OP; return OPCODE;
-or      TC; yylval->int_value = OR_OP; return OPCODE;
-orn     TC; yylval->int_value = ORN_OP; return OPCODE;
-pmevent TC; yylval->int_value = PMEVENT_OP; return OPCODE;
-popc    TC; yylval->int_value = POPC_OP; return OPCODE;
-prefetch TC; yylval->int_value = PREFETCH_OP; return OPCODE;
-prefetchu TC; yylval->int_value = PREFETCHU_OP; return OPCODE;
-createpolicy TC; yylval->int_value = CREATEPOLICY_OP; return OPCODE; /* yasai: L2 cache policy, functional value 0 */
-prmt    TC; yylval->int_value = PRMT_OP; return OPCODE;
-rcp	TC; yylval->int_value = RCP_OP; return OPCODE;
-red     TC; yylval->int_value = RED_OP; return OPCODE;
-rem	TC; yylval->int_value = REM_OP; return OPCODE;
-ret	TC; yylval->int_value = RET_OP; return OPCODE;
-retp     TC; yylval->int_value = RETP_OP; return OPCODE;
-rsqrt	TC; yylval->int_value = RSQRT_OP; return OPCODE;
-sad     TC; yylval->int_value = SAD_OP; return OPCODE;
-selp	TC; yylval->int_value = SELP_OP; return OPCODE;
-setp    TC; yylval->int_value = SETP_OP; return OPCODE;
-set	TC; yylval->int_value = SET_OP; return OPCODE;
-setmaxnreg	TC; yylval->int_value = SETMAXNREG_OP; return OPCODE;
-shfl	TC; yylval->int_value = SHFL_OP; return OPCODE;
-shf	TC; yylval->int_value = SHF_OP; return OPCODE;
-shl     TC; yylval->int_value = SHL_OP; return OPCODE;
-shr     TC; yylval->int_value = SHR_OP; return OPCODE;
-sin	TC; yylval->int_value = SIN_OP; return OPCODE;
-slct	TC; yylval->int_value = SLCT_OP; return OPCODE;
-sqrt	TC; yylval->int_value = SQRT_OP; return OPCODE;
-sst	TC; yylval->int_value = SST_OP; return OPCODE;
-ssy     TC; yylval->int_value = SSY_OP; return OPCODE;
-st      TC; yylval->int_value = ST_OP; return OPCODE;
-st.volatile TC; yylval->int_value = ST_OP; return OPCODE;
-sub	TC; yylval->int_value = SUB_OP; return OPCODE;
-subc	TC; yylval->int_value = SUBC_OP; return OPCODE;
-suld	TC; yylval->int_value = SULD_OP; return OPCODE;
-sured	TC; yylval->int_value = SURED_OP; return OPCODE;
-surst	TC; yylval->int_value = SUST_OP; return OPCODE;
-suq	TC; yylval->int_value = SUQ_OP; return OPCODE;
-tanh	TC; yylval->int_value = TANH_OP; return OPCODE;
+clz	TC; BEGIN(NOT_OPCODE); yylval->int_value = CLZ_OP; return OPCODE;
+cnot	TC; BEGIN(NOT_OPCODE); yylval->int_value = CNOT_OP; return OPCODE;
+cos	TC; BEGIN(NOT_OPCODE); yylval->int_value = COS_OP; return OPCODE;
+cvt\.pack	TC; BEGIN(NOT_OPCODE); yylval->int_value = CVT_PACK_OP; return OPCODE; /* yasai */
+cvt	TC; BEGIN(NOT_OPCODE); yylval->int_value = CVT_OP; return OPCODE;
+cvta	TC; BEGIN(NOT_OPCODE); yylval->int_value = CVTA_OP; return OPCODE;
+div	TC; BEGIN(NOT_OPCODE); yylval->int_value = DIV_OP; return OPCODE;
+dp4a	TC; BEGIN(NOT_OPCODE); yylval->int_value = DP4A_OP; return OPCODE;
+dp2a	TC; BEGIN(NOT_OPCODE); yylval->int_value = DP2A_OP; return OPCODE; /* yasai */
+copysign	TC; BEGIN(NOT_OPCODE); yylval->int_value = COPYSIGN_OP; return OPCODE; /* yasai */
+lop3	TC; BEGIN(NOT_OPCODE); yylval->int_value = LOP3_OP; return OPCODE; /* yasai */
+redux	TC; BEGIN(NOT_OPCODE); yylval->int_value = REDUX_OP; return OPCODE; /* yasai */
+bmsk	TC; BEGIN(NOT_OPCODE); yylval->int_value = BMSK_OP; return OPCODE; /* yasai */
+ex2	TC; BEGIN(NOT_OPCODE); yylval->int_value = EX2_OP; return OPCODE;
+exit	TC; BEGIN(NOT_OPCODE); yylval->int_value = EXIT_OP; return OPCODE;
+fma     TC; BEGIN(NOT_OPCODE); yylval->int_value = FMA_OP; return OPCODE;
+isspacep TC; BEGIN(NOT_OPCODE); yylval->int_value = ISSPACEP_OP; return OPCODE;
+ld      TC; BEGIN(NOT_OPCODE); yylval->int_value = LD_OP; return OPCODE;
+ld.volatile TC; BEGIN(NOT_OPCODE); yylval->int_value = LD_OP; return OPCODE;
+ldu     TC; BEGIN(NOT_OPCODE); yylval->int_value = LDU_OP; return OPCODE;
+lg2	TC; BEGIN(NOT_OPCODE); yylval->int_value = LG2_OP; return OPCODE;
+griddepcontrol TC; BEGIN(NOT_OPCODE); yylval->int_value = GRIDDEPCONTROL_OP; return OPCODE;
+mad24   TC; BEGIN(NOT_OPCODE); yylval->int_value = MAD24_OP; return OPCODE;
+mad     TC; BEGIN(NOT_OPCODE); yylval->int_value = MAD_OP; return OPCODE;
+madc	TC; BEGIN(NOT_OPCODE); yylval->int_value = MADC_OP; return OPCODE;
+madp	TC; BEGIN(NOT_OPCODE); yylval->int_value = MADP_OP; return OPCODE;
+mapa	TC; BEGIN(NOT_OPCODE); yylval->int_value = MAPA_OP; return OPCODE;
+max     TC; BEGIN(NOT_OPCODE); yylval->int_value = MAX_OP; return OPCODE;
+membar  TC; BEGIN(NOT_OPCODE); yylval->int_value = MEMBAR_OP; return OPCODE;
+min     TC; BEGIN(NOT_OPCODE); yylval->int_value = MIN_OP; return OPCODE;
+mov     TC; BEGIN(NOT_OPCODE); yylval->int_value = MOV_OP; return OPCODE;
+mul24   TC; BEGIN(NOT_OPCODE); yylval->int_value = MUL24_OP; return OPCODE;
+mul     TC; BEGIN(NOT_OPCODE); yylval->int_value = MUL_OP; return OPCODE;
+neg     TC; BEGIN(NOT_OPCODE); yylval->int_value = NEG_OP; return OPCODE;
+nandn   TC; BEGIN(NOT_OPCODE); yylval->int_value = NANDN_OP; return OPCODE;
+norn    TC; BEGIN(NOT_OPCODE); yylval->int_value = NORN_OP; return OPCODE;
+not     TC; BEGIN(NOT_OPCODE); yylval->int_value = NOT_OP; return OPCODE;
+or      TC; BEGIN(NOT_OPCODE); yylval->int_value = OR_OP; return OPCODE;
+orn     TC; BEGIN(NOT_OPCODE); yylval->int_value = ORN_OP; return OPCODE;
+pmevent TC; BEGIN(NOT_OPCODE); yylval->int_value = PMEVENT_OP; return OPCODE;
+popc    TC; BEGIN(NOT_OPCODE); yylval->int_value = POPC_OP; return OPCODE;
+prefetch TC; BEGIN(NOT_OPCODE); yylval->int_value = PREFETCH_OP; return OPCODE;
+prefetchu TC; BEGIN(NOT_OPCODE); yylval->int_value = PREFETCHU_OP; return OPCODE;
+createpolicy TC; BEGIN(NOT_OPCODE); yylval->int_value = CREATEPOLICY_OP; return OPCODE; /* yasai: L2 cache policy, functional value 0 */
+prmt    TC; BEGIN(NOT_OPCODE); yylval->int_value = PRMT_OP; return OPCODE;
+rcp	TC; BEGIN(NOT_OPCODE); yylval->int_value = RCP_OP; return OPCODE;
+red     TC; BEGIN(NOT_OPCODE); yylval->int_value = RED_OP; return OPCODE;
+rem	TC; BEGIN(NOT_OPCODE); yylval->int_value = REM_OP; return OPCODE;
+ret	TC; BEGIN(NOT_OPCODE); yylval->int_value = RET_OP; return OPCODE;
+retp     TC; BEGIN(NOT_OPCODE); yylval->int_value = RETP_OP; return OPCODE;
+rsqrt	TC; BEGIN(NOT_OPCODE); yylval->int_value = RSQRT_OP; return OPCODE;
+sad     TC; BEGIN(NOT_OPCODE); yylval->int_value = SAD_OP; return OPCODE;
+selp	TC; BEGIN(NOT_OPCODE); yylval->int_value = SELP_OP; return OPCODE;
+setp    TC; BEGIN(NOT_OPCODE); yylval->int_value = SETP_OP; return OPCODE;
+set	TC; BEGIN(NOT_OPCODE); yylval->int_value = SET_OP; return OPCODE;
+setmaxnreg	TC; BEGIN(NOT_OPCODE); yylval->int_value = SETMAXNREG_OP; return OPCODE;
+shfl	TC; BEGIN(NOT_OPCODE); yylval->int_value = SHFL_OP; return OPCODE;
+shf	TC; BEGIN(NOT_OPCODE); yylval->int_value = SHF_OP; return OPCODE;
+shl     TC; BEGIN(NOT_OPCODE); yylval->int_value = SHL_OP; return OPCODE;
+shr     TC; BEGIN(NOT_OPCODE); yylval->int_value = SHR_OP; return OPCODE;
+sin	TC; BEGIN(NOT_OPCODE); yylval->int_value = SIN_OP; return OPCODE;
+slct	TC; BEGIN(NOT_OPCODE); yylval->int_value = SLCT_OP; return OPCODE;
+sqrt	TC; BEGIN(NOT_OPCODE); yylval->int_value = SQRT_OP; return OPCODE;
+sst	TC; BEGIN(NOT_OPCODE); yylval->int_value = SST_OP; return OPCODE;
+ssy     TC; BEGIN(NOT_OPCODE); yylval->int_value = SSY_OP; return OPCODE;
+st      TC; BEGIN(NOT_OPCODE); yylval->int_value = ST_OP; return OPCODE;
+st.volatile TC; BEGIN(NOT_OPCODE); yylval->int_value = ST_OP; return OPCODE;
+sub	TC; BEGIN(NOT_OPCODE); yylval->int_value = SUB_OP; return OPCODE;
+subc	TC; BEGIN(NOT_OPCODE); yylval->int_value = SUBC_OP; return OPCODE;
+suld	TC; BEGIN(NOT_OPCODE); yylval->int_value = SULD_OP; return OPCODE;
+sured	TC; BEGIN(NOT_OPCODE); yylval->int_value = SURED_OP; return OPCODE;
+surst	TC; BEGIN(NOT_OPCODE); yylval->int_value = SUST_OP; return OPCODE;
+suq	TC; BEGIN(NOT_OPCODE); yylval->int_value = SUQ_OP; return OPCODE;
+tanh	TC; BEGIN(NOT_OPCODE); yylval->int_value = TANH_OP; return OPCODE;
 tex	TC; BEGIN(NOT_OPCODE); yylval->int_value = TEX_OP; return OPCODE;
-txq	TC; yylval->int_value = TEX_OP; return OPCODE;
-tensormap	TC; yylval->int_value = TENSORMAP_OP; return OPCODE;
-fence	TC; yylval->int_value = FENCE_OP; return OPCODE;
-elect	TC; yylval->int_value = ELECT_OP; return OPCODE;
-ldmatrix	TC; yylval->int_value = LDMATRIX_OP; return OPCODE;
-stmatrix	TC; yylval->int_value = STMATRIX_OP; return OPCODE;
-tcgen05\.relinquish_alloc_permit TC; yylval->int_value = TCGEN05_RELINQUISH_ALLOC_PERMIT_OP; return OPCODE;
-tcgen05\.alloc TC; yylval->int_value = TCGEN05_ALLOC_OP; return OPCODE;
-tcgen05\.dealloc TC; yylval->int_value = TCGEN05_DEALLOC_OP; return OPCODE;
-tcgen05\.mma\.sp TC; recognizer->add_option(TCGEN05_SP_OPTION); yylval->int_value = TCGEN05_MMA_OP; return OPCODE; /* yasai: sparse A */
-tcgen05\.mma\.ws\.sp TC; recognizer->add_option(TCGEN05_WS_OPTION); recognizer->add_option(TCGEN05_SP_OPTION); yylval->int_value = TCGEN05_MMA_OP; return OPCODE; /* yasai: sparse A, weight stationary */
-tcgen05\.mma TC; yylval->int_value = TCGEN05_MMA_OP; return OPCODE;
-tcgen05\.commit TC; yylval->int_value = TCGEN05_COMMIT_OP; return OPCODE;
-tcgen05\.ld TC; yylval->int_value = TCGEN05_LD_OP; return OPCODE;
-tcgen05\.st TC; yylval->int_value = TCGEN05_ST_OP; return OPCODE;
-tcgen05\.wait::st TC; recognizer->add_option(TCGEN05_WAIT_ST_OPTION); yylval->int_value = TCGEN05_WAIT_OP; return OPCODE;
-tcgen05\.wait::ld TC; recognizer->add_option(TCGEN05_WAIT_LD_OPTION); yylval->int_value = TCGEN05_WAIT_OP; return OPCODE;
-tcgen05\.cp TC; yylval->int_value = TCGEN05_CP_OP; return OPCODE;
-tcgen05\.shift TC; yylval->int_value = TCGEN05_SHIFT_OP; return OPCODE;
-tcgen05\.fence TC; yylval->int_value = TCGEN05_FENCE_OP; return OPCODE;
-clusterlaunchcontrol\.try_cancel[a-z0-9_.:]* TC; yylval->int_value = CLC_TRY_CANCEL_OP; return OPCODE; /* yasai */
-clusterlaunchcontrol\.query_cancel\.is_canceled[a-z0-9_.:]* TC; yylval->int_value = CLC_QUERY_IS_CANCELED_OP; return OPCODE; /* yasai */
-clusterlaunchcontrol\.query_cancel\.get_first_ctaid[a-z0-9_.:]* TC; yylval->int_value = CLC_QUERY_FIRST_CTAID_OP; return OPCODE; /* yasai */
-trap	TC; yylval->int_value = TRAP_OP; return OPCODE;
-vabsdiff TC; yylval->int_value = VABSDIFF_OP; return OPCODE;
-vadd    TC; yylval->int_value = VADD_OP; return OPCODE;
-vmad    TC; yylval->int_value = VMAD_OP; return OPCODE;
-vmax    TC; yylval->int_value = VMAX_OP; return OPCODE;
-vmin    TC; yylval->int_value = VMIN_OP; return OPCODE;
-vset    TC; yylval->int_value = VSET_OP; return OPCODE;
-vshl    TC; yylval->int_value = VSHL_OP; return OPCODE;
-vshr    TC; yylval->int_value = VSHR_OP; return OPCODE;
-vsub    TC; yylval->int_value = VSUB_OP; return OPCODE;
-vote	TC; yylval->int_value = VOTE_OP; return OPCODE;
-match	TC; yylval->int_value = MATCH_OP; return OPCODE; /* yasai: match.{any,all}.sync */
-activemask TC; yylval->int_value = ACTIVEMASK_OP; return OPCODE;
-xor     TC; yylval->int_value = XOR_OP; return OPCODE;
-nop     TC; yylval->int_value = NOP_OP; return OPCODE;
-break  TC; yylval->int_value = BREAK_OP; return OPCODE;
-breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
+txq	TC; BEGIN(NOT_OPCODE); yylval->int_value = TEX_OP; return OPCODE;
+tensormap	TC; BEGIN(NOT_OPCODE); yylval->int_value = TENSORMAP_OP; return OPCODE;
+fence	TC; BEGIN(NOT_OPCODE); yylval->int_value = FENCE_OP; return OPCODE;
+elect	TC; BEGIN(NOT_OPCODE); yylval->int_value = ELECT_OP; return OPCODE;
+ldmatrix	TC; BEGIN(NOT_OPCODE); yylval->int_value = LDMATRIX_OP; return OPCODE;
+movmatrix	TC; BEGIN(NOT_OPCODE); yylval->int_value = MOVMATRIX_OP; return OPCODE; /* yasai */
+stmatrix	TC; BEGIN(NOT_OPCODE); yylval->int_value = STMATRIX_OP; return OPCODE;
+tcgen05\.relinquish_alloc_permit TC; BEGIN(NOT_OPCODE); yylval->int_value = TCGEN05_RELINQUISH_ALLOC_PERMIT_OP; return OPCODE;
+tcgen05\.alloc TC; BEGIN(NOT_OPCODE); yylval->int_value = TCGEN05_ALLOC_OP; return OPCODE;
+tcgen05\.dealloc TC; BEGIN(NOT_OPCODE); yylval->int_value = TCGEN05_DEALLOC_OP; return OPCODE;
+tcgen05\.mma\.sp TC; BEGIN(NOT_OPCODE); recognizer->add_option(TCGEN05_SP_OPTION); yylval->int_value = TCGEN05_MMA_OP; return OPCODE; /* yasai: sparse A */
+tcgen05\.mma\.ws\.sp TC; BEGIN(NOT_OPCODE); recognizer->add_option(TCGEN05_WS_OPTION); recognizer->add_option(TCGEN05_SP_OPTION); yylval->int_value = TCGEN05_MMA_OP; return OPCODE; /* yasai: sparse A, weight stationary */
+tcgen05\.mma TC; BEGIN(NOT_OPCODE); yylval->int_value = TCGEN05_MMA_OP; return OPCODE;
+tcgen05\.commit TC; BEGIN(NOT_OPCODE); yylval->int_value = TCGEN05_COMMIT_OP; return OPCODE;
+tcgen05\.ld TC; BEGIN(NOT_OPCODE); yylval->int_value = TCGEN05_LD_OP; return OPCODE;
+tcgen05\.st TC; BEGIN(NOT_OPCODE); yylval->int_value = TCGEN05_ST_OP; return OPCODE;
+tcgen05\.wait::st TC; BEGIN(NOT_OPCODE); recognizer->add_option(TCGEN05_WAIT_ST_OPTION); yylval->int_value = TCGEN05_WAIT_OP; return OPCODE;
+tcgen05\.wait::ld TC; BEGIN(NOT_OPCODE); recognizer->add_option(TCGEN05_WAIT_LD_OPTION); yylval->int_value = TCGEN05_WAIT_OP; return OPCODE;
+tcgen05\.cp TC; BEGIN(NOT_OPCODE); yylval->int_value = TCGEN05_CP_OP; return OPCODE;
+tcgen05\.shift TC; BEGIN(NOT_OPCODE); yylval->int_value = TCGEN05_SHIFT_OP; return OPCODE;
+tcgen05\.fence TC; BEGIN(NOT_OPCODE); yylval->int_value = TCGEN05_FENCE_OP; return OPCODE;
+clusterlaunchcontrol\.try_cancel[a-z0-9_.:]* TC; BEGIN(NOT_OPCODE); yylval->int_value = CLC_TRY_CANCEL_OP; return OPCODE; /* yasai */
+clusterlaunchcontrol\.query_cancel\.is_canceled[a-z0-9_.:]* TC; BEGIN(NOT_OPCODE); yylval->int_value = CLC_QUERY_IS_CANCELED_OP; return OPCODE; /* yasai */
+clusterlaunchcontrol\.query_cancel\.get_first_ctaid[a-z0-9_.:]* TC; BEGIN(NOT_OPCODE); yylval->int_value = CLC_QUERY_FIRST_CTAID_OP; return OPCODE; /* yasai */
+trap	TC; BEGIN(NOT_OPCODE); yylval->int_value = TRAP_OP; return OPCODE;
+vabsdiff TC; BEGIN(NOT_OPCODE); yylval->int_value = VABSDIFF_OP; return OPCODE;
+vadd    TC; BEGIN(NOT_OPCODE); yylval->int_value = VADD_OP; return OPCODE;
+vmad    TC; BEGIN(NOT_OPCODE); yylval->int_value = VMAD_OP; return OPCODE;
+vmax    TC; BEGIN(NOT_OPCODE); yylval->int_value = VMAX_OP; return OPCODE;
+vmin    TC; BEGIN(NOT_OPCODE); yylval->int_value = VMIN_OP; return OPCODE;
+vset    TC; BEGIN(NOT_OPCODE); yylval->int_value = VSET_OP; return OPCODE;
+vshl    TC; BEGIN(NOT_OPCODE); yylval->int_value = VSHL_OP; return OPCODE;
+vshr    TC; BEGIN(NOT_OPCODE); yylval->int_value = VSHR_OP; return OPCODE;
+vsub    TC; BEGIN(NOT_OPCODE); yylval->int_value = VSUB_OP; return OPCODE;
+vote	TC; BEGIN(NOT_OPCODE); yylval->int_value = VOTE_OP; return OPCODE;
+match	TC; BEGIN(NOT_OPCODE); yylval->int_value = MATCH_OP; return OPCODE; /* yasai: match.{any,all}.sync */
+activemask TC; BEGIN(NOT_OPCODE); yylval->int_value = ACTIVEMASK_OP; return OPCODE;
+xor     TC; BEGIN(NOT_OPCODE); yylval->int_value = XOR_OP; return OPCODE;
+nop     TC; BEGIN(NOT_OPCODE); yylval->int_value = NOP_OP; return OPCODE;
+break  TC; BEGIN(NOT_OPCODE); yylval->int_value = BREAK_OP; return OPCODE;
+breakaddr  TC; BEGIN(NOT_OPCODE); yylval->int_value = BREAKADDR_OP; return OPCODE;
 
 "CPTX_END"	printf("ENDING CUSTOM PTX.\n"); BEGIN(IN_COMMENT);
 
@@ -258,6 +259,10 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.m8n32k16\.global TC;  yylval->int_value = M8N32K16; return CONFIGURATION;
 
 \.m16n16k16\.shared TC; yylval->int_value = M16N16K16; return CONFIGURATION;
+	/* yasai: .shared::cta is .shared (PTX ISA: .shared without a sub-qualifier defaults to ::cta) */
+\.m16n16k16\.shared::cta TC; yylval->int_value = M16N16K16; return CONFIGURATION;
+\.m32n8k16\.shared::cta TC; yylval->int_value = M32N8K16; return CONFIGURATION;
+\.m8n32k16\.shared::cta TC;  yylval->int_value = M8N32K16; return CONFIGURATION;
 \.m32n8k16\.shared TC; yylval->int_value = M32N8K16; return CONFIGURATION;
 \.m8n32k16\.shared TC;  yylval->int_value = M8N32K16; return CONFIGURATION;
 
@@ -310,7 +315,7 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.explicitcluster TC; return EXPLICITCLUSTER_DIRECTIVE; /* yasai */
 \.param  TC; return PARAM_DIRECTIVE;
 \.pragma TC; return PRAGMA_DIRECTIVE;
-\.reg    TC; return REG_DIRECTIVE;
+\.reg    TC; if (YY_START == INITIAL) BEGIN(NOT_OPCODE); return REG_DIRECTIVE; /* yasai: a declared register may spell an opcode (.reg .b32 neg) */
 \.reqntid TC; return REQNTID_DIRECTIVE;
 \.section TC; return SECTION_DIRECTIVE;
 \.section[ \t]+\.debug_[a-z]+ TC; BEGIN(IN_DEBUG_SECTION); /* skip debug sections */
@@ -419,6 +424,7 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.e4m3x2  TC;  return E4M3X2_TYPE;
 \.e5m2x2  TC;  return E5M2X2_TYPE;
 \.e2m1x2  TC;  return E2M1X2_TYPE;
+\.e2m1x4  TC;  return E2M1X4_TYPE; /* yasai: cvt.rs (b16 storage) */
 \.e2m3x2  TC;  return E2M3X2_TYPE;
 \.e3m2x2  TC;  return E3M2X2_TYPE;
 \.ue8m0x2  TC;  return UE8M0X2_TYPE;
@@ -489,6 +495,7 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 
 \.rn	TC; return RN_OPTION;
 \.rz	TC; return RZ_OPTION;
+\.rs	TC; return RS_OPTION; /* yasai: cvt.rs (stochastic rounding), parsed only */
 \.rm	TC; return RM_OPTION;
 \.rp	TC; return RP_OPTION;
 
@@ -528,6 +535,10 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.init  TC; return INIT_OPTION;
 \.inval TC; return INVAL_OPTION;
 \.m8n8 TC; return M8N8_OPTION;
+\.m8n16 TC; return M8N16_OPTION; /* yasai: ldmatrix .b8x16.b4x16_p64 */
+\.b8x16 TC; return B8X16_OPTION;
+\.b4x16_p64 TC; return B4X16_P64_OPTION;
+\.b6x16_p32 TC; return B6X16_P32_OPTION;
 \.trans TC; return TRANS_OPTION;
 \.x1 TC; return X1_OPTION;
 \.x2 TC; return X2_OPTION;
@@ -640,6 +651,7 @@ breakaddr  TC; yylval->int_value = BREAKADDR_OP; return OPCODE;
 \.b1024 TC; return B1024_TYPE;
 ::generic TC; return GENERIC_OPTION;
 \.proxy TC; return PROXY_OPTION;
+\.alias TC; return IGNORED_OPTION; /* yasai: fence.proxy.alias, a fence as the other proxy fences */
 \.async TC; return ASYNC_OPTION;
 \.tensormap TC; return TENSORMAP_OPTION;
 \.read TC; return READ_OPTION;

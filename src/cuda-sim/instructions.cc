@@ -2233,6 +2233,34 @@ void ldmatrix_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
   handle_ldmatrix_inst(pI, core, inst);
 }
 
+// yasai: movmatrix.sync.aligned.m8n8.trans.b16 d, a: the warp's 8x8 matrix of b16 elements (lane
+// 4 * r + c holds row r, columns 2c and 2c + 1, low half first) transposed; lane 4 * r + c receives
+// elements (2c, r) and (2c + 1, r) of the source, low half first (an RTX 5090 and a GB10 give this for
+// distinct elements, tests/gaps_m1.cu). Executed once per warp (tensorcore_op), reading every lane's
+// source before any destination is written, so that d may equal a.
+void movmatrix_impl(const ptx_instruction *pI, core_t *core, warp_inst_t inst) {
+  const unsigned tid0 =
+      (core->get_gpu()->is_functional_sim() ? inst.warp_id_func() : inst.warp_id()) *
+      core->get_warp_size();
+  const operand_info &dst = pI->dst();
+  const operand_info &src = pI->src1();
+  uint16_t m[8][8];
+  for (unsigned lane = 0; lane < 32; lane++) {
+    ptx_thread_info *t = core->get_thread_info()[tid0 + lane];
+    const uint32_t a = t->get_operand_value(src, dst, B32_TYPE, t, 1).u32;
+    m[lane / 4][2 * (lane % 4)] = uint16_t(a);
+    m[lane / 4][2 * (lane % 4) + 1] = uint16_t(a >> 16);
+  }
+  for (unsigned lane = 0; lane < 32; lane++) {
+    ptx_thread_info *t = core->get_thread_info()[tid0 + lane];
+    const unsigned r = lane / 4, c = lane % 4;
+    ptx_reg_t d;
+    d.u64 = 0;
+    d.u32 = uint32_t(m[2 * c][r]) | (uint32_t(m[2 * c + 1][r]) << 16);
+    t->set_operand_value(dst, d, B32_TYPE, t, pI);
+  }
+}
+
 void stmatrix_impl(const ptx_instruction *pI, core_t *core, warp_inst_t &inst) {
   handle_stmatrix_inst(pI, core, inst);
 }
@@ -4064,6 +4092,18 @@ void ptx_saturate(ptx_reg_t &data, int saturation_mode, int type) {
 }
 
 void cvt_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
+  // yasai: cvt.rs (stochastic rounding with a random-bits operand, PTX ISA 8.7) is parsed so that a
+  // module holding it loads, but its rounding has no reference here: the GB10 (sm_121a) driver rejects
+  // the PTX (CUDA_ERROR_INVALID_PTX), so the result cannot be measured locally. The semantics are not
+  // guessed; executing it stops.
+  if (pI->rounding_mode() == RS_OPTION) {
+    fprintf(stderr,
+            "yasai-cvt-rs: %s:%u: %s: cvt.rs (stochastic rounding) has no GPU reference on the local GPUs; "
+            "its semantics are not implemented\n",
+            pI->source_file(), pI->source_line(), pI->get_source());
+    fflush(stderr);
+    abort();
+  }
   const operand_info &dst = pI->dst();
   const operand_info &src1 = pI->src1();
   unsigned to_type = pI->get_type();

@@ -112,6 +112,7 @@ class ptx_recognizer;
 %token  E4M3X2_TYPE
 %token  E5M2X2_TYPE
 %token  E2M1X2_TYPE
+%token  E2M1X4_TYPE
 %token  E2M3X2_TYPE
 %token  E3M2X2_TYPE
 %token  UE8M0X2_TYPE
@@ -186,6 +187,7 @@ class ptx_recognizer;
 %token <int_value> WGMMA_SHAPE
 %token RN_OPTION
 %token RZ_OPTION
+%token RS_OPTION
 %token RM_OPTION
 %token RP_OPTION
 %token RNI_OPTION
@@ -309,6 +311,10 @@ class ptx_recognizer;
 %token	MBARRIER_INIT_OPTION;
 %token	SYNC_RESTRICT_OPTION;
 %token	M8N8_OPTION;
+%token	M8N16_OPTION;
+%token	B8X16_OPTION;
+%token	B4X16_P64_OPTION;
+%token	B6X16_P32_OPTION;
 %token	TRANS_OPTION;
 %token	X1_OPTION;
 %token	X2_OPTION;
@@ -595,6 +601,7 @@ scalar_type: S8_TYPE { recognizer->add_scalar_type_spec( S8_TYPE ); }
 	| E3M2X2_TYPE { recognizer->add_scalar_type_spec( B16_TYPE ); recognizer->note_packed_minifloat(E3M2X2_TYPE); }
 	| UE8M0X2_TYPE { recognizer->add_scalar_type_spec( B16_TYPE ); recognizer->note_packed_minifloat(UE8M0X2_TYPE); }
 	| E2M1X2_TYPE { recognizer->add_scalar_type_spec( B8_TYPE ); recognizer->note_packed_minifloat(E2M1X2_TYPE); }
+	| E2M1X4_TYPE { recognizer->add_scalar_type_spec( B16_TYPE ); recognizer->note_packed_minifloat(E2M1X4_TYPE); }
 	| E5M2_TYPE  { recognizer->add_scalar_type_spec( E5M2_TYPE ); }
 	| E2M1_TYPE  { recognizer->add_scalar_type_spec( E2M1_TYPE ); }
 	| E2M3_TYPE  { recognizer->add_scalar_type_spec( E2M3_TYPE ); }
@@ -815,6 +822,10 @@ option: type_spec
 	| MBARRIER_INIT_OPTION { recognizer->add_option(MBARRIER_INIT_OPTION); }
 	| SYNC_RESTRICT_OPTION { recognizer->add_option(SYNC_RESTRICT_OPTION); } /* yasai: fence is a no-op here */
 	| M8N8_OPTION { recognizer->add_option(M8N8_OPTION); }
+	| M8N16_OPTION { recognizer->add_option(M8N16_OPTION); }
+	| B8X16_OPTION { recognizer->add_option(B8X16_OPTION); }
+	| B4X16_P64_OPTION { recognizer->add_option(B4X16_P64_OPTION); }
+	| B6X16_P32_OPTION { recognizer->add_option(B6X16_P32_OPTION); }
 	| TRANS_OPTION { recognizer->add_option(TRANS_OPTION); }
 	| X1_OPTION { recognizer->add_option(X1_OPTION); }
 	| X2_OPTION { recognizer->add_option(X2_OPTION); }
@@ -886,6 +897,7 @@ floating_point_rounding_mode: RN_OPTION { recognizer->add_option(RN_OPTION); }
 	| RZ_OPTION { recognizer->add_option(RZ_OPTION); }
 	| RM_OPTION { recognizer->add_option(RM_OPTION); }
 	| RP_OPTION { recognizer->add_option(RP_OPTION); }
+	| RS_OPTION { recognizer->add_option(RS_OPTION); }
 	;
 
 integer_rounding_mode: RNI_OPTION { recognizer->add_option(RNI_OPTION); }

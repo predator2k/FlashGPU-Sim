@@ -1688,6 +1688,7 @@ ptx_instruction::ptx_instruction(
       case E4M3X2_TYPE:  // yasai: markers from ptx_recognizer::note_packed_minifloat
       case E5M2X2_TYPE:
       case E2M1X2_TYPE:
+      case E2M1X4_TYPE:  // yasai: cvt.rs.satfinite.e2m1x4.f32 (stopped at execution)
       case E2M3X2_TYPE:
       case E3M2X2_TYPE:
       case UE8M0X2_TYPE:
@@ -1720,6 +1721,7 @@ ptx_instruction::ptx_instruction(
       case RZ_OPTION:
       case RM_OPTION:
       case RP_OPTION:
+      case RS_OPTION:  // yasai: cvt.rs (stochastic rounding), stopped at execution (cvt_impl)
         m_rounding_mode = last_ptx_inst_option;
         m_yasai_rnd_explicit = true;  // yasai: see has_rounding_modifier()
         break;
@@ -1881,6 +1883,10 @@ ptx_instruction::ptx_instruction(
         m_yasai_cluster_scope = true;
         break;
       case M8N8_OPTION:
+      case M8N16_OPTION:      // yasai: ldmatrix .m8n16.b8x16.b4x16_p64 (ld_st_matrix.cc)
+      case B8X16_OPTION:
+      case B4X16_P64_OPTION:
+      case B6X16_P32_OPTION:
       case MBARRIER_INIT_OPTION:
       case SYNC_RESTRICT_OPTION:  // yasai: fence.*.sync_restrict (fence is a no-op)
       case TRANS_OPTION:
@@ -1944,6 +1950,8 @@ ptx_instruction::ptx_instruction(
     }
   }
   m_scalar_type = scalar_type;
+  // yasai: ldmatrix .b8x16.b4x16_p64 names formats instead of a type; its elements are bytes.
+  if (opcode == LDMATRIX_OP && m_scalar_type.empty()) m_scalar_type.push_back(B8_TYPE);
 
   /**
    * TMA instructions has no scalar type. Make it b64 by default.
