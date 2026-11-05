@@ -33,6 +33,7 @@
 #include <cstring>
 #include "instructions.h"
 #include "yasai_func.h"
+#include "yasai_stall.h"
 #include "../gpgpu-sim/flash/mma/mma_trace.h"
 #include "../gpgpu-sim/flash/mma/tensor_mma.h"
 #include "half.h"
@@ -2092,7 +2093,13 @@ void atom_callback(const inst_t *inst, ptx_thread_info *thread) {
   // Write operation result into  memory
   // (i.e. copy src1_data to dst)
   if (data_ready) {
-    mem->write(effective_address, size / 8, &op_result.s64, thread, pI);
+    {
+      // yasai: an atomic is progress only when it changed the value (yasai_stall.h): a failed
+      // compare-and-swap, an add of 0 or an exchange with the same value is not.
+      yasai_stall::rmw_scope rs;
+      mem->write(effective_address, size / 8, &op_result.s64, thread, pI);
+    }
+    if (memcmp(&data.s64, &op_result.s64, size / 8) != 0) yasai_stall::note();
   } else {
     printf("Execution error: data_ready not set\n");
     assert(0);
@@ -2363,6 +2370,7 @@ void tcgen05_ld_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
 
 void tcgen05_st_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   flash_gpgpu_sim::handle_tcgen05_st_inst(pI, thread);
+  yasai_stall::note();  // yasai: a store to tensor memory is progress (yasai_stall.h)
 }
 
 void tcgen05_wait_impl(const ptx_instruction *pI, ptx_thread_info *thread) {

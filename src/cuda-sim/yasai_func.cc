@@ -1,6 +1,7 @@
 // yasai additions to the functional simulation mode: statistics, FP value skipping and CTA
 // sampling. See yasai_func.h for the environment switches.
 #include "yasai_func.h"
+#include "yasai_stall.h"
 
 #include <shared_mutex>
 
@@ -519,6 +520,7 @@ void mbar_try_advance(MbarState &m) {
   if (m.pending <= 0 && m.tx == 0) {
     m.phase++;
     m.pending = m.expected;
+    yasai_stall::note();  // a completed mbarrier phase is progress (yasai_stall.h)
   }
 }
 
