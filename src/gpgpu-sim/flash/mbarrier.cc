@@ -334,15 +334,19 @@ bool is_tcgen05_mbarrier_arrive_one(const ptx_instruction *pI) {
 } // namespace
 
 // yasai: the state destination of mbarrier.arrive (CuTe DSL writes "mbarrier.arrive.expect_tx
-// %rd, [bar], tx"). Only phase-parity waits are modeled, and they do not read the state, so a
-// zero token is written; a wait on a state token (test_wait/try_wait without .parity) stops at
-// its own assertion.
-//   pI: the arrive instruction; thread: the arriving thread
-static void yasai_write_arrive_state(const ptx_instruction *pI, ptx_thread_info *thread) {
+// %rd, [bar], tx"; NCCL 2.30 "mbarrier.arrive.shared.b64 %rd, [bar]" with a later try_wait on it).
+// The state is the number of the phase the arrival belongs to (the phase before this arrival is
+// counted); try_wait without .parity waits for that phase, so its parity is the state's low bit. A
+// GPU's state is opaque; programs only pass it back to the wait. The functional model keeps the
+// phase (yasai_func::mbar_phase); the timing model does not, so there a zero state is written and a
+// wait on a state stops (handle_mbarrier_inst).
+//   pI: the arrive instruction; thread: the arriving thread; phase: the phase to write
+static void yasai_write_arrive_state(const ptx_instruction *pI, ptx_thread_info *thread,
+                                     uint32_t phase) {
   const operand_info &state_op = pI->dst();
   if (state_op.name() == "_") return;
   ptx_reg_t token;
-  token.u64 = 0;
+  token.u64 = phase;
   thread->set_operand_value(state_op, token, B64_TYPE, thread, pI);
 }
 
@@ -444,8 +448,11 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
   // yasai: in the pure functional mode the timing model's barrier_set_t does
   // not run, so the mbarrier state is kept by yasai_func and try_wait writes
   // its predicate here. The per-lane info below is still recorded unchanged.
+  uint32_t arrive_phase = 0;  // yasai: the state an arrive writes (yasai_write_arrive_state)
   if (thread->isInFunctionalSimulationMode()) {
     const uint64_t cta_key = ctaid;
+    if (bar_op == ARRIVE_OPTION || bar_op == EXPECT_TX_OPTION)
+      arrive_phase = yasai_func::mbar_phase(cta_key, bar_addr);
     if (bar_op == INIT_OPTION) {
       yasai_func::mbar_init(cta_key, bar_addr, get_u32_value(pI->src1()));
     } else if (bar_op == TRY_WAIT_OPTION) {
@@ -502,7 +509,14 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
     set_thread_mbarrier_info(addr, expected_count, false);
   } else if (bar_op == TRY_WAIT_OPTION) {
 
-    assert(pI->parity_op() && "Only support parity op of mbarrier.try_wait");
+    // yasai: without .parity the third operand is the state of an arrive (its phase number); the
+    // functional model above waits on its low bit like a parity. The timing model keeps no phase in
+    // the state.
+    if (!pI->parity_op() && !thread->isInFunctionalSimulationMode()) {
+      fprintf(stderr, "yasai-mbar: %s: try_wait on a state is not implemented in the timing model\n",
+              pI->to_string().c_str());
+      abort();
+    }
 
     assert((pI->get_num_operands() == 3 || pI->get_num_operands() == 4) &&
            "mbarrier.try_wait expects predicate, address, parity, and optional "
@@ -561,7 +575,7 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
     auto expected_tx_count = 0;
     if (is_arrive && is_expect_tx) {
       assert(pI->get_num_operands() == 3);
-      yasai_write_arrive_state(pI, thread);
+      yasai_write_arrive_state(pI, thread, arrive_phase);
 
       addr = bar_addr;
       expected_tx_count = get_u32_value(pI->src2());
@@ -578,7 +592,7 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
 
     } else if (is_arrive) {
       assert(pI->get_num_operands() == 3 || pI->get_num_operands() == 2);
-      yasai_write_arrive_state(pI, thread);
+      yasai_write_arrive_state(pI, thread, arrive_phase);
 
       addr = bar_addr;
       if (pI->get_num_operands() == 3) {
