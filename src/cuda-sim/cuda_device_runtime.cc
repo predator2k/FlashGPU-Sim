@@ -1,6 +1,7 @@
 // Jin: cuda_device_runtime.cc
 // Defines CUDA device runtime APIs for CDP support
 
+#include "yasai_strict_addr.h"
 #include <iostream>
 #include <map>
 #include <cstdlib>
@@ -80,6 +81,7 @@ void cuda_device_runtime::gpgpusim_cuda_getParameterBufferV2(
   // get total child kernel argument size and malloc buffer in global memory
   unsigned child_kernel_arg_size = child_kernel_entry->get_args_aligned_size();
   void *param_buffer = thread->get_gpu()->gpu_malloc(child_kernel_arg_size);
+  yasai_strict_addr::note_internal((uint64_t)param_buffer, child_kernel_arg_size);
   g_total_param_size += ((child_kernel_arg_size + 255) / 256 * 256);
   DEV_RUNTIME_REPORT("child kernel arg size total "
                      << child_kernel_arg_size

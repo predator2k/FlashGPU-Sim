@@ -171,6 +171,7 @@ typedef enum CUoutput_mode_enum {
 #include "../src/cuda-sim/cuda-sim.h"
 #include "../src/cuda-sim/host_window.h"
 #include "../src/cuda-sim/shared_devmem.h"
+#include "../src/cuda-sim/yasai_strict_addr.h"
 #include "../src/cuda-sim/yasai_lazy.h"
 #include "../src/cuda-sim/yasai_module_scope.h"
 #include "yasai_fatbin_units.h"
@@ -415,9 +416,25 @@ static stream_manager *yasai_stream_manager(gpgpu_context *ctx) {
 // copy_ of every parameter, PyTorch's IPC storage deleter closed the handle at once, and 17 of 18
 // parameters became zero). With host synchronization on (CUDA_LAUNCH_BLOCKING or
 // YASAI_STREAM_ZERO_HOST_SYNC) nothing is queued and nothing is waited for.
-void yasai_wait_before_unmap() {
+// yasai: when queued operations use [lo, lo + bytes) (a copy or memset
+// whose device side overlaps it, or a kernel with a parameter word that points into it), one line
+// names the call, the range and their number before the wait (the CUDA recorder does not record
+// these calls, so this line is what shows that a run met the race).
+//   call: the API; lo, bytes: the range it removes (bytes 0: unknown, nothing is counted)
+void yasai_wait_before_unmap(const char *call, uint64_t lo, size_t bytes) {
   gpgpu_context *ctx = GPGPU_Context();
-  if (!yasai_stream_manager(ctx)->yasai_host_sync()) yasai_stream_manager(ctx)->yasai_wait_device();
+  stream_manager *sm = yasai_stream_manager(ctx);
+  if (sm->yasai_host_sync()) return;
+  if (bytes) {
+    unsigned copies = 0, kernels = 0;
+    sm->yasai_count_users(lo, lo + bytes, &copies, &kernels);
+    if (copies + kernels)
+      fprintf(stderr,
+              "yasai-unmap-wait: %s [0x%llx, +%zu) waits for %u queued operations that use it "
+              "(%u copies or memsets, %u kernels by parameter)\n",
+              call, (unsigned long long)lo, bytes, copies + kernels, copies, kernels);
+  }
+  sm->yasai_wait_device();
 }
 
 // yasai: runtime functions defined further down that the driver forwards and their helpers
@@ -1885,7 +1902,10 @@ cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx
       return g_last_cudaError = (cudaError_t)720;  // cudaErrorCooperativeLaunchTooLarge
     }
     unsigned long long ws = yasai_func::grid_ws_take();
-    if (ws == 0) ws = (unsigned long long)device_gpu->gpu_malloc(64);
+    if (ws == 0) {
+      ws = (unsigned long long)device_gpu->gpu_malloc(64);
+      yasai_strict_addr::note_internal(ws, 64);  // yasai: a storage allocation of its own
+    }
     grid->set_yasai_cooperative(true, ws);
   }
 
@@ -2066,6 +2086,7 @@ cudaMallocPitchInternal(void **devPtr, size_t *pitch, size_t width,
   CUctx_st *context = GPGPUSim_Context(ctx);
   *devPtr = context->get_device()->get_gpgpu()->gpu_malloc(
       malloc_width_inbytes * height);
+  yasai_strict_addr::note_internal((uint64_t)*devPtr, malloc_width_inbytes * height);
   pitch[0] = malloc_width_inbytes;
   if (*devPtr) {
     return g_last_cudaError = cudaSuccess;
@@ -2107,6 +2128,7 @@ cudaError_t cudaHostGetDevicePointerInternal(void **pDevice, void *pHost,
   assert(i != ctx->api->pinned_memory_size.end());
   size_t size = i->second;
   *pDevice = gpu->gpu_malloc(size);
+  yasai_strict_addr::note_internal((uint64_t)*pDevice, size);
   if (g_debug_execution >= 3) {
     printf("GPGPU-Sim PTX: cudaMallocing %zu bytes starting at 0x%llx..\n",
            size, (unsigned long long)*pDevice);
@@ -2148,6 +2170,8 @@ __host__ cudaError_t CUDARTAPI cudaMallocArrayInternal(
   printf("GPGPU-Sim PTX: cudaMallocArray: devPtr32 = %d\n",
          ((*array)->devPtr32));
   ((*array)->devPtr) = (void *)(long long)((*array)->devPtr32);
+  // yasai: the array is used at its truncated 32-bit address (existing behaviour, unchanged).
+  yasai_strict_addr::note_internal((uint64_t)(*array)->devPtr, size);
   if (((*array)->devPtr)) {
     return g_last_cudaError = cudaSuccess;
   } else {
@@ -2586,6 +2610,7 @@ cudaError_t cudaGLMapBufferObjectInternal(void **devPtr, GLuint bufferObj,
     glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_SIZE, &buffer_size);
     assert(buffer_size != 0);
     *devPtr = context->get_device()->get_gpgpu()->gpu_malloc(buffer_size);
+    yasai_strict_addr::note_internal((uint64_t)*devPtr, buffer_size);
 
     // create entry and insert to front of list
     glbmap_entry_t *n = (glbmap_entry_t *)calloc(1, sizeof(glbmap_entry_t));
@@ -3680,6 +3705,7 @@ uint64_t cudaMallocSST(void **devPtr, size_t size) {
   void **test_malloc2 = &test_malloc;
   CUctx_st *context = GPGPUSim_Context(GPGPU_Context());
   *test_malloc2 = context->get_device()->get_gpgpu()->gpu_malloc(size);
+  yasai_strict_addr::note_internal((uint64_t)*test_malloc2, size);
   printf("GPGPU-Sim PTX: cudaMallocing %zu bytes starting at 0x%llx..\n", size,
          (unsigned long long)*test_malloc2);
   if (g_debug_execution >= 3)
@@ -3760,8 +3786,12 @@ __host__ cudaError_t CUDARTAPI cudaFree(void *devPtr) {
   }
   // yasai: cudaFree synchronizes the device implicitly, as in CUDA: kernels and copies queued
   // before it may still use the allocation, now that their launches do not block the host.
-  gpgpu_context *ctx = GPGPU_Context();
-  if (!yasai_stream_manager(ctx)->yasai_host_sync()) yasai_stream_manager(ctx)->yasai_wait_device();
+  {
+    uint64_t fb = 0;
+    size_t fs = 0;
+    if (!shared_devmem::range_of(reinterpret_cast<uint64_t>(devPtr), &fb, &fs)) fs = 0;
+    yasai_wait_before_unmap("cudaFree", fb, fs);
+  }
   yasai_free_now(devPtr);
   return g_last_cudaError = cudaSuccess;
 }
@@ -3772,8 +3802,10 @@ __host__ cudaError_t CUDARTAPI cudaFreeHost(void *ptr) {
   // yasai: synchronizes the device implicitly, as cudaFree does: queued copies may still use the
   // pinned buffer.
   if (ptr != NULL) {
-    gpgpu_context *ctx = GPGPU_Context();
-    if (!yasai_stream_manager(ctx)->yasai_host_sync()) yasai_stream_manager(ctx)->yasai_wait_device();
+    const uint64_t a = reinterpret_cast<uint64_t>(ptr);
+    const size_t n = host_window::size_at(a);
+    yasai_wait_before_unmap("cudaFreeHost", a, n);
+    if (n) yasai_strict_addr::note_freed(a, n, "cudaFreeHost");
   }
   host_window::remove(reinterpret_cast<uint64_t>(ptr));
   free(ptr);  // this will crash the system if called twice
@@ -11045,7 +11077,13 @@ __host__ cudaError_t CUDARTAPI cudaIpcGetEventHandle(cudaIpcEventHandle_t *handl
 
 __host__ cudaError_t CUDARTAPI cudaIpcCloseMemHandle(void *devPtr) {
   // yasai: work queued before the close may still read or write the mapping.
-  yasai_wait_before_unmap();
+  {
+    shared_devmem::phys *mp = nullptr;
+    uint64_t mb = 0;
+    size_t ms = 0, mo = 0;
+    if (!shared_devmem::mapping_at(reinterpret_cast<uint64_t>(devPtr), &mp, &mb, &ms, &mo)) ms = 0;
+    yasai_wait_before_unmap("cudaIpcCloseMemHandle", mb, ms);
+  }
   if (!yasai_vmm::ipc_close_mem_handle(reinterpret_cast<uint64_t>(devPtr)))
     return g_last_cudaError = cudaErrorInvalidValue;
   return g_last_cudaError = cudaSuccess;
@@ -11184,7 +11222,9 @@ __host__ cudaError_t CUDARTAPI cudaGetDriverEntryPointByVersion(
 __host__ cudaError_t CUDARTAPI cudaHostUnregister(void *ptr) {
   // yasai: undoes cudaHostRegister, after the work queued before it, which may still access the
   // range through its device address.
-  yasai_wait_before_unmap();
+  const size_t n = host_window::size_at(reinterpret_cast<uint64_t>(ptr));
+  yasai_wait_before_unmap("cudaHostUnregister", reinterpret_cast<uint64_t>(ptr), n);
+  if (n) yasai_strict_addr::note_freed(reinterpret_cast<uint64_t>(ptr), n, "cudaHostUnregister");
   if (!host_window::remove(reinterpret_cast<uint64_t>(ptr)))
     return g_last_cudaError = cudaErrorHostMemoryNotRegistered;
   GPGPU_Context()->api->pinned_memory_size.erase(ptr);

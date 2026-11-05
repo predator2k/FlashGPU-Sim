@@ -177,6 +177,11 @@ void note_alloc(uint64_t base, size_t size);
 /// @return True when an allocation started at base.
 bool forget_alloc(uint64_t base);
 
+/// Whether the calling thread holds this module's lock (yasai_strict_addr's guard: a lookup
+/// from a thread that holds it would wait for itself).
+/// @return True while a function of this module that holds the lock runs on this thread.
+bool lock_held_by_this_thread();
+
 /// Finds the allocation or mapping that holds `addr`.
 /// @param addr Any device address.
 /// @param base Receives the first address.
@@ -184,6 +189,19 @@ bool forget_alloc(uint64_t base);
 /// @return True when addr lies in a known allocation or mapping.
 bool range_of(uint64_t addr, uint64_t *base, size_t *size);
 
+/// The allocations or mappings nearest to `addr`: the one with the largest first address not
+/// above `addr`, and the one with the smallest first address above it (for illegal-address
+/// reports and the mapping-granularity margin, yasai_strict_addr).
+/// @param addr Any address.
+/// @param below_base Receives the first address of the one below (or at) addr.
+/// @param below_size Receives its length (the requested size of an allocation).
+/// @param below_map Receives whether it is a mapping (cuMemMap, IPC import) rather than an allocation.
+/// @param above_base Receives the first address of the one above addr.
+/// @param above_size Receives its length.
+/// @param above_map Receives whether it is a mapping.
+/// @return Bit 0 set when one below was found, bit 1 when one above was found.
+int neighbors(uint64_t addr, uint64_t *below_base, size_t *below_size, bool *below_map,
+              uint64_t *above_base, size_t *above_size, bool *above_map);
 /// Finds the allocation or mapping that holds `addr`, as range_of, and tells whether it is shared
 /// with another process (it has a segment: exported, opened from another process, created with
 /// YASAI_DEVMEM_EAGER_MEMFD=1, or bound to a multicast object) or private to this process

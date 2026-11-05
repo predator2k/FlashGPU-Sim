@@ -25,6 +25,7 @@
 
 #include "host_window.h"
 #include "fio_window.h"
+#include "yasai_strict_addr.h"
 
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000  // Linux 4.17 and later
@@ -130,6 +131,26 @@ state &st() {
   static state *s = new state;
   return *s;
 }
+
+/// yasai: how many devmem_lock objects of this thread hold st().mu (0 or 1; st().mu is not
+/// recursive). yasai_strict_addr reads it through lock_held_by_this_thread().
+thread_local int t_mu_depth = 0;
+
+/// Holds st().mu while it lives and counts it in t_mu_depth, so that the illegal-address check,
+/// which looks addresses up in this registry, can stop with a message instead of waiting on the
+/// lock its own thread holds.
+struct devmem_lock {
+  devmem_lock() {
+    st().mu.lock();
+    ++t_mu_depth;
+  }
+  ~devmem_lock() {
+    --t_mu_depth;
+    st().mu.unlock();
+  }
+  devmem_lock(const devmem_lock &) = delete;
+  devmem_lock &operator=(const devmem_lock &) = delete;
+};
 
 /// Rounds n up to a multiple of a (a power of two).
 /// @param n Value.
@@ -471,7 +492,7 @@ bool convert_phys_locked(phys *p) {
 /// @param p Object, or nullptr.
 /// @return True when a conversion of p would copy.
 bool phys_needs_copy(phys *p) {
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   return p && st().live.count(p) && p->anon && p->anon_va;
 }
 
@@ -482,7 +503,7 @@ bool phys_needs_copy(phys *p) {
 bool convert_phys(phys *p) {
   std::unique_ptr<quiesce> q;
   if (phys_needs_copy(p)) q.reset(new quiesce);
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   return convert_phys_locked(p);
 }
 
@@ -493,6 +514,7 @@ bool convert_phys(phys *p) {
 void after_fork_child() {
   state &s = st();
   new (&s.mu) std::mutex();  // the parent may have held it
+  t_mu_depth = 0;
   new_token();
   for (auto &kv : s.allocs) {
     allocation &a = kv.second;
@@ -579,14 +601,14 @@ bool alloc_device(uint64_t va, size_t size) {
       if (r != MAP_FAILED) munmap(r, len);
       return false;
     }
-    std::lock_guard<std::mutex> lock(st().mu);
+    devmem_lock lock;
     host_window::add(va, len, host_window::range_kind::device);
     st().allocs[va] = allocation{size ? size : 1, nullptr, true};
     return true;
   }
   int fd = new_memfd(len);
   if (fd < 0) return false;
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   if (!place_locked(va, len, 0, fd, true, false)) {
     close(fd);
     return false;
@@ -600,14 +622,14 @@ phys *create(size_t size) {
   const size_t len = round_up(size ? size : 1, kGranularity);
   if (!eager_memfd()) {
     // No segment until the object is shared, pinned or mapped twice (convert_phys_locked).
-    std::lock_guard<std::mutex> lock(st().mu);
+    devmem_lock lock;
     phys *p = wrap_locked(-1, len);
     p->anon = true;
     return p;
   }
   int fd = new_memfd(len);
   if (fd < 0) return nullptr;
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   return wrap_locked(fd, len);
 }
 
@@ -631,7 +653,7 @@ phys *import_fd(int fd) {
         munmap(m, sizeof(mc_header));
     }
   }
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   phys *p = wrap_locked(d, size_t(sb.st_size));
   p->imported = true;
   if (h) {
@@ -653,13 +675,13 @@ void retain(phys *p) {
 
 void release(phys *p) {
   if (!p) return;
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   release_locked(p);
 }
 
 phys *from_handle(uint64_t handle) {
   phys *p = reinterpret_cast<phys *>(handle);
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   return st().live.count(p) ? p : nullptr;
 }
 
@@ -687,7 +709,7 @@ bool map(uint64_t va, size_t size, size_t offset, phys *p) {
   // second or partial mapping gives it its segment first (the quiesce comes before st().mu).
   std::unique_ptr<quiesce> q;
   if (phys_needs_copy(p)) q.reset(new quiesce);
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   if (p->multicast) {
     host_window::add(va, size, host_window::range_kind::multicast, p, offset);
   } else if (p->anon && !p->anon_va && offset == 0 && size == p->size) {
@@ -714,14 +736,14 @@ bool unmap(uint64_t va, size_t size) {
   // a later mapping: it gets its segment before the anonymous pages go away.
   phys *ap = nullptr;
   {
-    std::lock_guard<std::mutex> lock(st().mu);
+    devmem_lock lock;
     auto it = st().maps.find(va);
     if (it != st().maps.end() && it->second.p->anon && it->second.p->anon_va == va &&
         it->second.p->refs.load() > 1)
       ap = it->second.p;
   }
   if (ap) convert_phys(ap);
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   state &s = st();
   auto it = s.maps.find(va);
   if (it == s.maps.end()) return false;
@@ -737,11 +759,12 @@ bool unmap(uint64_t va, size_t size) {
   }
   s.maps.erase(it);
   release_locked(p);
+  yasai_strict_addr::note_freed(va, len, "cuMemUnmap or cudaIpcCloseMemHandle");
   return true;
 }
 
 bool mapping_at(uint64_t va, phys **p, uint64_t *base, size_t *size, size_t *offset) {
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   auto &m = st().maps;
   auto it = m.upper_bound(va);
   if (it == m.begin()) return false;
@@ -755,12 +778,12 @@ bool mapping_at(uint64_t va, phys **p, uint64_t *base, size_t *size, size_t *off
 }
 
 void note_alloc(uint64_t base, size_t size) {
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   st().allocs[base] = allocation{size, nullptr, false};
 }
 
 bool forget_alloc(uint64_t base) {
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   state &s = st();
   auto it = s.allocs.find(base);
   if (it == s.allocs.end()) return false;
@@ -774,12 +797,15 @@ bool forget_alloc(uint64_t base) {
     host_window::remove(base);
     munmap(reinterpret_cast<void *>(base), round_up(it->second.size, kPage));
   }
+  yasai_strict_addr::note_freed(base, it->second.size, "cudaFree");
   s.allocs.erase(it);
   return true;
 }
 
+bool lock_held_by_this_thread() { return t_mu_depth > 0; }
+
 bool range_of(uint64_t addr, uint64_t *base, size_t *size) {
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   state &s = st();
   auto ia = s.allocs.upper_bound(addr);
   if (ia != s.allocs.begin()) {
@@ -802,8 +828,48 @@ bool range_of(uint64_t addr, uint64_t *base, size_t *size) {
   return false;
 }
 
+int neighbors(uint64_t addr, uint64_t *below_base, size_t *below_size, bool *below_map,
+              uint64_t *above_base, size_t *above_size, bool *above_map) {
+  devmem_lock lock;
+  state &s = st();
+  int got = 0;
+  // Below: the larger first address of the two candidates (allocations, mappings).
+  auto ia = s.allocs.upper_bound(addr);
+  auto im = s.maps.upper_bound(addr);
+  if (ia != s.allocs.begin()) {
+    auto p = std::prev(ia);
+    *below_base = p->first;
+    *below_size = p->second.size;
+    *below_map = false;
+    got |= 1;
+  }
+  if (im != s.maps.begin()) {
+    auto p = std::prev(im);
+    if (!(got & 1) || p->first > *below_base) {
+      *below_base = p->first;
+      *below_size = p->second.size;
+      *below_map = true;
+      got |= 1;
+    }
+  }
+  // Above: the smaller first address of the two candidates.
+  if (ia != s.allocs.end()) {
+    *above_base = ia->first;
+    *above_size = ia->second.size;
+    *above_map = false;
+    got |= 2;
+  }
+  if (im != s.maps.end() && (!(got & 2) || im->first < *above_base)) {
+    *above_base = im->first;
+    *above_size = im->second.size;
+    *above_map = true;
+    got |= 2;
+  }
+  return got;
+}
+
 bool private_range_of(uint64_t addr, uint64_t *base, size_t *size, bool *shared) {
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   state &s = st();
   auto ia = s.allocs.upper_bound(addr);
   if (ia != s.allocs.begin()) {
@@ -835,7 +901,7 @@ bool ipc_export(uint64_t addr, const read_fn &read_old, std::string *ref, uint64
   // converts.
   std::unique_ptr<quiesce> q;
   if (range_needs_copy(addr, 1)) q.reset(new quiesce);
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   state &s = st();
   auto it = s.allocs.upper_bound(addr);
   if (it == s.allocs.begin()) return false;
@@ -862,10 +928,16 @@ bool ipc_export(uint64_t addr, const read_fn &read_old, std::string *ref, uint64
       return false;
     }
     std::vector<char> buf(kCopyChunk);
-    for (size_t off = 0; off < a.size; off += kCopyChunk) {
-      const size_t n = std::min(kCopyChunk, a.size - off);
-      read_old(b + off, n, buf.data());
-      copy_nonzero(static_cast<char *>(tmp) + off, buf.data(), n);
+    {
+      // yasai: read_old reads the global space, whose illegal-address check would look the
+      // address up in this registry under st().mu, which this thread holds; the reads lie in
+      // this allocation, so the check passes them without a lookup.
+      yasai_strict_addr::own_scope own(b, a.size);
+      for (size_t off = 0; off < a.size; off += kCopyChunk) {
+        const size_t n = std::min(kCopyChunk, a.size - off);
+        read_old(b + off, n, buf.data());
+        copy_nonzero(static_cast<char *>(tmp) + off, buf.data(), n);
+      }
     }
     munmap(tmp, len);
     if (!place_locked(b, len, 0, fd, true, false)) {
@@ -916,7 +988,7 @@ std::vector<std::pair<uint64_t, uint64_t>> discard_anon_pages(uint64_t addr, siz
   const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
   const uint64_t end = addr + bytes;
   {
-    std::lock_guard<std::mutex> lock(st().mu);
+    devmem_lock lock;
     state &s = st();
     auto add = [&](uint64_t first, uint64_t size) {
       const uint64_t lo = std::max(first, addr), hi = std::min(first + size, end);
@@ -947,7 +1019,7 @@ std::vector<std::pair<uint64_t, uint64_t>> discard_anon_pages(uint64_t addr, siz
 }
 
 bool range_needs_copy(uint64_t addr, size_t bytes) {
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   state &s = st();
   const uint64_t end = addr + (bytes ? bytes : 1);
   auto it = s.allocs.upper_bound(addr);
@@ -964,7 +1036,7 @@ bool range_needs_copy(uint64_t addr, size_t bytes) {
 bool share_range(uint64_t addr, size_t bytes) {
   init_once();
   quiesce q;  // before st().mu (lock order)
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   state &s = st();
   auto it = s.allocs.upper_bound(addr);
   if (it != s.allocs.begin()) --it;
@@ -987,7 +1059,7 @@ bool ipc_open(const char *ref, size_t size, uint64_t va) {
     fprintf(stderr, "shared_devmem: cannot open IPC segment %s: %s\n", ref, strerror(errno));
     return false;
   }
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   const size_t len = round_up(size, kPage);
   if (!place_locked(va, len, 0, fd, true, true)) {
     close(fd);
@@ -1033,7 +1105,7 @@ phys *mc_create(unsigned num_devices, size_t size) {
   hdr->size = round_up(size, kGranularity);
   hdr->num_devices = num_devices;
   __atomic_store_n(&hdr->magic, kMcMagic, __ATOMIC_RELEASE);
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   phys *p = wrap_locked(fd, size_t(hdr->size));
   p->multicast = true;
   p->hdr = hdr;
@@ -1085,7 +1157,7 @@ int mc_targets(void *mcv, uint64_t off, size_t bytes, uint64_t *addrs, int max) 
   for (unsigned spins = 0;; spins++) {
     int n = 0;
     {
-      std::lock_guard<std::mutex> lock(st().mu);
+      devmem_lock lock;
       uint32_t ns = __atomic_load_n(&mc->hdr->nslots, __ATOMIC_ACQUIRE);
       for (uint32_t i = 0; i < ns && int(i) < kMaxMcSlots && n < max; i++) {
         mc_slot &sl = mc->hdr->slots[i];
@@ -1109,7 +1181,7 @@ int mc_targets(void *mcv, uint64_t off, size_t bytes, uint64_t *addrs, int max) 
 uint64_t mc_local_target(void *mcv, uint64_t off, size_t bytes) {
   phys *mc = static_cast<phys *>(mcv);
   if (!mc || !mc->hdr) return 0;
-  std::lock_guard<std::mutex> lock(st().mu);
+  devmem_lock lock;
   const uint64_t me = st().token;
   uint64_t first = 0;
   uint32_t ns = __atomic_load_n(&mc->hdr->nslots, __ATOMIC_ACQUIRE);

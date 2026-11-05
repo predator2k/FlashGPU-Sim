@@ -303,6 +303,14 @@ class stream_operation {
   /// yasai: whether the operation can run now: a wait for an event whose awaited record has not
   /// completed cannot; every other operation can.
   bool yasai_ready() const;
+  /// yasai: whether the operation uses device memory in [lo, hi): a copy or memset whose device
+  /// side overlaps it, or a kernel with an 8-byte-aligned parameter word that points into it (a
+  /// pointer reached only through memory is not seen).
+  /// @param lo First address.
+  /// @param hi End address.
+  /// @param kernel Receives whether the operation is a kernel launch.
+  /// @return True when it uses the range.
+  bool yasai_uses(uint64_t lo, uint64_t hi, bool *kernel);
 
  private:
   uint64_t m_yasai_seq = 0;          ///< yasai: host-order sequence number
@@ -340,6 +348,12 @@ struct CUstream_st {
   stream_operation next();
   void cancel_front();  // front operation fails, cancle the pending status
   stream_operation &front() { return m_operations.front(); }
+  /// yasai: counts the queued operations of this stream that use [lo, hi) (yasai_uses).
+  /// @param lo First address.
+  /// @param hi End address.
+  /// @param copies Incremented per copy or memset.
+  /// @param kernels Incremented per kernel.
+  void yasai_count_users(uint64_t lo, uint64_t hi, unsigned *copies, unsigned *kernels);
   void print(FILE *fp);
   unsigned get_uid() const { return m_uid; }
   /// yasai: sequence number of the front operation (the running or the next one).
@@ -408,6 +422,13 @@ class stream_manager {
   /// stream, the blocking and the non-blocking streams) has completed: the implicit device
   /// synchronization of cudaFree. Operations pushed after the call are not waited for.
   void yasai_wait_device();
+  /// yasai: counts the queued operations of every stream that use [lo, hi) (CUstream_st::
+  /// yasai_count_users), for the log line before a mapping is removed.
+  /// @param lo First address.
+  /// @param hi End address.
+  /// @param copies Receives the copies and memsets.
+  /// @param kernels Receives the kernels.
+  void yasai_count_users(uint64_t lo, uint64_t hi, unsigned *copies, unsigned *kernels);
   /// yasai: the stream an application handle denotes: NULL and cudaStreamLegacy (0x1) give
   /// NULL (the legacy default stream), cudaStreamPerThread (0x2) gives the calling thread's own
   /// blocking stream, and other handles are returned unchanged.

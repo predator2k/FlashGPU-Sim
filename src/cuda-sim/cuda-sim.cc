@@ -31,6 +31,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "host_window.h"
+#include "yasai_strict_addr.h"
 #include "shared_devmem.h"
 #include "cuda-sim.h"
 #include <shared_mutex>
@@ -1013,6 +1014,7 @@ void gpgpu_t::memcpy_to_gpu(size_t dst_start_addr, const void *src,
   {
     host_window::copy_zero_skip_scope copy;  // yasai: zero-over-zero pieces may be skipped
     shared_devmem::exec_scope work;  // yasai: no conversion during the copy
+    yasai_strict_addr::copy_scope what("a host-to-device copy");
     m_global_mem->write(dst_start_addr, count, src, NULL, NULL);
   }
 
@@ -1034,6 +1036,7 @@ void gpgpu_t::memcpy_from_gpu(void *dst, size_t src_start_addr, size_t count) {
   unsigned char *dst_data = (unsigned char *)dst;
   // yasai: pending deferred kernels that write the range run first (yasai_lazy.h).
   yasai_lazy::observe(src_start_addr, count, 0, 0);
+  yasai_strict_addr::copy_scope what("a device-to-host copy");
   m_global_mem->read(src_start_addr, count, dst_data);
 
   // Copy into the performance model.
@@ -1057,6 +1060,7 @@ void gpgpu_t::memcpy_gpu_to_gpu(size_t dst, size_t src, size_t count) {
   yasai_lazy::observe(src, count, dst, count);  // yasai: see memcpy_to_gpu
   host_window::copy_zero_skip_scope copy;  // yasai: zero-over-zero pages may be skipped
   shared_devmem::exec_scope work;          // yasai: no conversion during the copy
+  yasai_strict_addr::copy_scope what("a device-to-device copy");
   // yasai: the copy goes in pieces of at most kYasaiCopyChunk bytes through one bounce buffer
   // (it went byte by byte: 374 MB took 18 s). Each piece is one read and one write of the
   // global space, which split an access at host_window range boundaries, so a piece may cross
@@ -1087,6 +1091,7 @@ void gpgpu_t::gpu_memset(size_t dst_start_addr, int c, size_t count) {
   yasai_lazy::observe(0, 0, dst_start_addr, count);  // yasai: see memcpy_to_gpu
   host_window::copy_zero_skip_scope copy;  // yasai: zero-over-zero pages may be skipped
   shared_devmem::exec_scope work;          // yasai: no conversion during the memset
+  yasai_strict_addr::copy_scope what("a memset");
   // yasai: in pieces of at most kYasaiCopyChunk bytes from one filled buffer, as
   // memcpy_gpu_to_gpu does (it went byte by byte, with an unsigned counter).
   const std::vector<unsigned char> buf(std::min(count, kYasaiCopyChunk), c_value);
@@ -2929,6 +2934,8 @@ void ptx_thread_info::ptx_exec_inst(warp_inst_t &inst, unsigned lane_id) {
   assert(pc ==
          inst.pc);  // make sure timing model and functional model are in sync
   const ptx_instruction *pI = m_func_info->get_dyn_inst(pc);
+  // yasai: names this thread and instruction in illegal-address reports.
+  yasai_strict_addr::inst_scope strict_ctx(this, pI);
 
   set_npc(pc + pI->inst_size());
 

@@ -34,6 +34,9 @@
 #include "gpgpusim_entrypoint.h"
 #include "yasai_realtime.h"
 #include "cuda-sim/fio_window.h"
+#include "cuda-sim/memory.h"
+#include "cuda-sim/ptx_ir.h"
+#include "kernel_info.h"
 
 #include <unistd.h>
 #include <atomic>
@@ -694,6 +697,56 @@ void stream_manager::yasai_wait_stream(CUstream_st *handle, uint64_t seq) {
     if (!busy) return;
     yasai_backoff(&us);
   }
+}
+
+bool stream_operation::yasai_uses(uint64_t lo, uint64_t hi, bool *kernel) {
+  *kernel = false;
+  auto overlaps = [&](uint64_t a, size_t n) { return n && a < hi && a + n > lo; };
+  switch (m_type) {
+    case stream_memcpy_host_to_device:
+    case stream_memset:
+      return overlaps(m_device_address_dst, m_cnt);
+    case stream_memcpy_device_to_host:
+      return overlaps(m_device_address_src, m_cnt);
+    case stream_memcpy_device_to_device:
+      return overlaps(m_device_address_src, m_cnt) || overlaps(m_device_address_dst, m_cnt);
+    case stream_kernel_launch: {
+      if (!m_kernel || !m_kernel->entry()) return false;
+      *kernel = true;
+      const function_info *f = m_kernel->entry();
+      for (unsigned i = 0; i < f->num_args(); i++) {
+        const symbol *s = f->get_arg(i);
+        if (!s->has_valid_address()) continue;
+        const uint64_t a0 = s->get_address(), a1 = a0 + s->get_size_in_bytes();
+        for (uint64_t o = (a0 + 7) & ~7ull; o + 8 <= a1; o += 8) {
+          uint64_t v = 0;
+          m_kernel->get_param_memory()->read(o, 8, &v);
+          if (v >= lo && v < hi) return true;
+        }
+      }
+      return false;
+    }
+    default:
+      return false;
+  }
+}
+
+void CUstream_st::yasai_count_users(uint64_t lo, uint64_t hi, unsigned *copies,
+                                    unsigned *kernels) {
+  pthread_mutex_lock(&m_lock);
+  for (stream_operation &op : m_operations) {
+    bool k = false;
+    if (op.yasai_uses(lo, hi, &k)) ++*(k ? kernels : copies);
+  }
+  pthread_mutex_unlock(&m_lock);
+}
+
+void stream_manager::yasai_count_users(uint64_t lo, uint64_t hi, unsigned *copies,
+                                       unsigned *kernels) {
+  pthread_mutex_lock(&m_lock);
+  m_stream_zero.yasai_count_users(lo, hi, copies, kernels);
+  for (CUstream_st *s : m_streams) s->yasai_count_users(lo, hi, copies, kernels);
+  pthread_mutex_unlock(&m_lock);
 }
 
 void stream_manager::yasai_wait_device() {
