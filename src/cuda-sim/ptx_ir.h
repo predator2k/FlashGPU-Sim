@@ -1850,6 +1850,18 @@ class function_info {
   }
   // yasai: component i (0..2) of the required cluster shape.
   unsigned req_cluster_dim(int i) const { return m_yasai_req_cluster[i]; }
+  // yasai: the kernel's .reqntid shape (a launch with another thread block fails).
+  void set_req_ntid(unsigned x, unsigned y, unsigned z) {
+    m_yasai_req_ntid[0] = x;
+    m_yasai_req_ntid[1] = y;
+    m_yasai_req_ntid[2] = z;
+  }
+  // yasai: component i (0..2) of the .reqntid shape; 0 without the directive.
+  unsigned req_ntid(int i) const { return m_yasai_req_ntid[i]; }
+  // yasai: the kernel's .maxclusterrank (a launch with a larger cluster fails).
+  void set_max_cluster_rank(unsigned n) { m_yasai_max_cluster_rank = n; }
+  // yasai: the .maxclusterrank; 0 without the directive.
+  unsigned max_cluster_rank() const { return m_yasai_max_cluster_rank; }
   unsigned get_maxnt_id() { return maxnt_id; }
   const symbol *canonicalize_register(const symbol *reg) const {
     if (m_reg_alloc_aliases.empty()) return reg;
@@ -1951,6 +1963,8 @@ class function_info {
   std::list<std::pair<unsigned, unsigned> > m_back_edges;
   std::unordered_map<const symbol *, const symbol *> m_reg_alloc_aliases;
   unsigned m_yasai_req_cluster[3] = {0, 0, 0};  // yasai: see set_req_cluster_dim
+  unsigned m_yasai_req_ntid[3] = {0, 0, 0};     // yasai: see set_req_ntid
+  unsigned m_yasai_max_cluster_rank = 0;        // yasai: see set_max_cluster_rank
   // Strict compiler-removed register views.  The key is a 32-bit logical
   // register and the value is {source register, 32-bit lane}.  PTX reorder
   // only installs entries after proving a single-definition, same-region

@@ -814,6 +814,16 @@ void ptx_recognizer::req_ncta_per_cluster(int x, int y, int z) {
 }
 
 // yasai: see ptx_parser.h.
+void ptx_recognizer::req_ntid(int x, int y, int z) {
+  if (g_func_info) g_func_info->set_req_ntid(x, y, z);
+}
+
+// yasai: see ptx_parser.h.
+void ptx_recognizer::max_cluster_rank(int n) {
+  if (g_func_info) g_func_info->set_max_cluster_rank(n);
+}
+
+// yasai: see ptx_parser.h.
 void ptx_recognizer::shared_window_space() {
   if (g_space_spec == undefined_space &&
       (g_opcode == LD_OP || g_opcode == ST_OP || g_opcode == ATOM_OP || g_opcode == RED_OP ||

@@ -1722,6 +1722,9 @@ cudaError_t cudaSetupArgumentInternal(const void *arg, size_t size,
 
 cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx);
 
+// yasai: cudaErrorInvalidClusterSize and CUDA_ERROR_INVALID_CLUSTER_SIZE, which this tree's headers lack.
+static const cudaError_t kYasaiInvalidClusterSize = static_cast<cudaError_t>(912);
+
 // yasai: set by cudaLaunchInternalImpl when the launch it pushed is a host-executed fill
 // (yasai_fill_kernel.h), so cudaLaunchInternal marks the kernel record; per thread, because
 // launches from several host threads may interleave.
@@ -1868,6 +1871,31 @@ cudaError_t cudaLaunchInternalImpl(const char *hostFun, gpgpu_context *gpgpu_ctx
       yasai_stream_manager(ctx)->yasai_resolve(config.get_stream());
 
   function_info *entry = context->get_kernel(hostFun);
+  // yasai: a launch that breaks the kernel's .reqntid or .maxclusterrank fails at once with the
+  // code an RTX 5090 returns, the kernel does not run, and the next synchronize returns 0
+  // (tests/launch_dims_probe.cu).
+  {
+    const dim3 bd = config.block_dim();
+    if (entry->req_ntid(0) != 0 && (bd.x != entry->req_ntid(0) || bd.y != entry->req_ntid(1) ||
+                                    bd.z != entry->req_ntid(2))) {
+      fprintf(stderr, "yasai-launch: %s launched with threads (%u,%u,%u) against .reqntid %u, %u, %u: returns 1\n",
+              entry->get_name().c_str(), bd.x, bd.y, bd.z, entry->req_ntid(0), entry->req_ntid(1), entry->req_ntid(2));
+      g_yasai_pending_cluster = dim3(1, 1, 1);
+      g_yasai_pending_cooperative = false;
+      ctx->api->g_cuda_launch_stack.pop_back();
+      return g_last_cudaError = cudaErrorInvalidValue;
+    }
+    const dim3 cl = g_yasai_pending_cluster;
+    const unsigned long long cluster_size = (unsigned long long)cl.x * cl.y * cl.z;
+    if (entry->max_cluster_rank() != 0 && cluster_size > entry->max_cluster_rank()) {
+      fprintf(stderr, "yasai-launch: %s launched with a cluster of (%u,%u,%u) against .maxclusterrank %u: returns 912\n",
+              entry->get_name().c_str(), cl.x, cl.y, cl.z, entry->max_cluster_rank());
+      g_yasai_pending_cluster = dim3(1, 1, 1);
+      g_yasai_pending_cooperative = false;
+      ctx->api->g_cuda_launch_stack.pop_back();
+      return g_last_cudaError = kYasaiInvalidClusterSize;
+    }
+  }
   const struct gpgpu_ptx_sim_info *kernel_info = entry->get_kernel_info();
   unsigned static_smem = kernel_info ? kernel_info->smem : 0;
   size_t dynamic_smem = config.shared_mem();
@@ -3567,6 +3595,7 @@ CUresult CUDAAPI cuLaunchKernelInternal(
     }
   }
   cudaError_t launch_result = cudaLaunchInternal(hostFun, ctx);
+  if (launch_result == kYasaiInvalidClusterSize) return static_cast<CUresult>(912);  // yasai
   return launch_result == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 #endif /* CUDART_VERSION >= 4000 */
@@ -7808,6 +7837,8 @@ static const char *yasai_cu_error_name(CUresult error) {
     YASAI_CU_ERR(CUDA_ERROR_NOT_SUPPORTED)
     YASAI_CU_ERR(CUDA_ERROR_UNKNOWN)
 #undef YASAI_CU_ERR
+    case 912:  // not in this tree's headers
+      return "CUDA_ERROR_INVALID_CLUSTER_SIZE";
     default:
       return NULL;
   }
