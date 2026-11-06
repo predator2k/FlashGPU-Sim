@@ -397,6 +397,10 @@ static void parse_tensor_coords(ptx_thread_info *thread,
 
 // Validate tensormap and dimension match
 // Returns true if valid, false otherwise
+// yasai: the fatal errors of a tensor map stop with abort(), like the other TMA
+// errors of this file. exit() runs the static destructors and atexit handlers
+// while the other function-mode pool threads (YASAI_FUNC_THREADS) keep simulating,
+// so the exit status could depend on what those threads touched.
 static bool validate_tensormap(uint64_t tensormap_addr,
                                const tensormap_descriptor_t &tensormap,
                                unsigned inst_dim) {
@@ -405,7 +409,7 @@ static bool validate_tensormap(uint64_t tensormap_addr,
             (unsigned long long)tensormap_addr);
     tensormap.print();
     fflush(stdout);
-    exit(1);
+    abort();
   }
 
   unsigned tensormap_dim = tensormap.num_dims();
@@ -415,7 +419,7 @@ static bool validate_tensormap(uint64_t tensormap_addr,
             "num_dims is %u (dim=%uD)\n",
             inst_dim, tensormap_dim, tensormap_dim);
     fflush(stdout);
-    exit(1);
+    abort();
   }
   return true;
 }
@@ -1262,7 +1266,7 @@ public:
                     (unsigned long long)tensormap_addr);
             tensormap.print();
             fflush(stdout);
-            exit(1);
+            abort();
           }
           m_agu.init_tensor(tx.agu_state, tensormap, tma_dyn_info.coords);
 

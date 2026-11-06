@@ -133,7 +133,13 @@ tensormap_descriptor_t::calculate_src_addr(const int32_t coords[5]) const {
 void tensormap_descriptor_t::print() const {
   char buf[2048];
   size_t pos = 0;
-  uint32_t dims = num_dims();
+  // yasai: tensorRank of an invalid descriptor can hold any value (an opaque CUDA
+  // descriptor has other fields there, for example 0x46322), so the lists below
+  // stop at the dimensions the descriptor holds; num_dims() as the bound read
+  // fields.boxDim and the others far past the descriptor.
+  const uint32_t max_dims = sizeof(fields.boxDim) / sizeof(fields.boxDim[0]);
+  const bool rank_in_range = fields.tensorRank < max_dims;
+  uint32_t dims = rank_in_range ? num_dims() : max_dims;
 
   auto append_checked = [&](const char *fmt, ...) {
     if (pos >= sizeof(buf))
@@ -158,7 +164,12 @@ void tensormap_descriptor_t::print() const {
   append_checked("TensorMap Descriptor:\n");
   append_checked("  global_address: 0x%llx\n",
                  (unsigned long long)fields.globalAddress);
-  append_checked("  rank: %u (num_dims=%u)\n", fields.tensorRank, dims);
+  if (rank_in_range)
+    append_checked("  rank: %u (num_dims=%u)\n", fields.tensorRank, dims);
+  else
+    append_checked("  rank: %u (0x%x): illegal number of dimensions, the "
+                   "descriptor holds at most %u; the lists below show %u\n",
+                   fields.tensorRank, fields.tensorRank, max_dims, dims);
   append_checked("  elemtype: %u (size=%u bytes)\n", fields.tensorDataType,
                  get_element_size());
 
