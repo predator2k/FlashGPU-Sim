@@ -161,7 +161,8 @@ class Recorder {
     if (f_ == nullptr) return false;
     fprintf(f_, "{\"rec\":\"header\",\"layer\":\"cuda\",\"host\":\"%s\",\"pid\":%d,\"rank\":%ld,"
                 "\"mono_ns\":%llu,\"real_ns\":%llu,\"source\":\"flashgpu-sim functional; device "
-                "operations carry the host time of their launch call\"}\n",
+                "operations carry the host time of their launch call; a captured CUDA graph is "
+                "replayed as one stream in capture order, so its graph_edge records are that order\"}\n",
             host, (int)pid, rank, (unsigned long long)mono_ns(), (unsigned long long)real_ns());
     fprintf(f_, "{\"rec\":\"init\",\"t\":%llu,\"clock\":\"host_monotonic_ns\"}\n",
             (unsigned long long)mono_ns());

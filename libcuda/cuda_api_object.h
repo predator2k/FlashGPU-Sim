@@ -197,6 +197,18 @@ struct CUctx_st {
     return p == m_yasai_pending_kernel.end() ? "(unknown)" : p->second.c_str();
   }
 
+  // yasai: device name of the kernel registered under hostFun, empty when the key is not
+  // registered. It loads no PTX, unlike get_kernel, so the recorder can name a kernel at its
+  // capture without moving the kernel's lazy load and static allocations to the capture.
+  //   hostFun: host stub address the kernel was registered with
+  std::string yasai_kernel_name_without_load(const void *hostFun) const {
+    auto i = m_kernel_lookup.find(hostFun);
+    if (i == m_kernel_lookup.end()) return std::string();
+    if (i->second != NULL) return i->second->get_name();
+    auto p = m_yasai_pending_kernel.find(hostFun);
+    return p == m_yasai_pending_kernel.end() ? std::string() : p->second;
+  }
+
   function_info *get_kernel(const char *hostFun) {
     auto i = m_kernel_lookup.find(hostFun);
     if (i == m_kernel_lookup.end()) {
