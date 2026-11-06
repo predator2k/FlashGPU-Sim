@@ -21,15 +21,20 @@
 // Raw warp trace (.ywr), little-endian, one record per executed warp instruction:
 //   magic "YWR1"
 //   record: warp_idx u32, pc u32, ptx_opcode u16, class_code u8, flags u8 (bit0 write,
-//           bit1 value present), active_mask u32, dst_count u8, src_count u8, line_count u16,
-//           reg_idx u16 x (dst_count + src_count), line u64 x line_count (128 B line address
-//           with the touched 32 B sector mask in bits 0..3), value u64 when flags bit1 is set
-//           (the loaded value of the first active lane of a global load).
+//           bit1 value present, bit2 auxiliary fields present), active_mask u32, dst_count u8,
+//           src_count u8, line_count u16, reg_idx u16 x (dst_count + src_count), line u64 x
+//           line_count (128 B line address with the touched 32 B sector mask in bits 0..3), value
+//           u64 when flags bit1 is set (the loaded value of the first active lane of a global
+//           load), and when flags bit2 is set the auxiliary fields: kind u8 (AuxKind), op u8
+//           (AuxTmaOp or AuxMbarOp), parity u8, result u8, mbarrier address u32, count u32, tx
+//           bytes u32. A warp instruction with auxiliary fields on several mbarriers writes one
+//           record per mbarrier. A trace without bit 2 reads as before.
 #ifndef YASAI_FUNC_H
 #define YASAI_FUNC_H
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -126,6 +131,62 @@ enum ClassCode : uint8_t {
   kMma = 11,        // matrix multiply-accumulate (mma, wgmma, tcgen05.mma)
 };
 
+// Kinds of the auxiliary fields of a raw record. They carry what a replay needs of the operations
+// that the functional model executes at once: the operands of a TMA copy and of an mbarrier
+// operation, and the bulk async groups of TMA stores.
+enum AuxKind : uint8_t {
+  kAuxTma = 1,         // one TMA copy: op is an AuxTmaOp; the record's lines are its global side
+  kAuxMbarrier = 2,    // one mbarrier operation: op is an AuxMbarOp
+  kAuxBulkCommit = 3,  // cp.async.bulk.commit_group
+  kAuxBulkWait = 4,    // cp.async.bulk.wait_group: count is its operand N
+};
+
+// Direction of a TMA copy.
+enum AuxTmaOp : uint8_t {
+  kAuxTmaLoad = 0,   // global to shared; completes tx bytes on the mbarrier at the mbarrier address
+  kAuxTmaStore = 1,  // shared to global; completes through its bulk async group
+};
+
+// Operation on an mbarrier (the order of MBARRIER_OPS of the yasai trace entry format).
+enum AuxMbarOp : uint8_t {
+  kAuxMbarInit = 0,           // init: count is the expected arrivals per phase
+  kAuxMbarArrive = 1,         // arrive: count arrivals
+  kAuxMbarExpectTx = 2,       // expect_tx: tx more bytes
+  kAuxMbarArriveExpectTx = 3, // arrive.expect_tx: count arrivals and tx more bytes
+  kAuxMbarCompleteTx = 4,     // complete_tx: tx bytes arrived
+  kAuxMbarWait = 5,           // try_wait or test_wait: result 1 when every lane found the phase done
+};
+
+// The auxiliary fields of one raw record. The lanes of one warp instruction add to one entry per
+// (kind, op, mbarrier address), so a warp-wide operation gives the sum over its lanes.
+struct WarpAux {
+  uint8_t kind = 0;                     // AuxKind
+  uint8_t op = 0;                       // AuxTmaOp or AuxMbarOp
+  uint8_t parity = 0;                   // wait: the parity of the waited phase
+  uint8_t result = 1;                   // wait: 1 when every lane found the phase done, else 0
+  uint32_t mbar_addr = 0;               // shared-memory address of the mbarrier
+  uint32_t count = 0;                   // expected arrivals, arrivals, or N of a wait_group
+  uint32_t tx_bytes = 0;                // transaction bytes
+  std::map<uint64_t, uint8_t> line_mask;  // TMA: 128 B line address -> touched 32 B sector mask
+};
+
+// The notes below are for the instruction implementations. Each returns at once when no trace is
+// being written, and adds to the entries of the warp instruction that this thread executes.
+// One lane's mbarrier operation other than a wait.
+void aux_mbar(AuxMbarOp op, uint32_t addr, uint32_t count, uint32_t tx_bytes);
+// One lane's phase check.
+void aux_mbar_wait(uint32_t addr, uint32_t parity, bool done);
+// One lane's TMA copy; aux_tma_span then gives the parts of its global side.
+void aux_tma(AuxTmaOp op, uint32_t mbar_addr, uint32_t bytes);
+// A part of the global side of the copy noted last by aux_tma on this thread.
+void aux_tma_span(uint64_t addr, uint64_t bytes);
+// One lane's cp.async.bulk.commit_group (kAuxBulkCommit) or wait_group N (kAuxBulkWait).
+void aux_bulk(AuxKind kind, uint32_t n);
+// Forgets the entries of this thread (before a warp instruction executes).
+void aux_clear();
+// The entries of the warp instruction this thread executed; they are forgotten here.
+std::vector<WarpAux> aux_take();
+
 // One executed warp instruction, filled by the functional core from the warp_inst_t and the
 // PTX instruction, in plain values.
 struct WarpRecord {
@@ -143,6 +204,7 @@ struct WarpRecord {
   uint32_t lane_bytes[32];      // per-lane access size in bytes
   bool has_value = false;       // value holds the loaded value of the first active lane
   uint64_t value = 0;           // see has_value
+  const WarpAux *aux = nullptr; // auxiliary fields of this record; a TMA entry's lines replace lane_addr
 };
 
 // Returns true when a trace is being written for the current kernel.

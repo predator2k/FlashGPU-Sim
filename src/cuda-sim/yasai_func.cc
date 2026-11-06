@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -226,6 +227,69 @@ void note_pc_source(uint32_t pc, unsigned line, const char *text) {
   if (e.first++ == 0) e.second = std::to_string(line) + "\t" + (text ? text : "");
 }
 
+namespace {
+// The auxiliary fields of the warp instruction that this thread executes (the lanes of one warp run
+// on one thread).
+thread_local std::vector<WarpAux> g_aux;
+
+// The entry of (kind, op, addr) of this thread's instruction, created when it is the first.
+WarpAux &aux_entry(uint8_t kind, uint8_t op, uint32_t addr) {
+  for (WarpAux &a : g_aux)
+    if (a.kind == kind && a.op == op && a.mbar_addr == addr) return a;
+  g_aux.emplace_back();
+  WarpAux &a = g_aux.back();
+  a.kind = kind;
+  a.op = op;
+  a.mbar_addr = addr;
+  return a;
+}
+}  // namespace
+
+void aux_mbar(AuxMbarOp op, uint32_t addr, uint32_t count, uint32_t tx_bytes) {
+  if (!tracing()) return;
+  WarpAux &a = aux_entry(kAuxMbarrier, op, addr);
+  if (op == kAuxMbarInit)
+    a.count = count;  // every lane sets the same object; the last init holds
+  else
+    a.count += count;
+  a.tx_bytes += tx_bytes;
+}
+
+void aux_mbar_wait(uint32_t addr, uint32_t parity, bool done) {
+  if (!tracing()) return;
+  WarpAux &a = aux_entry(kAuxMbarrier, kAuxMbarWait, addr);
+  a.parity = uint8_t(parity & 1u);
+  if (!done) a.result = 0;
+}
+
+void aux_tma(AuxTmaOp op, uint32_t mbar_addr, uint32_t bytes) {
+  if (!tracing()) return;
+  WarpAux &a = aux_entry(kAuxTma, op, mbar_addr);
+  a.tx_bytes += bytes;
+  // aux_tma_span adds to the back of the list, so the entry of this copy moves there.
+  if (&a != &g_aux.back()) std::swap(a, g_aux.back());
+}
+
+void aux_tma_span(uint64_t addr, uint64_t bytes) {
+  if (!tracing() || g_aux.empty() || g_aux.back().kind != kAuxTma || bytes == 0) return;
+  WarpAux &a = g_aux.back();
+  for (uint64_t s = addr >> 5; s <= (addr + bytes - 1) >> 5; s++)
+    a.line_mask[(s >> 2) << 7] |= uint8_t(1u << (s & 3));
+}
+
+void aux_bulk(AuxKind kind, uint32_t n) {
+  if (!tracing()) return;
+  aux_entry(kind, 0, 0).count = n;
+}
+
+void aux_clear() { g_aux.clear(); }
+
+std::vector<WarpAux> aux_take() {
+  std::vector<WarpAux> out;
+  out.swap(g_aux);
+  return out;
+}
+
 void emit(const WarpRecord &rec) {
   if (!tracing()) return;
   // Coalesce the active lanes of a global access into 128 B lines with 32 B sector masks.
@@ -253,12 +317,19 @@ void emit(const WarpRecord &rec) {
   put(rec.pc);
   put(rec.ptx_opcode);
   put(rec.class_code);
-  const uint8_t flags = uint8_t((rec.is_write ? 1 : 0) | (rec.has_value ? 2 : 0));
+  const uint8_t flags = uint8_t((rec.is_write ? 1 : 0) | (rec.has_value ? 2 : 0) | (rec.aux ? 4 : 0));
   put(flags);
   put(rec.active_mask);
   put(rec.dst_count);
   put(rec.src_count);
-  put(uint16_t(nlines));
+  // The global side of a TMA copy can exceed the 64 lines of a warp access, so it has its own list.
+  const bool tma_lines = rec.aux != nullptr && rec.aux->kind == kAuxTma;
+  if (tma_lines && rec.aux->line_mask.size() > 0xFFFFu) {
+    std::fprintf(stderr, "yasai-func: a TMA copy of warp %u touches %zu lines, more than a record holds\n",
+                 rec.warp_idx, rec.aux->line_mask.size());
+    std::abort();
+  }
+  put(uint16_t(tma_lines ? rec.aux->line_mask.size() : nlines));
   for (unsigned r = 0; r < unsigned(rec.dst_count) + rec.src_count; r++) {
     auto it = g_trace.reg_idx.find(rec.reg_uid[r]);
     uint16_t idx;
@@ -270,8 +341,21 @@ void emit(const WarpRecord &rec) {
     }
     put(idx);
   }
-  for (unsigned j = 0; j < nlines; j++) put(lines[j]);
+  if (tma_lines) {
+    for (const auto &kv : rec.aux->line_mask) put(uint64_t(kv.first | kv.second));
+  } else {
+    for (unsigned j = 0; j < nlines; j++) put(lines[j]);
+  }
   if (rec.has_value) put(rec.value);
+  if (rec.aux != nullptr) {
+    put(rec.aux->kind);
+    put(rec.aux->op);
+    put(rec.aux->parity);
+    put(rec.aux->result);
+    put(rec.aux->mbar_addr);
+    put(rec.aux->count);
+    put(rec.aux->tx_bytes);
+  }
   g_trace.records++;
   if (g_trace.buf.size() >= (1u << 22)) flush_trace();
   if (config().trace_max_bytes && g_trace.bytes + g_trace.buf.size() >= config().trace_max_bytes) {

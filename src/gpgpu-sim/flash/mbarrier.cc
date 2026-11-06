@@ -455,9 +455,11 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
       arrive_phase = yasai_func::mbar_phase(cta_key, bar_addr);
     if (bar_op == INIT_OPTION) {
       yasai_func::mbar_init(cta_key, bar_addr, get_u32_value(pI->src1()));
+      yasai_func::aux_mbar(yasai_func::kAuxMbarInit, bar_addr, get_u32_value(pI->src1()), 0);
     } else if (bar_op == TRY_WAIT_OPTION) {
       const bool done = yasai_func::mbar_phase_done(
           cta_key, bar_addr, get_u32_value(pI->src2()) & 1u);
+      yasai_func::aux_mbar_wait(bar_addr, get_u32_value(pI->src2()) & 1u, done);
       ptx_reg_t p;
       p.u64 = 0;
       p.pred =
@@ -474,18 +476,22 @@ void handle_mbarrier_inst(const ptx_instruction *pIin,
             (unsigned)thread->get_reg(pI->dst().get_symbol()).pred);
     } else if (bar_op == COMPLETE_TX_OPTION) {
       yasai_func::mbar_complete_tx(cta_key, bar_addr, get_u32_value(pI->src1()));
+      yasai_func::aux_mbar(yasai_func::kAuxMbarCompleteTx, bar_addr, 0, get_u32_value(pI->src1()));
     } else if (bar_op == ARRIVE_OPTION || bar_op == EXPECT_TX_OPTION) {
       auto [is_arrive, is_expect_tx] =
           parse_mbarrier_arrive_expect_tx_options(pI);
       if (is_arrive && is_expect_tx) {
         yasai_func::mbar_expect_tx(cta_key, bar_addr, get_u32_value(pI->src2()));
         yasai_func::mbar_arrive(cta_key, bar_addr, 1);
+        yasai_func::aux_mbar(yasai_func::kAuxMbarArriveExpectTx, bar_addr, 1, get_u32_value(pI->src2()));
       } else if (is_arrive) {
         const uint32_t n =
             pI->get_num_operands() == 3 ? get_u32_value(pI->src2()) : 1;
         yasai_func::mbar_arrive(cta_key, bar_addr, n);
+        yasai_func::aux_mbar(yasai_func::kAuxMbarArrive, bar_addr, n, 0);
       } else {
         yasai_func::mbar_expect_tx(cta_key, bar_addr, get_u32_value(pI->src1()));
+        yasai_func::aux_mbar(yasai_func::kAuxMbarExpectTx, bar_addr, 0, get_u32_value(pI->src1()));
       }
     } else if (bar_op == INVAL_OPTION) {
       yasai_func::mbar_inval(cta_key, bar_addr);

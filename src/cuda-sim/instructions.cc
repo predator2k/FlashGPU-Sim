@@ -2458,7 +2458,10 @@ void cp_async_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       for (int opt : pI->get_options()) {
         if (opt == NOINC_OPTION) noinc = true;
       }
-      if (noinc) yasai_func::mbar_arrive(thread->get_cta_uid(), addr, 1);
+      if (noinc) {
+        yasai_func::mbar_arrive(thread->get_cta_uid(), addr, 1);
+        yasai_func::aux_mbar(yasai_func::kAuxMbarArrive, addr, 1, 0);
+      }
     }
     return;
   }
@@ -3464,6 +3467,7 @@ void clc_try_cancel_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
     const uint32_t m = (c != nullptr && all) ? uint32_t(yasai_func::dsmem_encode(r, off)) : mbar;
     thread->m_shared_mem->write(a, 16, zero, thread, pI);
     yasai_func::mbar_complete_tx(thread->get_cta_uid(), m, 16);
+    yasai_func::aux_mbar(yasai_func::kAuxMbarCompleteTx, m, 0, 16);
   }
 }
 
@@ -8615,6 +8619,7 @@ void st_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       default: break;
     }
     yasai_func::mbar_complete_tx(thread->get_cta_uid(), mbar_addr, int64_t(nelem * size / 8));
+    yasai_func::aux_mbar(yasai_func::kAuxMbarCompleteTx, mbar_addr, 0, uint32_t(nelem * size / 8));
   }
   thread->m_last_effective_address = addr;
   thread->m_last_memory_space = space;
