@@ -4767,7 +4767,16 @@ void functionalCoreSim::yasai_emit_warp(const warp_inst_t &inst, unsigned w) {
       rec.value = t0->m_last_set_operand_value.u64;
     }
   }
-  yasai_func::emit(rec);
+  // A TMA or mbarrier instruction carries its operands in auxiliary fields, one record per mbarrier.
+  const std::vector<yasai_func::WarpAux> aux = yasai_func::aux_take();
+  if (aux.empty()) {
+    yasai_func::emit(rec);
+    return;
+  }
+  for (const yasai_func::WarpAux &a : aux) {
+    rec.aux = &a;
+    yasai_func::emit(rec);
+  }
 }
 
 void functionalCoreSim::executeWarp(unsigned i, bool &allAtBarrier,
@@ -4789,6 +4798,7 @@ void functionalCoreSim::executeWarp(unsigned i, bool &allAtBarrier,
   if (!m_warpAtBarrier[i] && m_liveThreadCount[i] != 0) {
     warp_inst_t inst = getExecuteWarp(i);
     yasai_func::g_wait_failed = false;
+    if (yasai_func::tracing()) yasai_func::aux_clear();
     execute_warp_inst_t(inst, i);
     yasai_func::count_warp_inst(inst.active_count());
     if (yasai_func::tracing()) yasai_emit_warp(inst, i);

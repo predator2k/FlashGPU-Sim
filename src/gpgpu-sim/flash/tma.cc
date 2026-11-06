@@ -2275,6 +2275,7 @@ static void do_tma_transfer_subbyte(const tensormap_descriptor_t &tm,
           uint32_t(std::min<int64_t>(16, tm.fields.globalDim[0] - e0));
       const uint32_t nbytes = (valid * bits + 7) / 8;
       const uint64_t gaddr = row_base + uint64_t(e0) * bits / 8;
+      yasai_func::aux_tma_span(gaddr, nbytes);  // yasai: the global side of the trace record
       const uint64_t logical = uint64_t(r) * smem_row + uint64_t(g) * gsz;
       const uint64_t off = apply_tma_swizzle(logical & ~uint64_t(15), smem_addr,
                                              tm.fields.swizzle, smem_row) +
@@ -2338,6 +2339,7 @@ static void do_tma_transfer(
     uint64_t global_req_addr = req.global_addr;
     uint32_t req_size = req.size;
     uint64_t tile_offset = req.tile_offset;
+    yasai_func::aux_tma_span(global_req_addr, req_size);  // yasai: the global side of the trace record
 
     unsigned char *data_buffer = (req_size <= LOCAL_BUF_SIZE)
                                      ? local_data_buf
@@ -2661,9 +2663,12 @@ static void handle_tma_copy(ptx_instruction *pI, ptx_thread_info *thread) {
     copy_mem(global_mem, src_addr, shared_mem, dst_addr, size_in_bytes, thread,
              pI);
     // yasai: in the pure functional mode the transfer is complete now.
-    if (thread->isInFunctionalSimulationMode())
+    if (thread->isInFunctionalSimulationMode()) {
       yasai_func::mbar_complete_tx(thread->get_cta_uid(), mbar_addr,
                                    size_in_bytes);
+      yasai_func::aux_tma(yasai_func::kAuxTmaLoad, mbar_addr, size_in_bytes);
+      yasai_func::aux_tma_span(src_addr, size_in_bytes);
+    }
 
     GPPRINTF_THREAD_CORE(TMA, thread,
                          "Functional Sim: "
@@ -2705,6 +2710,10 @@ static void handle_tma_copy(ptx_instruction *pI, ptx_thread_info *thread) {
         .size_in_bytes = size_in_bytes,
     };
     pI->set_tma_dyn_info(laneid, tma_dyn_info);
+    if (thread->isInFunctionalSimulationMode()) {
+      yasai_func::aux_tma(yasai_func::kAuxTmaStore, 0, size_in_bytes);
+      yasai_func::aux_tma_span(dst_addr, size_in_bytes);
+    }
 
     if (reduce_add) {
       const auto scalar_types = pI->get_scalar_type();
@@ -2758,6 +2767,8 @@ static void handle_tma_commit_group(ptx_instruction *pI,
       .src_space = inst_t::tma_static_info_t::TMA_SPACE_INVALID,
   };
   pI->set_tma_static_info(tma_static_info);
+  if (thread->isInFunctionalSimulationMode())
+    yasai_func::aux_bulk(yasai_func::kAuxBulkCommit, 0);
   GPPRINTF_THREAD_CORE(TMA, thread,
                        "Functional Sim: cp.async.bulk.commit_group%s\n", "");
 }
@@ -2783,6 +2794,8 @@ static void handle_tma_wait_group(ptx_instruction *pI,
       .bulk_wait_read_only = read_only,
   };
   pI->set_tma_static_info(tma_static_info);
+  if (thread->isInFunctionalSimulationMode())
+    yasai_func::aux_bulk(yasai_func::kAuxBulkWait, group_num);
   GPPRINTF_THREAD_CORE(TMA, thread,
                        "Functional Sim: cp.async.bulk.wait_group%s %u\n",
                        read_only ? ".read" : "", group_num);
@@ -2923,6 +2936,10 @@ static void handle_tma_tensor(ptx_instruction *pI, ptx_thread_info *thread) {
       row_map.fields.boxDim[1] = 1;
       size_in_bytes = 4 * row_map.get_tile_size_bytes();
     }
+    // yasai: the trace record of this copy; the transfers below give its global side. A multicast
+    // copy writes one record with the mbarrier it names.
+    if (thread->isInFunctionalSimulationMode())
+      yasai_func::aux_tma(yasai_func::kAuxTmaLoad, mbar_addr, size_in_bytes);
     yasai_func::ClusterState *cl = yasai_func::cluster();
     if (multicast && cl != nullptr && pI->get_num_operands() > 4) {
       const uint32_t mask =
@@ -3004,6 +3021,8 @@ static void handle_tma_tensor(ptx_instruction *pI, ptx_thread_info *thread) {
     cache_tensormap_descriptor(tma_dyn_info, tensormap);
     pI->set_tma_dyn_info(thread->get_laneid(), tma_dyn_info);
 
+    if (thread->isInFunctionalSimulationMode())
+      yasai_func::aux_tma(yasai_func::kAuxTmaStore, 0, size_in_bytes);
     do_tma_transfer(tensormap, coords, shared_mem, global_mem, src_addr, thread,
                     pI, false, reduction_op);
 

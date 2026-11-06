@@ -910,11 +910,15 @@ void commit(const ptx_instruction *pI, ptx_thread_info *t) {
     yasai_func::dsmem_decode(addr, rank, off);
     for (unsigned r = 0; r < yasai_func::cluster()->size; ++r)
       if ((mask >> r) & 1)
+      {
         yasai_func::mbar_arrive(t->get_cta_uid(),
                                 uint32_t(yasai_func::dsmem_encode(r, off)), 1);
+        yasai_func::aux_mbar(yasai_func::kAuxMbarArrive, uint32_t(yasai_func::dsmem_encode(r, off)), 1, 0);
+      }
     return;
   }
   yasai_func::mbar_arrive(t->get_cta_uid(), addr, 1);
+  yasai_func::aux_mbar(yasai_func::kAuxMbarArrive, addr, 1, 0);
 }
 
 } // namespace yumma
