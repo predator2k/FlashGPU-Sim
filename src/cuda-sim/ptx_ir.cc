@@ -50,6 +50,7 @@ typedef void *yyscan_t;
 #include "../gpgpu-sim/flash/reg_alloc.h"
 #include "cuda-sim.h"
 #include "../yasai_subprocess.h"
+#include "yasai_const_window.h"
 
 #define STR_SIZE 1024
 
@@ -149,8 +150,10 @@ symbol *symbol_table::lookup_by_addr(addr_t addr) {
   for (auto it = m_symbols.begin(); it != m_symbols.end(); ++it) {
     symbol *sym = it->second;
 
-    // check if symbol has the addr to be found
-    if ((!sym->is_reg()) && (sym->has_valid_address()) &&
+    // check if symbol has the addr to be found. yasai: a .const symbol's address is an offset in
+    // its module's constant segment (yasai_const_window.h), not a global address, so it is skipped
+    // (the callers look up texture references).
+    if ((!sym->is_reg()) && (!sym->is_const()) && (sym->has_valid_address()) &&
         (sym->get_address() == addr)) {
       return sym;
     }
@@ -268,6 +271,8 @@ bool symbol_table::add_function_decl(const char *name, int entry_point,
     *func_info = new function_info(entry_point, gpgpu_ctx);
     (*func_info)->set_name(name);
     (*func_info)->set_maxnt_id(0);
+    // yasai: the function belongs to the source module being parsed (yasai_const_window.h).
+    (*func_info)->set_yasai_const_segment(yasai_const::current(gpgpu_ctx->g_filename));
     m_function_info_lookup[key] = *func_info;
   }
 

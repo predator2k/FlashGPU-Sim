@@ -297,7 +297,7 @@ breakaddr  TC; BEGIN(NOT_OPCODE); yylval->int_value = BREAKADDR_OP; return OPCOD
 \.byte	TC; return BYTE_DIRECTIVE; /* not in PTX 2.1 */
 \.callprototype TC; return CALLPROTOTYPE_DIRECTIVE;
 \.calltargets TC; return CALLTARGETS_DIRECTIVE;
-\.const\[[0-9]+\] TC; yylval->int_value = atoi(yytext+7); return CONST_DIRECTIVE;
+\.const\[[0-9]+\] TC; recognizer->yasai_banked_const(yytext); yylval->int_value = atoi(yytext+7); return CONST_DIRECTIVE; /* yasai: not modeled (yasai_const_window.h) */
 \.const TC; if (YY_START == INITIAL && recognizer->m_yasai_paren == 0) BEGIN(NOT_OPCODE); yylval->int_value = 0; return CONST_DIRECTIVE;
 \.entry TC; return ENTRY_DIRECTIVE;
 \.extern TC; return EXTERN_DIRECTIVE;

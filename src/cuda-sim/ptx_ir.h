@@ -54,6 +54,9 @@ using flash_gpgpu_sim::mma_shape_type;
 
 class gpgpu_context;
 class function_info;
+namespace yasai_const {
+struct segment;  // yasai_const_window.h
+}
 
 namespace flash_gpgpu_sim {
 void run_ptx_register_allocation(function_info *func);
@@ -239,6 +242,7 @@ class symbol {
     m_reg_num_valid = s.m_reg_num_valid;
     m_function = s.m_function;
     m_initializer = s.m_initializer;
+    m_yasai_const_seg = s.m_yasai_const_seg;
   }
   unsigned get_size_in_bytes() const { return m_size; }
   const std::string &name() const { return m_name; }
@@ -291,6 +295,12 @@ class symbol {
     m_yasai_dyn_smem_align = align;
   }
   unsigned yasai_dyn_smem_align() const { return m_yasai_dyn_smem_align; }
+  /// yasai: the constant segment of the module that defines this .const symbol, whose address is
+  /// the symbol's offset in that segment (yasai_const_window.h).
+  yasai_const::segment *yasai_const_segment() const { return m_yasai_const_seg; }
+  /// yasai: see yasai_const_segment.
+  /// @param seg The segment.
+  void set_yasai_const_segment(yasai_const::segment *seg) { m_yasai_const_seg = seg; }
   bool is_reg() const {
     if (m_type == NULL) {
       return false;
@@ -343,6 +353,7 @@ class symbol {
   bool m_is_func_addr;
   bool m_is_yasai_dyn_smem = false;  // see is_yasai_dyn_smem; a copied symbol starts as false
   unsigned m_yasai_dyn_smem_align = 0;  // see set_yasai_dyn_smem
+  yasai_const::segment *m_yasai_const_seg = nullptr;  // see yasai_const_segment
   unsigned m_reg_num;
   unsigned m_arch_reg_num;
   bool m_reg_num_valid;
@@ -1824,6 +1835,13 @@ class function_info {
   }
   /// yasai: prints why yasai_dyn_smem_base cannot resolve sym and aborts.
   [[noreturn]] void yasai_dyn_smem_fail(const symbol *sym) const;
+  /// yasai: the constant segment of the source module this function was parsed from; ld.const,
+  /// cvta.const and isspacep.const of a kernel's threads resolve in its entry's segment
+  /// (yasai_const_window.h).
+  yasai_const::segment *yasai_const_segment() const { return m_yasai_const_seg; }
+  /// yasai: see yasai_const_segment; set when the parser creates the function.
+  /// @param seg The segment.
+  void set_yasai_const_segment(yasai_const::segment *seg) { m_yasai_const_seg = seg; }
 
   unsigned local_mem_framesize() const { return m_local_mem_framesize; }
   void set_framesize(unsigned sz) { m_local_mem_framesize = sz; }
@@ -2016,6 +2034,8 @@ class function_info {
   addr_t m_yasai_dyn_smem_addr = 0;
   unsigned m_yasai_dyn_smem_pad = 0;
   unsigned m_yasai_dyn_smem_reserved = 0;
+  // yasai: see yasai_const_segment.
+  yasai_const::segment *m_yasai_const_seg = nullptr;
 
   // parameter size for device kernels
   int m_args_aligned_size;

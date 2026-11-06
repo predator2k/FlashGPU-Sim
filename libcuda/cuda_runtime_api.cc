@@ -175,6 +175,7 @@ typedef enum CUoutput_mode_enum {
 #include "../src/cuda-sim/yasai_stall.h"
 #include "../src/cuda-sim/yasai_lazy.h"
 #include "../src/cuda-sim/yasai_module_scope.h"
+#include "../src/cuda-sim/yasai_const_window.h"
 #include "yasai_fatbin_units.h"
 #include "yasai_fill_kernel.h"
 #include "yasai_vmm.h"
@@ -5906,13 +5907,23 @@ std::string yasai_ptx_decl_name(const std::string &line) {
   return line.substr(b, e - b);
 }
 
+// Parses file as part of the source module key, whose constant segment its constants join
+// (yasai_const_window.h); the PTX load lock covers the parse only, as it did before.
+//   ctx: simulator context; file: the file to parse; key: its source PTX file
+symbol_table *yasai_parse_in_module(gpgpu_context *ctx, const char *file, const std::string &key) {
+  std::lock_guard<std::recursive_mutex> lock(yasai_func::ptx_load_mutex());
+  yasai_const::module_scope scope(key);
+  return ctx->gpgpu_ptx_sim_load_ptx_from_filename(file);
+}
+
 // Parses file i of L and makes its kernels and variables available.
 void yasai_lazy_load_file(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i) {
   if (L.loaded[i]) return;
   L.loaded[i] = true;
   CUctx_st *context = GPGPUSim_Context(ctx);
   printf("GPGPU-Sim PTX: lazily parsing %s\n", L.files[i].c_str());
-  symbol_table *symtab = ctx->gpgpu_ptx_sim_load_ptx_from_filename(L.files[i].c_str());
+  // yasai: the file is the module of its constants, as for its per-kernel pieces.
+  symbol_table *symtab = yasai_parse_in_module(ctx, L.files[i].c_str(), L.files[i]);
   context->add_binary(symtab, L.handle);
   ctx->api->load_static_globals(symtab, STATIC_ALLOC_LIMIT, context->get_device()->get_gpgpu());
   ctx->api->load_constants(symtab, STATIC_ALLOC_LIMIT, context->get_device()->get_gpgpu());
@@ -6260,7 +6271,8 @@ bool yasai_lazy_load_piece_lazyfunc(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int
          entry_item >= 0 || func_item >= 0 ? target.c_str() : "", L.files[i].c_str(), piece,
          parse_text.size(), t.size(), g_yasai_piece_bytes);
   CUctx_st *context = GPGPUSim_Context(ctx);
-  symbol_table *symtab = ctx->gpgpu_ptx_sim_load_ptx_from_filename(parse_file.c_str());
+  // yasai: a piece belongs to its source file's module, whose constant segment all pieces share.
+  symbol_table *symtab = yasai_parse_in_module(ctx, parse_file.c_str(), L.files[i]);
   context->add_binary(symtab, L.handle);
   ctx->api->load_static_globals(symtab, STATIC_ALLOC_LIMIT, context->get_device()->get_gpgpu());
   ctx->api->load_constants(symtab, STATIC_ALLOC_LIMIT, context->get_device()->get_gpgpu());
@@ -6356,7 +6368,8 @@ bool yasai_lazy_load_piece(gpgpu_context *ctx, yasai_lazy_ptx_t &L, int i, const
          entry_item >= 0 ? target.c_str() : "the variables", L.files[i].c_str(), piece,
          parse_text.size(), t.size(), g_yasai_piece_bytes);
   CUctx_st *context = GPGPUSim_Context(ctx);
-  symbol_table *symtab = ctx->gpgpu_ptx_sim_load_ptx_from_filename(parse_file.c_str());
+  // yasai: a piece belongs to its source file's module, whose constant segment all pieces share.
+  symbol_table *symtab = yasai_parse_in_module(ctx, parse_file.c_str(), L.files[i]);
   context->add_binary(symtab, L.handle);
   ctx->api->load_static_globals(symtab, STATIC_ALLOC_LIMIT, context->get_device()->get_gpgpu());
   ctx->api->load_constants(symtab, STATIC_ALLOC_LIMIT, context->get_device()->get_gpgpu());
@@ -7736,6 +7749,9 @@ int cuda_runtime_api::load_constants(symbol_table *symtab, addr_t min_gaddr,
   printf("GPGPU-Sim PTX: loading constants with explicit initializers... ");
   fflush(stdout);
   int nc_bytes = 0;
+  // yasai: the segments of the modules parsed so far get their addresses in the constant window
+  // before their constants are written there (yasai_const_window.h).
+  yasai_const::place_pending();
   symbol_table::iterator g = symtab->const_iterator_begin();
 
   // yasai: initialized once, as in load_static_globals.
@@ -7768,8 +7784,9 @@ int cuda_runtime_api::load_constants(symbol_table *symtab, addr_t min_gaddr,
           default:
             abort();
         }
-        unsigned addr = constant->get_address() + nbytes_written;
-        assert(addr + nbytes < min_gaddr);
+        // yasai: the constant's place in its module's segment in the constant window.
+        const addr_t addr = yasai_const::host_address(constant) + nbytes_written;
+        assert(nbytes_written + nbytes <= (int)constant->get_size_in_bytes());
 
         gpu->get_global_memory()->write(
             addr, nbytes, &value, NULL,
@@ -8589,7 +8606,32 @@ CUresult CUDAAPI cuModuleGetGlobal(CUdeviceptr *dptr, size_t *bytes,
   if (g_debug_execution >= 3) {
     announce_call(__my_func__);
   }
-  printf("WARNING: this function has not been implemented yet %s\n", __my_func__);
+  // yasai: the address and size of a module's .global or .const variable. It returned success
+  // without writing either before. A constant's address is its module's segment in the constant
+  // window plus its offset, which equals cvta.const of the symbol (yasai_const_window.h); a
+  // module-local name resolves to the module's renamed symbol (yasai_module_scope.h).
+  gpgpu_context *ctx = GPGPU_Context();
+  if (!ctx) return CUDA_ERROR_INVALID_CONTEXT;
+  if (name == NULL) return CUDA_ERROR_INVALID_VALUE;
+  CUctx_st *context = GPGPUSim_Context(ctx);
+  const unsigned module_handle = (unsigned)(unsigned long long)hmod;
+  symbol_table *symtab = context->get_symbol_table(module_handle);
+  if (symtab == NULL) return CUDA_ERROR_INVALID_HANDLE;
+  std::string sym_name = name;
+  const auto mod_ptx = yasai_module_ptx().find(module_handle);
+  if (mod_ptx != yasai_module_ptx().end()) sym_name = yasai_scope::local_name(name, mod_ptx->second);
+  symbol *sym = symtab->lookup(sym_name.c_str());
+  if (sym == NULL && yasai_func::g_lazy_load_name != nullptr && yasai_func::g_lazy_load_name(sym_name.c_str()))
+    sym = symtab->lookup(sym_name.c_str());
+  if (sym == NULL || !(sym->is_const() || sym->is_global()) || !sym->has_valid_address()) {
+    printf("GPGPU-Sim PTX: cuModuleGetGlobal: no variable %s in module %u\n", name, module_handle);
+    return CUDA_ERROR_NOT_FOUND;
+  }
+  const unsigned long long addr = sym->is_const() ? yasai_const::host_address(sym) : sym->get_address();
+  if (dptr) *dptr = (CUdeviceptr)addr;
+  if (bytes) *bytes = sym->get_size_in_bytes();
+  printf("GPGPU-Sim PTX: cuModuleGetGlobal: %s of module %u at 0x%llx, %u bytes\n", name, module_handle, addr,
+         sym->get_size_in_bytes());
   return CUDA_SUCCESS;
 }
 #endif /* CUDART_VERSION >= 3020 */
