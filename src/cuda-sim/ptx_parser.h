@@ -239,6 +239,10 @@ class ptx_recognizer {
   void add_space_spec(enum _memory_space_t spec, int value);
   void add_ptr_spec(enum _memory_space_t spec);
   void add_extern_spec();
+  /// yasai: stops the process at a banked constant space .const[n], which the constant model does
+  /// not cover (yasai_const_window.h).
+  /// @param text The directive as written.
+  void yasai_banked_const(const char *text);
   void add_instruction();
   void set_return();
   void add_alignment_spec(int spec);

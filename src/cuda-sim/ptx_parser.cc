@@ -29,6 +29,7 @@
 #include "yasai_contract.h"
 #include "ptx_parser.h"
 #include "yasai_func.h"
+#include "yasai_const_window.h"
 #include "../../libcuda/gpgpu_context.h"
 #include "ptx_ir.h"
 
@@ -371,12 +372,30 @@ void ptx_recognizer::add_identifier(const char *identifier, int array_dim,
   unsigned addr_pad;
   new_addr_type addr;
   ti.type_decode(num_bits, basic_type);
+  const size_t elem_bits = num_bits;  // yasai: the element's size, the alignment of a .const without .align
+  const bool yasai_const_decl = !g_func_decl && ti.get_memory_space().get_type() == const_space;
+  if (yasai_const_decl && g_extern_spec) {
+    // yasai: a constant defined in another module (-rdc linking) has its offset in that module's
+    // segment, while ld.const reads the running kernel's segment (yasai_const_window.h).
+    yasai_const::not_modeled("extern_const", identifier,
+                             std::string(gpgpu_ctx->g_filename) + ":" + std::to_string(ptx_get_lineno(scanner)));
+  }
 
   bool duplicates = check_for_duplicates(identifier);
   if (duplicates) {
     symbol *s = g_current_symbol_table->lookup(identifier);
     g_last_symbol = s;
     if (g_func_decl) return;
+    // yasai: the per-kernel pieces of one source module repeat its constants, which stay the
+    // module's; a constant of another module under the same name would need its own copy in that
+    // module's segment, which one symbol table cannot hold (yasai_const_window.h).
+    if (yasai_const_decl && s->is_const() &&
+        s->yasai_const_segment() != yasai_const::current(gpgpu_ctx->g_filename)) {
+      const yasai_const::segment *first = s->yasai_const_segment();
+      yasai_const::not_modeled("const_defined_twice", identifier,
+                               (first ? first->key : std::string("?")) + " and " +
+                                   yasai_const::current(gpgpu_ctx->g_filename)->key);
+    }
     std::string msg = std::string(identifier) + " was declared previous at " +
                       s->decl_location() + " skipping new declaration";
     printf("GPGPU-Sim PTX: Warning %s\n", msg.c_str());
@@ -450,18 +469,20 @@ void ptx_recognizer::add_identifier(const char *identifier, int array_dim,
             "(need size information)\n",
             identifier);
       } else {
-        printf("GPGPU-Sim PTX: allocating constant region for \"%s\" ",
-               identifier);
-        fflush(stdout);
+        // yasai: the symbol's address is its offset in the constant segment of its source module,
+        // in declaration order at its .align (else its element size), as on a GPU
+        // (yasai_const_window.h); the segment is placed in the constant window after the parse.
         assert((num_bits % 8) == 0);
-        addr = g_current_symbol_table->get_global_next();
-        addr_pad = pad_address(addr, num_bits / 8, 128);
-        printf("from 0x%llx to 0x%llx (global memory space) %u\n",
-               addr + addr_pad, addr + addr_pad + num_bits / 8,
-               g_const_alloc++);
+        yasai_const::segment *seg = yasai_const::current(gpgpu_ctx->g_filename);
+        const unsigned align = g_alignment_spec > 0 ? (unsigned)g_alignment_spec
+                                                    : (unsigned)(elem_bits / 8 ? elem_bits / 8 : 1);
+        const unsigned long long offset = yasai_const::add_symbol(seg, num_bits / 8, align, identifier);
+        printf("GPGPU-Sim PTX: allocating constant region for \"%s\" at offset 0x%llx to 0x%llx of the "
+               "constant segment of %s %u\n",
+               identifier, offset, offset + num_bits / 8, seg->key.c_str(), g_const_alloc++);
         fflush(stdout);
-        g_last_symbol->set_address(addr + addr_pad);
-        g_current_symbol_table->alloc_global(num_bits / 8 + addr_pad);
+        g_last_symbol->set_address(offset);
+        g_last_symbol->set_yasai_const_segment(seg);
       }
       if (g_current_symbol_table == g_global_symbol_table) {
         gpgpu_ctx->func_sim->g_constants.insert(identifier);
@@ -593,6 +614,11 @@ void ptx_recognizer::add_ptr_spec(enum _memory_space_t spec) {
       spec == global_space or spec == local_space or spec == shared_space,
       "invalid space for ptr directive.");
   g_ptr_spec = spec;
+}
+
+void ptx_recognizer::yasai_banked_const(const char *text) {
+  yasai_const::not_modeled("banked_const", text,
+                           std::string(gpgpu_ctx->g_filename) + ":" + std::to_string(ptx_get_lineno(scanner)));
 }
 
 void ptx_recognizer::add_space_spec(enum _memory_space_t spec, int value) {

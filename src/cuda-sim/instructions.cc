@@ -34,6 +34,7 @@
 #include <cstring>
 #include "../gpgpu-sim/flash/mma/yasai_mma_dot.h"
 #include "instructions.h"
+#include "yasai_const_window.h"
 #include "yasai_func.h"
 #include "yasai_stall.h"
 #include "../gpgpu-sim/flash/mma/mma_trace.h"
@@ -4746,8 +4747,11 @@ void cvta_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
         // yasai: the inverse of cvta.param below, for any value, as on both GPUs.
         to_addr_hw = from_addr_hw - thread->get_kernel().yasai_param_window(thread->get_gpu());
         break;
-      case const_space:  // yasai: .const variables live at their own addresses in the global window
-        to_addr_hw = from_addr_hw;
+      case const_space:
+        // yasai: the offset in the running kernel's constant segment, for any value: the global
+        // address minus the segment's address, which is 0 for a module without constants
+        // (yasai_const_window.h; GB10 probes a and f).
+        to_addr_hw = from_addr_hw - yasai_const::base(yasai_const::of_thread(thread));
         break;
       default:
         fprintf(stderr, "yasai-cvta: %s: state space not implemented\n", pI->to_string().c_str());
@@ -4774,8 +4778,10 @@ void cvta_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
         // travels like any pointer. ld.param of the symbol's value is unaffected.
         to_addr_hw = from_addr_hw + thread->get_kernel().yasai_param_window(thread->get_gpu());
         break;
-      case const_space:  // yasai: see above (generic loads of the address read the same bytes)
-        to_addr_hw = from_addr_hw;
+      case const_space:
+        // yasai: the segment's global address plus the offset; generic and global loads of it read
+        // the constant (yasai_const_window.h; GB10 probes a, d and e).
+        to_addr_hw = from_addr_hw + yasai_const::base(yasai_const::of_thread(thread));
         break;
       default:
         fprintf(stderr, "yasai-cvta: %s: state space not implemented\n", pI->to_string().c_str());
@@ -5150,9 +5156,10 @@ void isspacep_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
   unsigned hwtid = thread->get_hw_tid();
 
   // yasai: the cases fell through to abort(), so every isspacep stopped the simulator (NVSHMEM's
-  // barrier, broadcast and other collectives use isspacep.shared). Generic addresses of the const
-  // space are not modeled, so isspacep.const answers false; isspacep.param tests the launch's copy
-  // of its parameters (cvta.param).
+  // barrier, broadcast and other collectives use isspacep.shared). isspacep.const holds inside the
+  // running kernel's constant segment only, and isspacep.global is false there, as on the GB10
+  // (yasai_const_window.h; probes b, g, i, j and e); isspacep.param tests the launch's copy of its
+  // parameters (cvta.param).
   switch (space.get_type()) {
     case shared_space:
       t = isspace_shared(smid, addr);
@@ -5161,9 +5168,12 @@ void isspacep_impl(const ptx_instruction *pI, ptx_thread_info *thread) {
       t = isspace_local(smid, hwtid, addr);
       break;
     case global_space:
-      t = isspace_global(addr) && !isspace_shared(smid, addr) && !isspace_local(smid, hwtid, addr);
+      t = isspace_global(addr) && !isspace_shared(smid, addr) && !isspace_local(smid, hwtid, addr) &&
+          !yasai_const::contains(yasai_const::of_thread(thread), addr);
       break;
     case const_space:
+      t = yasai_const::contains(yasai_const::of_thread(thread), addr);
+      break;
     case param_space_local:
       t = false;
       break;
@@ -5239,6 +5249,13 @@ void decode_space(memory_space_t &space, ptx_thread_info *thread,
       break;
     case generic_space:
       if (thread->get_ptx_version().ver() >= 2.0) {
+        // yasai: a .const symbol named in a generic access gives its segment offset, not a generic
+        // address (yasai_const_window.h); this form was not measured on a GPU, so it stops rather
+        // than reading the static region.
+        if (op.is_memory_operand() && op.get_symbol() != NULL && !op.get_symbol()->is_reg() &&
+            op.get_symbol()->is_const())
+          yasai_const::not_modeled("generic_access_of_const_symbol", op.get_symbol()->name().c_str(),
+                                   thread->get_kernel().name());
         // convert generic address to memory space address
         space = whichspace(addr);
         switch (space.get_type()) {
@@ -5292,10 +5309,28 @@ void ld_exec(const ptx_instruction *pI, ptx_thread_info *thread) {
   int t;
   data.u64 = 0;
   type_info_key::type_decode(type, size, t);
+  // yasai: ld.const reads the running kernel's constant segment at the offset; an access that ends
+  // past the module's data reads 0 (yasai_const_window.h; GB10 probes c and k).
+  bool const_zero = false;
+  if (space.get_type() == const_space) {
+    const unsigned nelem = !vector_spec ? 1 : vector_spec == V2_TYPE ? 2 : vector_spec == V3_TYPE ? 3
+                                          : vector_spec == V4_TYPE ? 4 : 8;
+    unsigned long long at = 0;
+    if (yasai_const::resolve_load(yasai_const::of_thread(thread), addr, (unsigned long long)nelem * (size / 8), &at))
+      addr = at;
+    else
+      const_zero = true;
+  }
+  auto read = [&](addr_t a, size_t n, void *dst_bytes) {
+    if (const_zero)
+      memset(dst_bytes, 0, n);
+    else
+      mem->read(a, n, dst_bytes);
+  };
   // yasai: signed element types are sign-extended into wider destination registers.
   const bool is_signed = type == S8_TYPE || type == S16_TYPE || type == S32_TYPE;
   if (!vector_spec) {
-    mem->read(addr, size / 8, &data.s64);
+    read(addr, size / 8, &data.s64);
     // yasai: ld.s8 sign-extends as well (PyTorch's fetch_and_cast loads int8 with
     // "ld.global.s8 %rd, [..]" into a 64-bit register; -1 became 255).
     if (type == S8_TYPE || type == S16_TYPE || type == S32_TYPE) sign_extend(data, size, dst);
@@ -5316,7 +5351,7 @@ void ld_exec(const ptx_instruction *pI, ptx_thread_info *thread) {
     for (unsigned e = 0; e < 8 && e < dst.get_vect_nelem(); e++) {
       ptx_reg_t d;
       d.u64 = 0;
-      mem->read(addr + e * size / 8, size / 8, &d.s64);
+      read(addr + e * size / 8, size / 8, &d.s64);
       if (is_signed) yasai_sign_extend_reg(d, size, dst.vec_symbol(e));
       thread->set_reg(dst.vec_symbol(e), d);
     }
@@ -5327,7 +5362,7 @@ void ld_exec(const ptx_instruction *pI, ptx_thread_info *thread) {
     // data and flag in one 8-byte vector, LL128 in 16-byte vectors).
     const unsigned n = vector_spec == V2_TYPE ? 2 : 4, eb = size / 8;
     unsigned char buf[16] = {0};
-    mem->read(addr, n * eb, buf);
+    read(addr, n * eb, buf);
     ptx_reg_t d[4];
     for (unsigned e = 0; e < 4; e++) {
       d[e].u64 = 0;
@@ -5340,17 +5375,17 @@ void ld_exec(const ptx_instruction *pI, ptx_thread_info *thread) {
   } else {
     ptx_reg_t data1, data2, data3, data4;
     data1.u64 = data2.u64 = data3.u64 = data4.u64 = 0;
-    mem->read(addr, size / 8, &data1.s64);
-    mem->read(addr + size / 8, size / 8, &data2.s64);
+    read(addr, size / 8, &data1.s64);
+    read(addr + size / 8, size / 8, &data2.s64);
     if (is_signed) {
       yasai_sign_extend_reg(data1, size, dst.vec_symbol(0));
       yasai_sign_extend_reg(data2, size, dst.vec_symbol(1));
     }
     if (vector_spec != V2_TYPE) {  // either V3 or V4
-      mem->read(addr + 2 * size / 8, size / 8, &data3.s64);
+      read(addr + 2 * size / 8, size / 8, &data3.s64);
       if (is_signed) yasai_sign_extend_reg(data3, size, dst.vec_symbol(2));
       if (vector_spec != V3_TYPE) {  // v4
-        mem->read(addr + 3 * size / 8, size / 8, &data4.s64);
+        read(addr + 3 * size / 8, size / 8, &data4.s64);
         if (is_signed) yasai_sign_extend_reg(data4, size, dst.vec_symbol(3));
         thread->set_vector_operand_values(dst, data1, data2, data3, data4);
       } else  // v3

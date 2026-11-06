@@ -80,6 +80,7 @@ typedef void *yyscan_t;
 
 #include "dyn_ptx_inst.h"
 #include "yasai_contract.h"
+#include "yasai_const_window.h"
 #include "yasai_func.h"
 #include "yasai_lazy.h"
 
@@ -3576,7 +3577,8 @@ void cuda_sim::gpgpu_ptx_sim_memcpy_symbol(const char *hostVar, const void *src,
 
   symbol *sym = symtab->lookup(sym_name.c_str());
   assert(sym);
-  unsigned dst = sym->get_address() + offset;
+  // yasai: a constant lives in its module's segment in the constant window (yasai_const_window.h).
+  const addr_t dst = (mem_region == const_space ? yasai_const::host_address(sym) : sym->get_address()) + offset;
   switch (mem_region.get_type()) {
     case const_space:
       mem = gpu->get_global_memory();
@@ -3591,8 +3593,8 @@ void cuda_sim::gpgpu_ptx_sim_memcpy_symbol(const char *hostVar, const void *src,
   }
   printf(
       "GPGPU-Sim PTX: gpgpu_ptx_sim_memcpy_symbol: copying %s memory %zu bytes "
-      "%s symbol %s+%zu @0x%x ...\n",
-      mem_name, count, (to ? " to " : "from"), sym_name.c_str(), offset, dst);
+      "%s symbol %s+%zu @0x%llx ...\n",
+      mem_name, count, (to ? " to " : "from"), sym_name.c_str(), offset, (unsigned long long)dst);
   // yasai: pending deferred kernels that use the variable run first (yasai_lazy.h).
   if (to)
     yasai_lazy::observe(0, 0, dst, count);
@@ -3625,7 +3627,9 @@ bool cuda_sim::yasai_symbol_address(const void *hostVar, unsigned long long *add
   if (st == tables.end()) return false;
   const symbol *sym = st->second->lookup(sym_name.c_str());
   if (sym == NULL) return false;
-  if (addr) *addr = sym->get_address();
+  // yasai: a constant's address is its module's segment in the constant window plus its offset,
+  // as on a GPU, where it equals cvta.const of the symbol (yasai_const_window.h).
+  if (addr) *addr = sym->is_const() ? yasai_const::host_address(sym) : sym->get_address();
   if (size) *size = sym->get_size_in_bytes();
   return true;
 }
