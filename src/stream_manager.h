@@ -36,7 +36,9 @@
 #include <stdint.h>
 #include <list>
 #include <map>
+#include <set>
 #include <memory>
+#include <mutex>
 #include "abstract_hardware_model.h"
 
 // class stream_barrier {
@@ -300,6 +302,16 @@ class stream_operation {
   uint64_t yasai_seq() const { return m_yasai_seq; }
   /// yasai: sets the sequence number (stream_manager::push only).
   void yasai_set_seq(uint64_t seq) { m_yasai_seq = seq; }
+  /// yasai: the cudaGraphLaunch this operation replays a node of (0: none); the host-ahead limit
+  /// counts all operations of one graph launch as one (stream_manager::yasai_limit_pending).
+  uint64_t yasai_group() const { return m_yasai_group; }
+  /// yasai: see yasai_group (stream_manager::push only).
+  void yasai_set_group(uint64_t group) { m_yasai_group = group; }
+  /// yasai: whether the host-ahead limit counts this operation: kernels, copies, memsets, event
+  /// records and host functions; a wait for an event and a no-op are not counted.
+  bool yasai_limited() const {
+    return m_type != stream_no_op && m_type != stream_wait_event;
+  }
   /// yasai: whether the operation can run now: a wait for an event whose awaited record has not
   /// completed cannot; every other operation can.
   bool yasai_ready() const;
@@ -314,6 +326,7 @@ class stream_operation {
 
  private:
   uint64_t m_yasai_seq = 0;          ///< yasai: host-order sequence number
+  uint64_t m_yasai_group = 0;        ///< yasai: graph launch of the operation (yasai_group)
   void (*m_host_fn)(void *) = NULL;  ///< yasai: host function of a stream_host_fn operation
   void *m_host_fn_user = NULL;       ///< yasai: its argument
   struct CUstream_st *m_stream;
@@ -354,6 +367,16 @@ struct CUstream_st {
   /// @param copies Incremented per copy or memset.
   /// @param kernels Incremented per kernel.
   void yasai_count_users(uint64_t lo, uint64_t hi, unsigned *copies, unsigned *kernels);
+  /// yasai: counts the queued operations (the running front included) that the host-ahead limit
+  /// counts (stream_operation::yasai_limited): one per operation outside a graph launch, and the
+  /// graph launches by their group identifiers.
+  /// @param ops Incremented per counted operation outside a graph launch.
+  /// @param groups Receives the graph launches with queued operations.
+  void yasai_count_pending(unsigned *ops, std::set<uint64_t> *groups);
+  /// yasai: prints the front operation, for the host-ahead limit's warning.
+  /// @param fp Output.
+  /// @return False when the stream is empty.
+  bool yasai_print_front(FILE *fp);
   void print(FILE *fp);
   unsigned get_uid() const { return m_uid; }
   /// yasai: sequence number of the front operation (the running or the next one).
@@ -435,6 +458,24 @@ class stream_manager {
   /// @param s Handle.
   /// @return Stream, or NULL for the legacy default stream.
   CUstream_st *yasai_resolve(CUstream_st *s);
+  /// yasai: the host-ahead limit (YASAI_MAX_PENDING_LAUNCHES=K; unset or 0: no limit). Before the
+  /// calling host thread queues op, it waits while K or more operations of this context are queued
+  /// and not yet completed, all streams together (stream_operation::yasai_limited; the operations
+  /// of one cudaGraphLaunch count as one, and the check runs at the launch's first operation). Only
+  /// the calling thread waits. A wait of kWarnS seconds of wall time in which the device completed
+  /// nothing prints one warning line; the wait goes on (a stall is the guard's matter). On a GPU
+  /// the device's speed keeps the host close; the simulator executes far slower, so a program's
+  /// host thread could run thousands of launches ahead and touch memory that queued work still
+  /// reads. K has no hardware counterpart.
+  /// @param op The operation about to be queued.
+  void yasai_limit_pending(const stream_operation &op);
+  /// yasai: the operations of this context that the host-ahead limit counts and that are queued
+  /// or running (yasai_limit_pending).
+  /// @return The count.
+  unsigned yasai_pending_ops();
+  /// yasai: prints "yasai-stream: host-ahead limit K: most queued N, waits W" (at exit when the
+  /// limit is on; the regression item launch_limit reads it).
+  void yasai_limit_summary();
   void pushCudaStreamWaitEventToAllStreams(CUevent_st *e, unsigned int flags);
   bool operation(bool *sim);
   void stop_all_running_kernels();
@@ -467,8 +508,23 @@ class stream_manager {
   uint64_t m_yasai_next_seq = 1;  // yasai: next sequence number (under m_lock)
   bool m_yasai_host_sync = false;  // yasai: YASAI_STREAM_ZERO_HOST_SYNC=1, the former waits
   std::map<pthread_t, CUstream_st *> m_yasai_per_thread;  // yasai: cudaStreamPerThread
+  unsigned m_yasai_max_pending = 0;  // yasai: YASAI_MAX_PENDING_LAUNCHES (0: no limit)
+  std::atomic<unsigned> m_yasai_max_pending_seen{0};  // yasai: most counted operations queued right after a queueing
+  std::atomic<unsigned long long> m_yasai_limit_waits{0};  // yasai: checks that had to wait at the limit
+  std::mutex m_yasai_limit_mu;  // yasai: held from a limited operation's check until it is queued
   pthread_mutex_t m_lock;
   std::list<struct CUstream_st *>::iterator m_last_stream;
 };
+
+/// yasai: device progress for the host-ahead limit's warning: stream operations completed and
+/// CTAs retired by the functional simulator, process-wide.
+extern std::atomic<unsigned long long> g_yasai_device_progress;
+
+/// yasai: a cudaGraphLaunch starts replaying its nodes on the calling thread: its operations get a
+/// new group identifier and count as one for the host-ahead limit (stream_manager::
+/// yasai_limit_pending). Ended by yasai_graph_launch_end.
+void yasai_graph_launch_begin();
+/// yasai: the replay that yasai_graph_launch_begin started has queued all its nodes.
+void yasai_graph_launch_end();
 
 #endif

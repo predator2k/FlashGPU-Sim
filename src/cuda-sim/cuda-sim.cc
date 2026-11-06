@@ -4093,6 +4093,8 @@ void yasai_func_run::retire(group &g) {
     if (m_uses_tmem) tmem.clear_cta(0, core->yasai_hw_cta());
     delete core;
     __atomic_fetch_add(&m_ctas_done, 1ul, __ATOMIC_RELAXED);  // pool threads retire at once
+    // yasai: device progress for the host-ahead limit's warning (stream_manager.h).
+    g_yasai_device_progress.fetch_add(1, std::memory_order_relaxed);
   }
   g.cores.clear();
 }

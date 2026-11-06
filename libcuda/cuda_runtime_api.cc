@@ -12933,6 +12933,12 @@ __host__ cudaError_t CUDARTAPI cudaGraphLaunch(cudaGraphExec_t graphExec, cudaSt
   }
   // Each replayed node's device record carries this call's correlation id, the graph, the node and the launch's index.
   const uint64_t launch_idx = graphExec->rec_launches++;
+  // yasai: the replay's operations count as one launch for the host-ahead limit
+  // (YASAI_MAX_PENDING_LAUNCHES, stream_manager::yasai_limit_pending).
+  struct yasai_graph_group_scope {
+    yasai_graph_group_scope() { yasai_graph_launch_begin(); }
+    ~yasai_graph_group_scope() { yasai_graph_launch_end(); }
+  } yasai_group_scope;
   for (const CUgraphNode_st &n : graphExec->nodes) {
     if (rec_api.on) {
       t_yasai_graph_replay.active = true;
