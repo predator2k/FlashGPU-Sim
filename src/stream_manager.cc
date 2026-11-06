@@ -197,6 +197,123 @@ void CUstream_st::record_next_done() {
   m_operations.pop_front();
   m_pending = false;
   pthread_mutex_unlock(&m_lock);
+  g_yasai_device_progress.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CUstream_st::yasai_count_pending(unsigned *ops, std::set<uint64_t> *groups) {
+  pthread_mutex_lock(&m_lock);
+  for (const stream_operation &op : m_operations) {
+    if (!op.yasai_limited()) continue;
+    if (op.yasai_group() != 0)
+      groups->insert(op.yasai_group());
+    else
+      ++*ops;
+  }
+  pthread_mutex_unlock(&m_lock);
+}
+
+bool CUstream_st::yasai_print_front(FILE *fp) {
+  pthread_mutex_lock(&m_lock);
+  const bool any = !m_operations.empty();
+  if (any) {
+    fprintf(fp, "stream %u%s: ", m_uid, m_pending ? " (running)" : "");
+    m_operations.front().print(fp);
+  }
+  pthread_mutex_unlock(&m_lock);
+  return any;
+}
+
+std::atomic<unsigned long long> g_yasai_device_progress{0};
+
+namespace {
+/// yasai: the cudaGraphLaunch whose nodes the calling thread queues (0: none), and whether its
+/// first operation passed the host-ahead limit already (yasai_graph_launch_begin).
+thread_local uint64_t t_yasai_graph_group = 0;
+thread_local bool t_yasai_graph_checked = false;
+std::atomic<uint64_t> g_yasai_next_graph_group{1};
+/// yasai: wall seconds a host thread waits at the host-ahead limit, with no device progress,
+/// before the warning line.
+constexpr double kWarnS = 600;
+/// yasai: the manager whose host-ahead limit summary is printed at exit (the first with the limit).
+stream_manager *g_yasai_limit_summary_of = NULL;
+void yasai_limit_summary_at_exit() {
+  if (g_yasai_limit_summary_of != NULL) g_yasai_limit_summary_of->yasai_limit_summary();
+}
+}  // namespace
+
+void yasai_graph_launch_begin() {
+  t_yasai_graph_group = g_yasai_next_graph_group.fetch_add(1, std::memory_order_relaxed);
+  t_yasai_graph_checked = false;
+}
+
+void yasai_graph_launch_end() {
+  t_yasai_graph_group = 0;
+  t_yasai_graph_checked = false;
+}
+
+unsigned stream_manager::yasai_pending_ops() {
+  unsigned ops = 0;
+  std::set<uint64_t> groups;
+  pthread_mutex_lock(&m_lock);
+  m_stream_zero.yasai_count_pending(&ops, &groups);
+  for (CUstream_st *s : m_streams) s->yasai_count_pending(&ops, &groups);
+  pthread_mutex_unlock(&m_lock);
+  return ops + (unsigned)groups.size();
+}
+
+void stream_manager::yasai_limit_summary() {
+  printf("yasai-stream: host-ahead limit %u: most queued %u, waits %llu\n", m_yasai_max_pending,
+         m_yasai_max_pending_seen.load(), m_yasai_limit_waits.load());
+  fflush(stdout);
+}
+
+void stream_manager::yasai_limit_pending(const stream_operation &op) {
+  if (m_yasai_max_pending == 0 || !op.yasai_limited()) return;
+  if (t_yasai_graph_group != 0) {
+    if (t_yasai_graph_checked) return;  // later nodes of a graph launch that passed
+    t_yasai_graph_checked = true;
+  }
+  unsigned n = yasai_pending_ops();
+  if (n < m_yasai_max_pending) return;
+  m_yasai_limit_waits.fetch_add(1, std::memory_order_relaxed);
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  double quiet_since = t0.tv_sec + t0.tv_nsec * 1e-9;
+  unsigned long long progress = g_yasai_device_progress.load(std::memory_order_relaxed);
+  bool warned = false;
+  unsigned us = 20;
+  while ((n = yasai_pending_ops()) >= m_yasai_max_pending) {
+    yasai_backoff(&us);
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    const double now = t.tv_sec + t.tv_nsec * 1e-9;
+    const unsigned long long p = g_yasai_device_progress.load(std::memory_order_relaxed);
+    if (p != progress) {
+      progress = p;
+      quiet_since = now;
+      warned = false;
+    } else if (!warned && now - quiet_since > kWarnS) {
+      // One line per quiet stretch: the fronts of the streams, then the operation that waits.
+      printf("yasai-stream: warning: a host thread has waited %.0f s at YASAI_STREAM_MAX_PENDING_OPS=%u (%u queued) "
+             "while the device completed nothing; fronts:",
+             now - quiet_since, m_yasai_max_pending, n);
+      pthread_mutex_lock(&m_lock);
+      printf(" [");
+      m_stream_zero.yasai_print_front(stdout);
+      printf("]");
+      for (CUstream_st *s : m_streams) {
+        printf(" [");
+        s->yasai_print_front(stdout);
+        printf("]");
+      }
+      pthread_mutex_unlock(&m_lock);
+      printf("; waiting to queue: ");
+      op.print(stdout);
+      printf("\n");
+      fflush(stdout);
+      warned = true;
+    }
+  }
 }
 
 stream_operation CUstream_st::next() {
@@ -393,6 +510,27 @@ stream_manager::stream_manager(gpgpu_sim *gpu, bool cuda_launch_blocking) {
   m_cuda_launch_blocking = cuda_launch_blocking;
   const char *hs = getenv("YASAI_STREAM_ZERO_HOST_SYNC");
   m_yasai_host_sync = hs != NULL && atoi(hs) != 0;
+  // yasai: the host-ahead limit (yasai_limit_pending); unset, empty or 0 is no limit, the former
+  // behaviour.
+  const char *mp = getenv("YASAI_STREAM_MAX_PENDING_OPS");
+  if (mp != NULL && *mp != '\0') {
+    char *end = NULL;
+    const long k = strtol(mp, &end, 10);
+    if (end == mp || *end != '\0' || k < 0) {
+      fprintf(stderr, "yasai-stream: YASAI_STREAM_MAX_PENDING_OPS=%s is not a count (0 or more)\n", mp);
+      abort();
+    }
+    m_yasai_max_pending = (unsigned)k;
+  }
+  if (m_yasai_max_pending > 0) {
+    printf("yasai-stream: a host thread waits while %u or more stream operations are queued and not completed "
+           "(YASAI_STREAM_MAX_PENDING_OPS)\n",
+           m_yasai_max_pending);
+    if (g_yasai_limit_summary_of == NULL) {
+      g_yasai_limit_summary_of = this;
+      atexit(yasai_limit_summary_at_exit);
+    }
+  }
   pthread_mutex_init(&m_lock, NULL);
   m_last_stream = m_streams.begin();
 }
@@ -769,6 +907,26 @@ void stream_manager::yasai_wait_device() {
 uint64_t stream_manager::push(stream_operation op) {
   struct CUstream_st *stream = yasai_resolve(op.get_stream());
   op.set_stream(stream);
+  // yasai: the operations of one cudaGraphLaunch count as one for the host-ahead limit, which the
+  // calling thread passes before the operation is queued (yasai_limit_pending).
+  if (t_yasai_graph_group != 0) op.yasai_set_group(t_yasai_graph_group);
+  // The check and the queueing happen under one mutex, so threads that pass the check together
+  // never queue more than the limit; the lock is released when the operation is queued.
+  std::unique_lock<std::mutex> yasai_limit_lock(m_yasai_limit_mu, std::defer_lock);
+  const bool yasai_limited = m_yasai_max_pending > 0 && op.yasai_limited();
+  if (yasai_limited) {
+    yasai_limit_lock.lock();
+    yasai_limit_pending(op);
+  }
+  // Records the most counted operations queued, then lets the next thread check.
+  auto yasai_queued = [&]() {
+    if (!yasai_limited) return;
+    const unsigned n = yasai_pending_ops();
+    unsigned seen = m_yasai_max_pending_seen.load(std::memory_order_relaxed);
+    while (n > seen && !m_yasai_max_pending_seen.compare_exchange_weak(seen, n)) {
+    }
+    yasai_limit_lock.unlock();
+  };
   if (!m_cuda_launch_blocking && !m_yasai_host_sync) {
     // yasai: no host wait; see front() and yasai_eligible.
     pthread_mutex_lock(&m_lock);
@@ -792,6 +950,7 @@ uint64_t stream_manager::push(stream_operation op) {
       printf("\n");
     }
     pthread_mutex_unlock(&m_lock);
+    yasai_queued();
     return seq;
   }
 
@@ -826,6 +985,7 @@ uint64_t stream_manager::push(stream_operation op) {
   }
   if (g_debug_execution >= 3) print_impl(stdout);
   pthread_mutex_unlock(&m_lock);
+  yasai_queued();
   if (!m_gpu->is_SST_mode() && (m_cuda_launch_blocking || stream == NULL)) {
     unsigned int wait_amount = 100;
     unsigned int wait_cap = 100000;  // 100ms
