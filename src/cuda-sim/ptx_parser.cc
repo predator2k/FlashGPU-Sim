@@ -387,12 +387,13 @@ void ptx_recognizer::add_identifier(const char *identifier, int array_dim,
     g_last_symbol = s;
     if (g_func_decl) return;
     // yasai: the per-kernel pieces of one source module repeat its constants, which stay the
-    // module's; a constant of another module under the same name would need its own copy in that
-    // module's segment, which one symbol table cannot hold (yasai_const_window.h).
+    // module's. Constants of two modules under one name have one symbol each, because the module
+    // scope renames them (yasai_module_scope.h). What reaches this branch from another module is a
+    // .weak or .common constant, which has no GPU reference, or a run with YASAI_MODULE_SCOPE=0.
     if (yasai_const_decl && s->is_const() &&
         s->yasai_const_segment() != yasai_const::current(gpgpu_ctx->g_filename)) {
       const yasai_const::segment *first = s->yasai_const_segment();
-      yasai_const::not_modeled("const_defined_twice", identifier,
+      yasai_const::not_modeled("const_defined_twice_unscoped", identifier,
                                (first ? first->key : std::string("?")) + " and " +
                                    yasai_const::current(gpgpu_ctx->g_filename)->key);
     }

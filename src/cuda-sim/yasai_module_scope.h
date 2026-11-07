@@ -6,11 +6,12 @@
 // symbol: the second module's declaration was skipped and its kernels read the first module's
 // data (UCCL-EP's device assert printed a libtorch_cuda string). A module-local symbol is a
 // file-scope .global, .const or .shared variable, or a .func, declared without .visible,
-// .extern, .weak or .common. scope_file() gives every such name of one PTX file a suffix that
-// is unique to the file ("__ym" and a hash of the file's base name, the same in every process
-// and run), in a copy of the file; .visible, .extern and .weak names keep resolving across
-// modules by name. local_name() maps a name that the host registers for a module
-// (__cudaRegisterVar of a static device variable) to the module's renamed symbol.
+// .extern, .weak or .common; a .visible .const is module-local as well, since each module has its
+// own copy on a GPU and no module reaches another's. scope_file() gives every such name of one PTX
+// file a suffix that is unique to the file ("__ym" and a hash of the file's base name, the same in
+// every process and run), in a copy of the file; the other .visible, .extern and .weak names keep
+// resolving across modules by name. local_name() maps a name that the host registers for a module
+// (__cudaRegisterVar of a device variable) to the module's renamed symbol.
 //
 // Kernels (.entry) have linkage, but separate modules may still define the same kernel name
 // with different bodies (two Inductor graphs both compile a "triton_poi_fused_..._0"; two
@@ -79,14 +80,33 @@ std::string library_unit(const std::string &library);
 std::string source_name(const std::string &name);
 
 /// The renamed symbol for a module-local name registered by the host, or name itself when no
-/// module renamed it. The candidate whose file has the library key of library (the fat
-/// binary's file; "libfoo" for "libfoo.so", "libfoo.so.1.sm_120.ptx" and "libfoo.1.sm_120a.ptx")
-/// is chosen. Without a match, a single candidate is chosen unless some module defines the name
-/// with linkage; otherwise the name is returned unchanged.
+/// module renamed it. The candidate of the file named library is chosen first, then the one whose
+/// file has the library key of library (the fat binary's file; "libfoo" for "libfoo.so",
+/// "libfoo.so.1.sm_120.ptx" and "libfoo.1.sm_120a.ptx"), or stands for that library
+/// (note_file_library). Without a match, a single candidate is chosen unless some module defines
+/// the name with linkage; otherwise the name is returned unchanged.
 /// @param name Name as the host registers it.
-/// @param library File name of the fat binary that registers it ("" when unknown).
+/// @param library File name of the fat binary that registers it ("" when unknown), or the PTX file
+///        of a driver-API module.
 /// @return The name to look up.
 std::string local_name(const std::string &name, const std::string &library);
+
+/// Whether some module renamed name, so that local_name returning it unchanged means that the
+/// registering module was not found.
+/// @param name Name as the host registers it.
+/// @return Whether a renamed symbol of that name exists.
+bool has_local_candidates(const std::string &name);
+
+/// Says that a PTX file stands for a library (YASAI_PTX_LIB_OVERRIDE: one merged file in place of a
+/// library's files, whose own name says nothing). Call it before scope_file for that file.
+/// @param path PTX file, as passed to scope_file.
+/// @param library The library's key ("libfoo").
+void note_file_library(const std::string &path, const std::string &library);
+
+/// Whether a PTX file declares a .const variable.
+/// @param path PTX file.
+/// @return Whether it does (false when the file cannot be read).
+bool file_defines_const(const std::string &path);
 
 }  // namespace yasai_scope
 

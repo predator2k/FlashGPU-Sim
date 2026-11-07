@@ -24,11 +24,17 @@
 // module a read past a segment reaches are not compared with a GPU.
 // A module is a source PTX file: the per-kernel pieces that lazy loading parses from one file share
 // the file's segment (yasai_const::module_scope names the file while a piece is parsed).
+// Two modules that define a constant under one name each have their own copy, for any combination of
+// .visible and no linkage, of sizes and of alignments: each kernel reads its own module's bytes, each
+// module's cuModuleGetGlobal, cuLibraryGetGlobal, cudaGetSymbolAddress and cudaMemcpyToSymbol reach
+// its own copy, and a write to one leaves the other (measured on a GB10 and an RTX 5090,
+// tests/ldconst_dup.cu and tests/ldconst_dup_rt.cu). The simulator keeps one symbol table for all
+// modules, so the module scope renames these names per module (yasai_module_scope.h).
 // Not modelled, and stopped with a "not modeled" line (also appended to YASAI_CVTA_REPORT): banked
-// constants (.const[n]), .extern .const declarations, and a .const symbol that two source modules
-// define under one name (the simulator keeps one symbol table for all modules). The simulator does
-// not unload modules (cuModuleUnload does nothing), so the reuse of an unloaded segment never
-// happens here.
+// constants (.const[n]), .extern .const declarations, .weak or .common constants under one name in
+// two modules (no GPU reference), and a registered constant whose module cannot be found. The
+// simulator does not unload modules (cuModuleUnload does nothing), so the reuse of an unloaded segment
+// never happens here.
 #ifndef YASAI_CONST_WINDOW_H
 #define YASAI_CONST_WINDOW_H
 
@@ -126,7 +132,7 @@ bool contains(segment *seg, unsigned long long addr);
 
 /// Stops the process for a constant form the model does not cover: prints a "not modeled" line and
 /// appends it to the file YASAI_CVTA_REPORT names.
-/// @param what Which form (banked, extern, defined twice).
+/// @param what Which form (banked, extern, defined twice without a module scope, module not found).
 /// @param name Symbol name.
 /// @param detail Where it was found.
 [[noreturn]] void not_modeled(const char *what, const char *name, const std::string &detail);

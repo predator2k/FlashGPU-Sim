@@ -42,6 +42,7 @@ struct Registry {
   std::map<std::string, std::map<std::string, std::string>> path_entries;  ///< scanned path ->
                                                     ///< (.entry name -> renamed symbol)
   std::map<std::string, std::string> entry_source;  ///< renamed .entry symbol -> source name
+  std::map<std::string, std::string> file_library;  ///< scanned path -> library it stands for
 };
 
 /// The process-wide registry.
@@ -134,21 +135,28 @@ int brace_delta(const std::string &line) {
 
 /// Name of the symbol that a file-scope line declares or defines, or "": a .func, or a
 /// .global/.const/.shared variable. *linked tells whether the line gives it linkage (.visible,
-/// .extern, .weak or .common); without it the symbol is module-local.
+/// .extern, .weak or .common); without it the symbol is module-local. A .visible .const is
+/// module-local too: every module has its own copy under that name, measured on a GB10 and an RTX
+/// 5090 (tools/fakeenv/sim_backend/tests/ldconst_dup.cu in the yasai repository), and no other
+/// module reaches it by name, because .extern .const stops the parser (yasai_const_window.h).
 /// @param line PTX line at brace depth 0.
 /// @param linked Set to whether the declaration has linkage (.extern counts as linked).
 /// @param defines Set to whether the line defines the name for other modules (.visible, .weak,
 ///        .common).
+/// @param visible_const Set to whether the line defines a .visible .const without other linkage.
+/// @param is_const Set to whether the line declares a .const variable.
 /// @return The symbol name, or "".
-std::string decl_name(const std::string &line, bool *linked, bool *defines) {
+std::string decl_name(const std::string &line, bool *linked, bool *defines, bool *visible_const, bool *is_const) {
   *linked = false;
   *defines = false;
+  *visible_const = false;
+  *is_const = false;
   size_t p = line.find_first_not_of(" \t");
   if (p == std::string::npos || line[p] != '.') return "";
   // An .entry or .func parameter line sits at depth 0 too (".param .u64 .ptr .global .align 1
   // k_param_0,"); its .global is the pointer's state space, not a declaration.
   if (line.compare(p, 6, ".param") == 0 || line.compare(p, 4, ".reg") == 0) return "";
-  bool linkage = false, var = false, func = false;
+  bool linkage = false, var = false, func = false, visible = false, other_linkage = false;
   // Directive words (".global", ".align 8", ".b8", ...) up to the name or the .func keyword.
   while (p < line.size() && line[p] == '.') {
     size_t e = p + 1;
@@ -158,6 +166,9 @@ std::string decl_name(const std::string &line, bool *linked, bool *defines) {
     if (p == std::string::npos) return "";
     if (w == ".visible" || w == ".extern" || w == ".weak" || w == ".common") linkage = true;
     if (w == ".visible" || w == ".weak" || w == ".common") *defines = true;
+    if (w == ".visible") visible = true;
+    if (w == ".extern" || w == ".weak" || w == ".common") other_linkage = true;
+    if (w == ".const") *is_const = true;
     if (w == ".global" || w == ".const" || w == ".shared") var = true;
     if (w == ".entry") return "";
     if (w == ".align") {  // its value
@@ -171,6 +182,11 @@ std::string decl_name(const std::string &line, bool *linked, bool *defines) {
     }
   }
   if (!(var || func)) return "";
+  if (*is_const && visible && !other_linkage) {
+    *visible_const = true;
+    *defines = false;
+    linkage = false;
+  }
   *linked = linkage;
   if (func && p < line.size() && line[p] == '(') {  // return parameter list
     int depth = 0;
@@ -214,10 +230,12 @@ std::string entry_decl_name(const std::string &line) {
 /// @param path PTX file.
 /// @param defined Receives the names the file defines with linkage (.visible, .weak, .common).
 /// @param entries Receives the .entry names of the file, in file order.
+/// @param visible_consts Receives the names among the result that the file defines as .visible .const.
 /// @param hash Receives the 64-bit FNV-1a hash of the file's lines.
 /// @return The names (empty when the file cannot be read).
 std::set<std::string> local_names(const std::string &path, std::set<std::string> *defined,
-                                  std::vector<std::string> *entries, uint64_t *hash) {
+                                  std::vector<std::string> *entries, std::set<std::string> *visible_consts,
+                                  uint64_t *hash) {
   std::set<std::string> names;
   std::ifstream in(path);
   std::string line;
@@ -231,10 +249,11 @@ std::set<std::string> local_names(const std::string &path, std::set<std::string>
     hv ^= uint8_t('\n');
     hv *= 1099511628211ull;
     if (depth == 0) {
-      bool linked = false, defines = false;
-      const std::string n = decl_name(line, &linked, &defines);
+      bool linked = false, defines = false, visible_const = false, is_const = false;
+      const std::string n = decl_name(line, &linked, &defines, &visible_const, &is_const);
       if (!n.empty() && !linked) names.insert(n);
       if (!n.empty() && defines) defined->insert(n);
+      if (!n.empty() && visible_const) visible_consts->insert(n);
       const std::string en = entry_decl_name(line);
       if (!en.empty()) entries->push_back(en);
     }
@@ -357,7 +376,8 @@ std::string scope_file(const std::string &path, const std::string &unit_in) {
   if (it != r.scoped_path.end()) return it->second;
   uint64_t content_hash = 0;
   std::vector<std::string> entries;
-  std::set<std::string> names = local_names(path, &r.defined, &entries, &content_hash);
+  std::set<std::string> visible_consts;
+  std::set<std::string> names = local_names(path, &r.defined, &entries, &visible_consts, &content_hash);
   // A kernel name that another unit defined first is renamed in this file, so each unit keeps
   // its own kernel; files of one unit (one library's architecture variants) share their names.
   const std::string unit = unit_in.empty() ? file_unit(base_name(path)) : unit_in;
@@ -370,13 +390,17 @@ std::string scope_file(const std::string &path, const std::string &unit_in) {
   names.insert(dup_entries.begin(), dup_entries.end());
   // The renamed kernels depend on which units registered before this file, so they are part of
   // the copy's identity: the shared cache key hashes them after the file's lines.
-  for (const std::string &e : dup_entries) {
-    for (char c : e) {
-      content_hash ^= uint8_t(c);
+  // So are the renamed .visible .const names: a copy that trees before this rule wrote keeps those
+  // names, and must not be reused.
+  for (const std::set<std::string> *part : {&dup_entries, &visible_consts}) {
+    for (const std::string &e : *part) {
+      for (char c : e) {
+        content_hash ^= uint8_t(c);
+        content_hash *= 1099511628211ull;
+      }
+      content_hash ^= uint8_t('\0');
       content_hash *= 1099511628211ull;
     }
-    content_hash ^= uint8_t('\0');
-    content_hash *= 1099511628211ull;
   }
   if (names.empty()) {
     r.scoped_path[path] = path;
@@ -454,7 +478,8 @@ std::string scope_file(const std::string &path, const std::string &unit_in) {
       r.path_entries[path][n] = n + suffix;
       r.entry_source[n + suffix] = n;
     } else {
-      r.renamed[n].emplace_back(base, n + suffix);
+      const auto noted = r.file_library.find(path);
+      r.renamed[n].emplace_back(noted == r.file_library.end() ? base : noted->second, n + suffix);
     }
   }
   printf("GPGPU-Sim PTX: %zu module-local symbols of %s scoped to the module (%s)\n", names.size(),
@@ -472,17 +497,48 @@ std::string local_name(const std::string &name, const std::string &library) {
   auto it = r.renamed.find(name);
   if (it == r.renamed.end()) return name;
   const std::string lib = base_name(library);
-  // A module of the registering library is chosen first. Without one (the library is unknown,
+  // The module loaded from that file is chosen first (the driver API names the file itself), then
+  // a module of the registering library. Without one (the library is unknown,
   // or the fat binary was registered under another file name), a single candidate is the
   // registered symbol unless some module defines the name with linkage: another library's local
   // name must not capture a .visible name.
   if (!lib.empty()) {
+    for (const auto &cand : it->second)
+      if (cand.first == lib) return cand.second;
     const std::string key = library_key(lib);
     for (const auto &cand : it->second)
       if (library_key(cand.first) == key) return cand.second;
   }
   if (it->second.size() == 1 && !r.defined.count(name)) return it->second.front().second;
   return name;
+}
+
+bool has_local_candidates(const std::string &name) {
+  Registry &r = registry();
+  std::lock_guard<std::mutex> lock(r.mu);
+  return r.renamed.count(name) != 0;
+}
+
+void note_file_library(const std::string &path, const std::string &library) {
+  Registry &r = registry();
+  std::lock_guard<std::mutex> lock(r.mu);
+  r.file_library[path] = library;
+}
+
+bool file_defines_const(const std::string &path) {
+  std::ifstream in(path);
+  std::string line;
+  int depth = 0;
+  while (std::getline(in, line)) {
+    if (depth == 0) {
+      bool linked = false, defines = false, visible_const = false, is_const = false;
+      const std::string n = decl_name(line, &linked, &defines, &visible_const, &is_const);
+      if (!n.empty() && is_const) return true;
+    }
+    depth += brace_delta(line);
+    if (depth < 0) depth = 0;
+  }
+  return false;
 }
 
 std::string module_entry_name(const std::string &path, const std::string &name) {

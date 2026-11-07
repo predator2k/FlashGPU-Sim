@@ -1147,8 +1147,28 @@ static std::map<unsigned, std::string> &yasai_module_ptx() {
   return m;
 }
 
+// yasai: a new file for one more load of a PTX file that declares .const data: the text with a new
+// name, so the load gets its own module (kernels, symbols and constant segment). Beside the file, or
+// in the working directory when that cannot be written.
+//   ptx_path  the file loaded before
+static std::string yasai_module_reload_copy(const std::string &ptx_path) {
+  static std::map<std::string, unsigned> loads;
+  const std::string name = ".load" + std::to_string(++loads[ptx_path]) + ".ptx";
+  std::ifstream in(ptx_path, std::ios::binary);
+  std::string target = ptx_path + name;
+  std::ofstream out(target, std::ios::binary);
+  if (!out.good()) {
+    const size_t slash = ptx_path.rfind('/');
+    target = (slash == std::string::npos ? ptx_path : ptx_path.substr(slash + 1)) + name;
+    out.open(target, std::ios::binary);
+  }
+  out << in.rdbuf();
+  out.close();
+  return target;
+}
+
 static CUresult load_module_from_ptx_file(CUmodule *module,
-                                          const std::string &ptx_path,
+                                          const std::string &ptx_path_loaded,
                                           const char *caller) {
   std::lock_guard<std::recursive_mutex> yasai_lock(yasai_func::ptx_load_mutex());
   gpgpu_context *ctx = GPGPU_Context();
@@ -1157,11 +1177,18 @@ static CUresult load_module_from_ptx_file(CUmodule *module,
     return CUDA_ERROR_INVALID_HANDLE;
   }
 
-  if (ptx_path.empty() || !file_exists(ptx_path)) {
+  if (ptx_path_loaded.empty() || !file_exists(ptx_path_loaded)) {
     printf("GPGPU-Sim PTX: ERROR: %s sidecar PTX not found: %s\n", caller,
-           ptx_path.c_str());
+           ptx_path_loaded.c_str());
     return CUDA_ERROR_INVALID_VALUE;
   }
+  // yasai: each load of a text with .const data has its own copy of the constants on a GPU
+  // (tests/ldconst_dup.cu, case same_text), so such a load gets a file of its own.
+  bool yasai_loaded_before = false;
+  for (const auto &m : yasai_module_ptx()) yasai_loaded_before = yasai_loaded_before || m.second == ptx_path_loaded;
+  const std::string ptx_path = yasai_loaded_before && yasai_scope::file_defines_const(ptx_path_loaded)
+                                   ? yasai_module_reload_copy(ptx_path_loaded)
+                                   : ptx_path_loaded;
 
   CUctx_st *context = GPGPUSim_Context(ctx);
   unsigned module_handle = get_next_fat_bin_handle();
@@ -1551,8 +1578,9 @@ void cudaRegisterVarInternal(
           .use_cuobjdump())
     ctx->cuobjdumpParseBinary((unsigned)(unsigned long long)fatCubinHandle);
   fflush(stdout);
-  // yasai: a static __device__ / __constant__ variable is module-local in the PTX and was
-  // renamed with its module (yasai_module_scope.h); the fat binary's library picks the module.
+  // yasai: a static __device__ variable or a __constant__ is module-local in the PTX and was
+  // renamed with its module (yasai_module_scope.h). The ELF file that holds the fat binary picks the
+  // module; every fat binary may be registered under the file name "default".
   const unsigned reg_handle = (unsigned)(unsigned long long)fatCubinHandle;
   std::string reg_library;
   const auto late = yasai_handle_library().find(reg_handle);
@@ -1562,7 +1590,16 @@ void cudaRegisterVarInternal(
     const auto reg_lib = ctx->api->fatbinmap.find(int(reg_handle));
     if (reg_lib != ctx->api->fatbinmap.end()) reg_library = reg_lib->second;
   }
+  const auto reg_fatbin = yasai_handle_fatbin().find(reg_handle);
+  if (reg_fatbin != yasai_handle_fatbin().end() && reg_fatbin->second != NULL) {
+    Dl_info reg_info;
+    char reg_resolved[4096];
+    if (dladdr(reg_fatbin->second, &reg_info) && reg_info.dli_fname != NULL && reg_info.dli_fname[0] != '\0')
+      reg_library = realpath(reg_info.dli_fname, reg_resolved) ? reg_resolved : reg_info.dli_fname;
+  }
   const std::string reg_name = yasai_scope::local_name(deviceName, reg_library);
+  if (constant && !global && !ext && reg_name == deviceName && yasai_scope::has_local_candidates(deviceName))
+    yasai_const::not_modeled("const_module_not_found", deviceName, reg_library);
   if (constant && !global && !ext) {
     ctx->func_sim->gpgpu_ptx_sim_register_const_variable(hostVar, reg_name.c_str(),
                                                          size);
@@ -6648,6 +6685,7 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
     const size_t sm_pos = first.find("sm_");
     yasai_override_arch()[ov.second] =
         sm_pos == std::string::npos ? "" : first.substr(sm_pos, first.find('.', sm_pos) - sm_pos);
+    yasai_scope::note_file_library(ov.second, ov.first);
     printf("GPGPU-Sim PTX: %zu PTX files of %s replaced by %s\n",
            selected_files.size() - first_of_library, lib.c_str(), ov.second.c_str());
     selected_files.resize(first_of_library);
@@ -6684,6 +6722,7 @@ void gpgpu_context::cuobjdumpParseBinary(unsigned int handle) {
       continue;
     }
     yasai_override_arch()[ov.second] = arch;
+    yasai_scope::note_file_library(ov.second, ov.first);
     selected_files.push_back(ov.second);
     printf("GPGPU-Sim PTX: %s carries no PTX; %s (%s) added for it\n", ov.first.c_str(),
            ov.second.c_str(), arch.c_str());
@@ -13104,6 +13143,13 @@ extern "C" CUresult CUDAAPI cuLibraryGetModule(CUmodule *pMod, void *library) {
   if (pMod == NULL) return CUDA_ERROR_INVALID_VALUE;
   *pMod = (CUmodule)library;
   return CUDA_SUCCESS;
+}
+
+// cuLibraryGetGlobal: the address and size of the library's variable, as for its module.
+//   dptr, bytes, library, name  as in cuda.h
+extern "C" CUresult CUDAAPI cuLibraryGetGlobal(CUdeviceptr *dptr, size_t *bytes, void *library, const char *name) {
+  YASAI_FAULT_CU();
+  return cuModuleGetGlobal(dptr, bytes, (CUmodule)library, name);
 }
 
 // cuLibraryGetKernel: the kernel of that name.
