@@ -135,28 +135,30 @@ int brace_delta(const std::string &line) {
 
 /// Name of the symbol that a file-scope line declares or defines, or "": a .func, or a
 /// .global/.const/.shared variable. *linked tells whether the line gives it linkage (.visible,
-/// .extern, .weak or .common); without it the symbol is module-local. A .visible .const is
-/// module-local too: every module has its own copy under that name, measured on a GB10 and an RTX
-/// 5090 (tools/fakeenv/sim_backend/tests/ldconst_dup.cu in the yasai repository), and no other
-/// module reaches it by name, because .extern .const stops the parser (yasai_const_window.h).
+/// .extern, .weak or .common); without it the symbol is module-local. A .visible .const and a
+/// .global of any linkage are module-local too: every module has its own copy under that name,
+/// measured on a GB10 and an RTX 5090 (tools/fakeenv/sim_backend/tests/ldconst_dup.cu and
+/// global_dup.cu in the yasai repository; a loaded module that only declares a .global with .extern
+/// gets its own copy as well). No other module reaches a .const by name, because .extern .const
+/// stops the parser (yasai_const_window.h).
 /// @param line PTX line at brace depth 0.
 /// @param linked Set to whether the declaration has linkage (.extern counts as linked).
 /// @param defines Set to whether the line defines the name for other modules (.visible, .weak,
 ///        .common).
-/// @param visible_const Set to whether the line defines a .visible .const without other linkage.
-/// @param is_const Set to whether the line declares a .const variable.
+/// @param scoped_with_linkage Set to whether the line has linkage and is module-local all the same.
+/// @param is_data Set to whether the line declares a .const or .global variable.
 /// @return The symbol name, or "".
-std::string decl_name(const std::string &line, bool *linked, bool *defines, bool *visible_const, bool *is_const) {
+std::string decl_name(const std::string &line, bool *linked, bool *defines, bool *scoped_with_linkage, bool *is_data) {
   *linked = false;
   *defines = false;
-  *visible_const = false;
-  *is_const = false;
+  *scoped_with_linkage = false;
+  *is_data = false;
   size_t p = line.find_first_not_of(" \t");
   if (p == std::string::npos || line[p] != '.') return "";
   // An .entry or .func parameter line sits at depth 0 too (".param .u64 .ptr .global .align 1
   // k_param_0,"); its .global is the pointer's state space, not a declaration.
   if (line.compare(p, 6, ".param") == 0 || line.compare(p, 4, ".reg") == 0) return "";
-  bool linkage = false, var = false, func = false, visible = false, other_linkage = false;
+  bool linkage = false, var = false, func = false, visible = false, other_linkage = false, is_const = false, is_global = false;
   // Directive words (".global", ".align 8", ".b8", ...) up to the name or the .func keyword.
   while (p < line.size() && line[p] == '.') {
     size_t e = p + 1;
@@ -168,7 +170,8 @@ std::string decl_name(const std::string &line, bool *linked, bool *defines, bool
     if (w == ".visible" || w == ".weak" || w == ".common") *defines = true;
     if (w == ".visible") visible = true;
     if (w == ".extern" || w == ".weak" || w == ".common") other_linkage = true;
-    if (w == ".const") *is_const = true;
+    if (w == ".const") is_const = true;
+    if (w == ".global") is_global = true;
     if (w == ".global" || w == ".const" || w == ".shared") var = true;
     if (w == ".entry") return "";
     if (w == ".align") {  // its value
@@ -182,8 +185,9 @@ std::string decl_name(const std::string &line, bool *linked, bool *defines, bool
     }
   }
   if (!(var || func)) return "";
-  if (*is_const && visible && !other_linkage) {
-    *visible_const = true;
+  *is_data = is_const || is_global;
+  if ((is_const && visible && !other_linkage) || (is_global && linkage)) {
+    *scoped_with_linkage = true;
     *defines = false;
     linkage = false;
   }
@@ -230,11 +234,11 @@ std::string entry_decl_name(const std::string &line) {
 /// @param path PTX file.
 /// @param defined Receives the names the file defines with linkage (.visible, .weak, .common).
 /// @param entries Receives the .entry names of the file, in file order.
-/// @param visible_consts Receives the names among the result that the file defines as .visible .const.
+/// @param scoped_linked Receives the names among the result that have linkage in the file (.visible .const, .global with linkage).
 /// @param hash Receives the 64-bit FNV-1a hash of the file's lines.
 /// @return The names (empty when the file cannot be read).
 std::set<std::string> local_names(const std::string &path, std::set<std::string> *defined,
-                                  std::vector<std::string> *entries, std::set<std::string> *visible_consts,
+                                  std::vector<std::string> *entries, std::set<std::string> *scoped_linked,
                                   uint64_t *hash) {
   std::set<std::string> names;
   std::ifstream in(path);
@@ -249,11 +253,11 @@ std::set<std::string> local_names(const std::string &path, std::set<std::string>
     hv ^= uint8_t('\n');
     hv *= 1099511628211ull;
     if (depth == 0) {
-      bool linked = false, defines = false, visible_const = false, is_const = false;
-      const std::string n = decl_name(line, &linked, &defines, &visible_const, &is_const);
+      bool linked = false, defines = false, scoped_with_linkage = false, is_data = false;
+      const std::string n = decl_name(line, &linked, &defines, &scoped_with_linkage, &is_data);
       if (!n.empty() && !linked) names.insert(n);
       if (!n.empty() && defines) defined->insert(n);
-      if (!n.empty() && visible_const) visible_consts->insert(n);
+      if (!n.empty() && scoped_with_linkage) scoped_linked->insert(n);
       const std::string en = entry_decl_name(line);
       if (!en.empty()) entries->push_back(en);
     }
@@ -376,8 +380,8 @@ std::string scope_file(const std::string &path, const std::string &unit_in) {
   if (it != r.scoped_path.end()) return it->second;
   uint64_t content_hash = 0;
   std::vector<std::string> entries;
-  std::set<std::string> visible_consts;
-  std::set<std::string> names = local_names(path, &r.defined, &entries, &visible_consts, &content_hash);
+  std::set<std::string> scoped_linked;
+  std::set<std::string> names = local_names(path, &r.defined, &entries, &scoped_linked, &content_hash);
   // A kernel name that another unit defined first is renamed in this file, so each unit keeps
   // its own kernel; files of one unit (one library's architecture variants) share their names.
   const std::string unit = unit_in.empty() ? file_unit(base_name(path)) : unit_in;
@@ -390,9 +394,9 @@ std::string scope_file(const std::string &path, const std::string &unit_in) {
   names.insert(dup_entries.begin(), dup_entries.end());
   // The renamed kernels depend on which units registered before this file, so they are part of
   // the copy's identity: the shared cache key hashes them after the file's lines.
-  // So are the renamed .visible .const names: a copy that trees before this rule wrote keeps those
+  // So are the renamed names with linkage: a copy that trees before this rule wrote keeps those
   // names, and must not be reused.
-  for (const std::set<std::string> *part : {&dup_entries, &visible_consts}) {
+  for (const std::set<std::string> *part : {&dup_entries, &scoped_linked}) {
     for (const std::string &e : *part) {
       for (char c : e) {
         content_hash ^= uint8_t(c);
@@ -525,15 +529,15 @@ void note_file_library(const std::string &path, const std::string &library) {
   r.file_library[path] = library;
 }
 
-bool file_defines_const(const std::string &path) {
+bool file_defines_data(const std::string &path) {
   std::ifstream in(path);
   std::string line;
   int depth = 0;
   while (std::getline(in, line)) {
     if (depth == 0) {
-      bool linked = false, defines = false, visible_const = false, is_const = false;
-      const std::string n = decl_name(line, &linked, &defines, &visible_const, &is_const);
-      if (!n.empty() && is_const) return true;
+      bool linked = false, defines = false, scoped_with_linkage = false, is_data = false;
+      const std::string n = decl_name(line, &linked, &defines, &scoped_with_linkage, &is_data);
+      if (!n.empty() && is_data) return true;
     }
     depth += brace_delta(line);
     if (depth < 0) depth = 0;

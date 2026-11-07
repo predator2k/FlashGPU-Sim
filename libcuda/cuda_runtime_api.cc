@@ -1147,7 +1147,7 @@ static std::map<unsigned, std::string> &yasai_module_ptx() {
   return m;
 }
 
-// yasai: a new file for one more load of a PTX file that declares .const data: the text with a new
+// yasai: a new file for one more load of a PTX file that declares .const or .global data: the text with a new
 // name, so the load gets its own module (kernels, symbols and constant segment). Beside the file, or
 // in the working directory when that cannot be written.
 //   ptx_path  the file loaded before
@@ -1182,11 +1182,11 @@ static CUresult load_module_from_ptx_file(CUmodule *module,
            ptx_path_loaded.c_str());
     return CUDA_ERROR_INVALID_VALUE;
   }
-  // yasai: each load of a text with .const data has its own copy of the constants on a GPU
-  // (tests/ldconst_dup.cu, case same_text), so such a load gets a file of its own.
+  // yasai: each load of a text with .const or .global data has its own copy of them on a GPU
+  // (tests/ldconst_dup.cu and tests/global_dup.cu, case same_text), so such a load gets a file of its own.
   bool yasai_loaded_before = false;
   for (const auto &m : yasai_module_ptx()) yasai_loaded_before = yasai_loaded_before || m.second == ptx_path_loaded;
-  const std::string ptx_path = yasai_loaded_before && yasai_scope::file_defines_const(ptx_path_loaded)
+  const std::string ptx_path = yasai_loaded_before && yasai_scope::file_defines_data(ptx_path_loaded)
                                    ? yasai_module_reload_copy(ptx_path_loaded)
                                    : ptx_path_loaded;
 
@@ -1578,7 +1578,7 @@ void cudaRegisterVarInternal(
           .use_cuobjdump())
     ctx->cuobjdumpParseBinary((unsigned)(unsigned long long)fatCubinHandle);
   fflush(stdout);
-  // yasai: a static __device__ variable or a __constant__ is module-local in the PTX and was
+  // yasai: a __device__ variable or a __constant__ is module-local in the PTX and was
   // renamed with its module (yasai_module_scope.h). The ELF file that holds the fat binary picks the
   // module; every fat binary may be registered under the file name "default".
   const unsigned reg_handle = (unsigned)(unsigned long long)fatCubinHandle;
@@ -1598,8 +1598,8 @@ void cudaRegisterVarInternal(
       reg_library = realpath(reg_info.dli_fname, reg_resolved) ? reg_resolved : reg_info.dli_fname;
   }
   const std::string reg_name = yasai_scope::local_name(deviceName, reg_library);
-  if (constant && !global && !ext && reg_name == deviceName && yasai_scope::has_local_candidates(deviceName))
-    yasai_const::not_modeled("const_module_not_found", deviceName, reg_library);
+  if (!global && !ext && reg_name == deviceName && yasai_scope::has_local_candidates(deviceName))
+    yasai_const::not_modeled(constant ? "const_module_not_found" : "global_module_not_found", deviceName, reg_library);
   if (constant && !global && !ext) {
     ctx->func_sim->gpgpu_ptx_sim_register_const_variable(hostVar, reg_name.c_str(),
                                                          size);

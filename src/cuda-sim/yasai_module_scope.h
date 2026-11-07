@@ -6,12 +6,13 @@
 // symbol: the second module's declaration was skipped and its kernels read the first module's
 // data (UCCL-EP's device assert printed a libtorch_cuda string). A module-local symbol is a
 // file-scope .global, .const or .shared variable, or a .func, declared without .visible,
-// .extern, .weak or .common; a .visible .const is module-local as well, since each module has its
-// own copy on a GPU and no module reaches another's. scope_file() gives every such name of one PTX
-// file a suffix that is unique to the file ("__ym" and a hash of the file's base name, the same in
-// every process and run), in a copy of the file; the other .visible, .extern and .weak names keep
-// resolving across modules by name. local_name() maps a name that the host registers for a module
-// (__cudaRegisterVar of a device variable) to the module's renamed symbol.
+// .extern, .weak or .common; a .visible .const and a .global of any linkage are module-local as
+// well, since each module has its own copy on a GPU and no module reaches another's. scope_file()
+// gives every such name of one PTX file a suffix that is unique to the file ("__ym" and a hash of
+// the file's base name, the same in every process and run), in a copy of the file; the other
+// .visible, .extern and .weak names (functions, .weak .const, .shared) keep resolving across modules
+// by name. local_name() maps a name that the host registers for a module (__cudaRegisterVar of a
+// device variable) to the module's renamed symbol.
 //
 // Kernels (.entry) have linkage, but separate modules may still define the same kernel name
 // with different bodies (two Inductor graphs both compile a "triton_poi_fused_..._0"; two
@@ -103,10 +104,10 @@ bool has_local_candidates(const std::string &name);
 /// @param library The library's key ("libfoo").
 void note_file_library(const std::string &path, const std::string &library);
 
-/// Whether a PTX file declares a .const variable.
+/// Whether a PTX file declares a .const or .global variable.
 /// @param path PTX file.
 /// @return Whether it does (false when the file cannot be read).
-bool file_defines_const(const std::string &path);
+bool file_defines_data(const std::string &path);
 
 }  // namespace yasai_scope
 

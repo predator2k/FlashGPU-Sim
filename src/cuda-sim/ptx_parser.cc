@@ -381,6 +381,14 @@ void ptx_recognizer::add_identifier(const char *identifier, int array_dim,
                              std::string(gpgpu_ctx->g_filename) + ":" + std::to_string(ptx_get_lineno(scanner)));
   }
 
+  // yasai: a module that only declares a .global with .extern has its own copy on a GPU, of the
+  // declared size (yasai_module_scope.h); one without a size has no reference.
+  if (!g_func_decl && g_extern_spec && ti.get_memory_space().get_type() == global_space &&
+      array_ident == ARRAY_IDENTIFIER_NO_DIM) {
+    yasai_const::not_modeled("extern_global_unsized", identifier,
+                             std::string(gpgpu_ctx->g_filename) + ":" + std::to_string(ptx_get_lineno(scanner)));
+  }
+
   bool duplicates = check_for_duplicates(identifier);
   if (duplicates) {
     symbol *s = g_current_symbol_table->lookup(identifier);
