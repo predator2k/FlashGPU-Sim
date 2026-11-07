@@ -4798,10 +4798,12 @@ void functionalCoreSim::executeWarp(unsigned i, bool &allAtBarrier,
   if (!m_warpAtBarrier[i] && m_liveThreadCount[i] != 0) {
     warp_inst_t inst = getExecuteWarp(i);
     yasai_func::g_wait_failed = false;
-    if (yasai_func::tracing()) yasai_func::aux_clear();
+    // One read of the trace flag for both uses (emit clears it only while it writes this record).
+    const bool trace_on = yasai_func::tracing();
+    if (trace_on) yasai_func::aux_clear();
     execute_warp_inst_t(inst, i);
     yasai_func::count_warp_inst(inst.active_count());
-    if (yasai_func::tracing()) yasai_emit_warp(inst, i);
+    if (trace_on) yasai_emit_warp(inst, i);
     if (inst.isatomic()) inst.do_atomic(true);
     // yasai: membar does not stop the warp (the functional memory is sequentially consistent;
     // blocking it until every warp reaches a barrier deadlocks warps that spin on a flag), and

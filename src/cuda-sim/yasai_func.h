@@ -170,18 +170,44 @@ struct WarpAux {
   std::map<uint64_t, uint8_t> line_mask;  // TMA: 128 B line address -> touched 32 B sector mask
 };
 
-// The notes below are for the instruction implementations. Each returns at once when no trace is
-// being written, and adds to the entries of the warp instruction that this thread executes.
+// True while a trace is being written for the current kernel (an open .ywr file that has not reached
+// YASAI_TRACE_MAX_MB). kernel_begin, kernel_end and the truncation in emit write it. A traced kernel
+// runs serially (yasai_func_run::serial_only), so no warp thread reads it while it changes.
+extern bool g_tracing;
+
+// Returns true when a trace is being written for the current kernel. It is inline, because the
+// functional mode asks it for every warp instruction.
+inline bool tracing() { return g_tracing; }
+
+// The out-of-line parts of the notes below, called only while tracing().
+void aux_mbar_traced(AuxMbarOp op, uint32_t addr, uint32_t count, uint32_t tx_bytes);
+void aux_mbar_wait_traced(uint32_t addr, uint32_t parity, bool done);
+void aux_tma_traced(AuxTmaOp op, uint32_t mbar_addr, uint32_t bytes);
+void aux_tma_span_traced(uint64_t addr, uint64_t bytes);
+void aux_bulk_traced(AuxKind kind, uint32_t n);
+
+// The notes below are for the instruction implementations. Each returns at once at its call site when
+// no trace is being written, and adds to the entries of the warp instruction that this thread executes.
 // One lane's mbarrier operation other than a wait.
-void aux_mbar(AuxMbarOp op, uint32_t addr, uint32_t count, uint32_t tx_bytes);
+inline void aux_mbar(AuxMbarOp op, uint32_t addr, uint32_t count, uint32_t tx_bytes) {
+  if (tracing()) aux_mbar_traced(op, addr, count, tx_bytes);
+}
 // One lane's phase check.
-void aux_mbar_wait(uint32_t addr, uint32_t parity, bool done);
+inline void aux_mbar_wait(uint32_t addr, uint32_t parity, bool done) {
+  if (tracing()) aux_mbar_wait_traced(addr, parity, done);
+}
 // One lane's TMA copy; aux_tma_span then gives the parts of its global side.
-void aux_tma(AuxTmaOp op, uint32_t mbar_addr, uint32_t bytes);
+inline void aux_tma(AuxTmaOp op, uint32_t mbar_addr, uint32_t bytes) {
+  if (tracing()) aux_tma_traced(op, mbar_addr, bytes);
+}
 // A part of the global side of the copy noted last by aux_tma on this thread.
-void aux_tma_span(uint64_t addr, uint64_t bytes);
+inline void aux_tma_span(uint64_t addr, uint64_t bytes) {
+  if (tracing()) aux_tma_span_traced(addr, bytes);
+}
 // One lane's cp.async.bulk.commit_group (kAuxBulkCommit) or wait_group N (kAuxBulkWait).
-void aux_bulk(AuxKind kind, uint32_t n);
+inline void aux_bulk(AuxKind kind, uint32_t n) {
+  if (tracing()) aux_bulk_traced(kind, n);
+}
 // Forgets the entries of this thread (before a warp instruction executes).
 void aux_clear();
 // The entries of the warp instruction this thread executed; they are forgotten here.
@@ -206,9 +232,6 @@ struct WarpRecord {
   uint64_t value = 0;           // see has_value
   const WarpAux *aux = nullptr; // auxiliary fields of this record; a TMA entry's lines replace lane_addr
 };
-
-// Returns true when a trace is being written for the current kernel.
-bool tracing();
 
 // With YASAI_TRACE_SRC=1, records the PTX source line of pc; kernel_end writes the executed PCs
 // with their execution counts and source to k<seq>.pcs.txt next to the trace.

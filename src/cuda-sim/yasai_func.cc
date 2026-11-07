@@ -199,11 +199,12 @@ void kernel_begin(const std::string &name, Dim3 grid, Dim3 block) {
     g_trace.file = std::fopen((g_trace.base + ".ywr").c_str(), "wb");
     if (g_trace.file) std::fwrite("YWR1", 1, 4, g_trace.file);
   }
+  g_tracing = g_trace.file != nullptr;
   g_kernel_seq++;
   g_counters.start = yasai_real_mono_s();
 }
 
-bool tracing() { return g_trace.file != nullptr && !g_trace.truncated; }
+bool g_tracing = false;
 
 namespace {
 
@@ -245,7 +246,7 @@ WarpAux &aux_entry(uint8_t kind, uint8_t op, uint32_t addr) {
 }
 }  // namespace
 
-void aux_mbar(AuxMbarOp op, uint32_t addr, uint32_t count, uint32_t tx_bytes) {
+void aux_mbar_traced(AuxMbarOp op, uint32_t addr, uint32_t count, uint32_t tx_bytes) {
   if (!tracing()) return;
   WarpAux &a = aux_entry(kAuxMbarrier, op, addr);
   if (op == kAuxMbarInit)
@@ -255,14 +256,14 @@ void aux_mbar(AuxMbarOp op, uint32_t addr, uint32_t count, uint32_t tx_bytes) {
   a.tx_bytes += tx_bytes;
 }
 
-void aux_mbar_wait(uint32_t addr, uint32_t parity, bool done) {
+void aux_mbar_wait_traced(uint32_t addr, uint32_t parity, bool done) {
   if (!tracing()) return;
   WarpAux &a = aux_entry(kAuxMbarrier, kAuxMbarWait, addr);
   a.parity = uint8_t(parity & 1u);
   if (!done) a.result = 0;
 }
 
-void aux_tma(AuxTmaOp op, uint32_t mbar_addr, uint32_t bytes) {
+void aux_tma_traced(AuxTmaOp op, uint32_t mbar_addr, uint32_t bytes) {
   if (!tracing()) return;
   WarpAux &a = aux_entry(kAuxTma, op, mbar_addr);
   a.tx_bytes += bytes;
@@ -270,14 +271,14 @@ void aux_tma(AuxTmaOp op, uint32_t mbar_addr, uint32_t bytes) {
   if (&a != &g_aux.back()) std::swap(a, g_aux.back());
 }
 
-void aux_tma_span(uint64_t addr, uint64_t bytes) {
+void aux_tma_span_traced(uint64_t addr, uint64_t bytes) {
   if (!tracing() || g_aux.empty() || g_aux.back().kind != kAuxTma || bytes == 0) return;
   WarpAux &a = g_aux.back();
   for (uint64_t s = addr >> 5; s <= (addr + bytes - 1) >> 5; s++)
     a.line_mask[(s >> 2) << 7] |= uint8_t(1u << (s & 3));
 }
 
-void aux_bulk(AuxKind kind, uint32_t n) {
+void aux_bulk_traced(AuxKind kind, uint32_t n) {
   if (!tracing()) return;
   aux_entry(kind, 0, 0).count = n;
 }
@@ -362,6 +363,7 @@ void emit(const WarpRecord &rec) {
     flush_trace();
     std::fflush(g_trace.file);
     g_trace.truncated = true;
+    g_tracing = false;
     dump_pcs();  // a kernel that never ends still leaves its executed PCs
   }
 }
@@ -469,6 +471,7 @@ void kernel_end(const std::string &name, Dim3 g, Dim3 b) {
       std::fclose(meta);
     }
     g_trace.file = nullptr;
+    g_tracing = false;
     dump_pcs();
   }
   g_pc_src.clear();
