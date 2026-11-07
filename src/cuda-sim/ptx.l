@@ -42,6 +42,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "opcodes.h"
 #include "ptx_parser.h"
 #include "ptx.tab.h"
+#include <cerrno>
 #include <cstdlib>
 #include <string.h>
 #include "../../libcuda/gpgpu_context.h"
@@ -51,6 +52,21 @@ POSSIBILITY OF SUCH DAMAGE.
 /* yasai: the U suffix of an integer literal only marks it unsigned; strtoull/strtoll stop at
    the suffix and return the right value, so nothing else is needed. */
 #define CHECK_UNSIGNED
+/* yasai: the value of a decimal integer literal. Without a sign a value of 2^63 or more is an unsigned
+   64-bit value (a .b64 initializer of a table, for example), which strtoll saturated to
+   0x7fffffffffffffff without a message; the bits are kept as the hexadecimal rule keeps them. A literal
+   that does not fit in 64 bits stops rather than giving a wrong value.
+     text  the literal, with its sign and its U suffix */
+static long long yasai_decimal_literal(const char *text) {
+  errno = 0;
+  const long long value =
+      text[0] == '-' ? strtoll(text, NULL, 10) : (long long)strtoull(text, NULL, 10);
+  if (errno == ERANGE) {
+    printf("GPGPU-Sim: ERROR ** integer literal %s does not fit in 64 bits\n", text);
+    abort();
+  }
+  return value;
+}
 #define YY_DECL int ptx_lex \
 	       (YYSTYPE * yylval_param , yyscan_t yyscanner, ptx_recognizer* recognizer)
 int ptx_error( yyscan_t yyscanner, ptx_recognizer* recognizer, const char *s );
@@ -335,6 +351,7 @@ breakaddr  TC; BEGIN(NOT_OPCODE); yylval->int_value = BREAKADDR_OP; return OPCOD
 \.version TC; return VERSION_DIRECTIVE;
 \.visible TC; return VISIBLE_DIRECTIVE;
 \.weak TC; return WEAK_DIRECTIVE;
+\.common TC; return COMMON_DIRECTIVE; /* yasai: linkage of a .global; each loaded module has its own copy (tests/global_dup.cu) */
 \.address_size TC; return ADDRESS_SIZE_DIRECTIVE;
 \.weak	TC; return WEAK_DIRECTIVE;
 \.mbarrier::complete_tx::bytes TC; return TMA_MBAR_COMPLETE_BYTES;
@@ -393,7 +410,7 @@ breakaddr  TC; BEGIN(NOT_OPCODE); yylval->int_value = BREAKADDR_OP; return OPCOD
 0[xX][0-9a-fA-F]+U? TC; CHECK_UNSIGNED; yylval->int_value = (long long)strtoull(yytext, NULL, 0); return INT_OPERAND;
 0[0-7]+U?   	TC; printf("GPGPU-Sim: ERROR ** parsing octal not (yet) implemented\n"); abort(); return INT_OPERAND;
 0[bB][01]+U?  	TC; printf("GPGPU-Sim: ERROR ** parsing binary not (yet) implemented\n"); abort(); return INT_OPERAND;
-[-]?[0-9]+U?    TC; CHECK_UNSIGNED; yylval->int_value = strtoll(yytext, NULL, 10); return INT_OPERAND;
+[-]?[0-9]+U?    TC; CHECK_UNSIGNED; yylval->int_value = yasai_decimal_literal(yytext); return INT_OPERAND;
 
 0[fF][0-9a-fA-F]{8}  TC; sscanf(yytext+2,"%x", (unsigned*)(void*)&yylval->float_value); return FLOAT_OPERAND;
 0[dD][0-9a-fA-F]{16}  TC; sscanf(yytext+2,"%Lx", (unsigned long long*)(void*)&yylval->double_value); return DOUBLE_OPERAND;

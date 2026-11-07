@@ -92,6 +92,7 @@ class ptx_recognizer;
 %token  ADDRESS_SIZE_DIRECTIVE
 %token  VISIBLE_DIRECTIVE
 %token  WEAK_DIRECTIVE
+%token  COMMON_DIRECTIVE
 %token  <string_value> IDENTIFIER
 %token  <int_value> INT_OPERAND
 %token  <float_value> FLOAT_OPERAND
@@ -564,6 +565,7 @@ var_spec: space_spec
 	| VISIBLE_DIRECTIVE
 	| EXTERN_DIRECTIVE { recognizer->add_extern_spec(); }
     | WEAK_DIRECTIVE
+	| COMMON_DIRECTIVE
 	;
 
 align_spec: ALIGN_DIRECTIVE INT_OPERAND { recognizer->add_alignment_spec($2); }
