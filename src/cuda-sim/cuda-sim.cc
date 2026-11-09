@@ -3503,6 +3503,15 @@ void cuda_sim::gpgpu_ptx_sim_register_global_variable(void *hostVar,
   g_global_name_lookup[hostVar] = deviceName;
 }
 
+void cuda_sim::yasai_register_var_without_ptx(const void *hostVar, const char *deviceName,
+                                              bool constant, size_t size,
+                                              const std::string &detail) {
+  printf("GPGPU-Sim PTX: yasai: %s %s (%zu bytes) belongs to a module without PTX (%s); host "
+         "access to it is not modeled\n",
+         constant ? "__constant__" : "__device__ variable", deviceName, size, detail.c_str());
+  yasai_vars_without_ptx[hostVar] = yasai_var_without_ptx_t{deviceName, constant, detail};
+}
+
 void cuda_sim::gpgpu_ptx_sim_memcpy_symbol(const char *hostVar, const void *src,
                                            size_t count, size_t offset, int to,
                                            gpgpu_t *gpu) {
@@ -3513,6 +3522,11 @@ void cuda_sim::gpgpu_ptx_sim_memcpy_symbol(const char *hostVar, const void *src,
   memory_space_t mem_region = undefined_space;
   std::string sym_name;
 
+  // yasai: a variable of a library without PTX has no symbol in the simulator.
+  const auto no_ptx = gpu->gpgpu_ctx->func_sim->yasai_vars_without_ptx.find(hostVar);
+  if (no_ptx != gpu->gpgpu_ctx->func_sim->yasai_vars_without_ptx.end())
+    yasai_const::not_modeled(no_ptx->second.constant ? "const_module_without_ptx" : "global_module_without_ptx",
+                             no_ptx->second.name.c_str(), no_ptx->second.detail);
   std::map<const void *, std::string>::iterator c =
       gpu->gpgpu_ctx->func_sim->g_const_name_lookup.find(hostVar);
   if (c != gpu->gpgpu_ctx->func_sim->g_const_name_lookup.end()) {
@@ -3610,6 +3624,11 @@ void cuda_sim::gpgpu_ptx_sim_memcpy_symbol(const char *hostVar, const void *src,
 }
 
 bool cuda_sim::yasai_symbol_address(const void *hostVar, unsigned long long *addr, size_t *size) {
+  // yasai: a variable of a library without PTX has no symbol in the simulator.
+  const auto no_ptx = yasai_vars_without_ptx.find(hostVar);
+  if (no_ptx != yasai_vars_without_ptx.end())
+    yasai_const::not_modeled(no_ptx->second.constant ? "const_module_without_ptx" : "global_module_without_ptx",
+                             no_ptx->second.name.c_str(), no_ptx->second.detail);
   std::string sym_name;
   auto c = g_const_name_lookup.find(hostVar);
   auto g = g_global_name_lookup.find(hostVar);

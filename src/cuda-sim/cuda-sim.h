@@ -408,6 +408,16 @@ class cuda_sim {
       g_global_name_lookup;  // indexed by hostVar
   std::map<const void *, std::string>
       g_const_name_lookup;  // indexed by hostVar
+  /// yasai: a __device__ variable or a __constant__ that a library without PTX registered
+  /// (yasai_register_var_without_ptx). The library's modules are not in the simulator, so the
+  /// variable has no symbol here.
+  struct yasai_var_without_ptx_t {
+    std::string name;    ///< name as the library registers it
+    bool constant;       ///< whether it is a __constant__
+    std::string detail;  ///< the library and the architecture it has no PTX files for
+  };
+  /// yasai: the variables of libraries without PTX, indexed by hostVar.
+  std::map<const void *, yasai_var_without_ptx_t> yasai_vars_without_ptx;
   int g_ptx_sim_mode;  // if non-zero run functional simulation only (i.e., no
                        // notion of a clock cycle)
   unsigned gpgpu_param_num_shaders;
@@ -445,6 +455,15 @@ class cuda_sim {
                                               size_t size);
   void gpgpu_ptx_sim_register_const_variable(void *, const char *deviceName,
                                              size_t size);
+  /// yasai: records a variable of a library without PTX (see yasai_vars_without_ptx); host
+  /// access to it stops the run as not modeled.
+  /// @param hostVar the host variable the library registers
+  /// @param deviceName the variable's name
+  /// @param constant whether it is a __constant__
+  /// @param size its size in bytes
+  /// @param detail the library and the architecture it has no PTX files for
+  void yasai_register_var_without_ptx(const void *hostVar, const char *deviceName, bool constant,
+                                      size_t size, const std::string &detail);
   void read_sim_environment_variables();
   void set_param_gpgpu_num_shaders(int num_shaders);
   struct rec_pts find_reconvergence_points(function_info *finfo);
@@ -454,7 +473,8 @@ class cuda_sim {
                                    gpgpu_t *gpu);
   /// yasai: device address and size of the variable that the host registered as hostVar
   /// (__cudaRegisterVar), for cudaGetSymbolAddress / cudaGetSymbolSize; loads its PTX file when
-  /// it is not parsed yet. False when hostVar names no registered variable.
+  /// it is not parsed yet. False when hostVar names no registered variable. A variable of a
+  /// library without PTX stops the run as not modeled.
   bool yasai_symbol_address(const void *hostVar, unsigned long long *addr, size_t *size);
   void ptx_print_insn(address_type pc, FILE *fp);
   std::string ptx_get_insn_str(address_type pc);

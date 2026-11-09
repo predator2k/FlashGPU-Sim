@@ -1297,6 +1297,15 @@ static std::map<unsigned, std::string> &yasai_handle_library() {
   static std::map<unsigned, std::string> m;
   return m;
 }
+
+/// yasai: every library in which yasai_register_library_ptx found no PTX file, with the compute
+/// capability it looked for. The library's modules are not in the simulator, so a variable that
+/// the library registers has no symbol here (cudaRegisterVarInternal).
+/// @return The library path -> compute capability map.
+static std::map<std::string, unsigned> &yasai_libraries_without_ptx() {
+  static std::map<std::string, unsigned> m;
+  return m;
+}
 }
 
 // Internal implementation for cudaRegisterFatBiaryInternal
@@ -1596,6 +1605,18 @@ void cudaRegisterVarInternal(
     char reg_resolved[4096];
     if (dladdr(reg_fatbin->second, &reg_info) && reg_info.dli_fname != NULL && reg_info.dli_fname[0] != '\0')
       reg_library = realpath(reg_info.dli_fname, reg_resolved) ? reg_resolved : reg_info.dli_fname;
+  }
+  // yasai: a library without PTX has modules that the simulator does not have, and on a GPU each
+  // module has its own copy of the variable, so the variable is recorded as one of such a module
+  // before local_name, which could otherwise choose another module's copy of the same name. None
+  // of the library's kernels can run here; host access to the variable stops the run as not
+  // modeled (cuda_sim::yasai_register_var_without_ptx).
+  const auto no_ptx = yasai_libraries_without_ptx().find(reg_library);
+  if (no_ptx != yasai_libraries_without_ptx().end() && !global && !ext) {
+    ctx->func_sim->yasai_register_var_without_ptx(
+        hostVar, deviceName, constant != 0, size,
+        reg_library + "; 0 PTX files indexed for compute capability " + std::to_string(no_ptx->second));
+    return;
   }
   const std::string reg_name = yasai_scope::local_name(deviceName, reg_library);
   if (!global && !ext && reg_name == deviceName && yasai_scope::has_local_candidates(deviceName))
@@ -6450,7 +6471,8 @@ bool yasai_lazy_load_name(const char *name) {
 // Now the library file of every registered fat binary is found with dladdr; the first time a
 // library is seen, the PTX files that cuobjdump extracts from it (one architecture, selected as
 // for PYTORCH_BIN) are indexed for lazy loading like the PYTORCH_BIN files, so its kernels are
-// parsed at their first launch. YASAI_DYNAMIC_LIB_PTX=0 turns this off.
+// parsed at their first launch. A library with no PTX file for that architecture is recorded in
+// yasai_libraries_without_ptx. YASAI_DYNAMIC_LIB_PTX=0 turns this off.
 //   ctx       simulator context
 //   handle    fat binary handle of this registration
 //   fatCubin  the fat binary wrapper the library passed (its address locates the library)
@@ -6491,7 +6513,10 @@ static void yasai_register_library_ptx(gpgpu_context *ctx, unsigned handle, void
   const std::vector<std::string> files = yasai_jit::ptx_files_of_library(path, cap);
   printf("GPGPU-Sim PTX: library %s registered after start-up: %zu PTX files indexed\n",
          path.c_str(), files.size());
-  if (files.empty()) return;
+  if (files.empty()) {
+    yasai_libraries_without_ptx()[path] = cap;
+    return;
+  }
   yasai_handle_library()[handle] = path;
   yasai_lazy_ptx_t L;
   L.handle = handle;
