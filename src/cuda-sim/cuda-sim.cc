@@ -3506,9 +3506,16 @@ void cuda_sim::gpgpu_ptx_sim_register_global_variable(void *hostVar,
 void cuda_sim::yasai_register_var_without_ptx(const void *hostVar, const char *deviceName,
                                               bool constant, size_t size,
                                               const std::string &detail) {
-  printf("GPGPU-Sim PTX: yasai: %s %s (%zu bytes) belongs to a module without PTX (%s); host "
-         "access to it is not modeled\n",
-         constant ? "__constant__" : "__device__ variable", deviceName, size, detail.c_str());
+  // A library registers every variable of every translation unit (transformer_engine about
+  // 6,000), so the first kYasaiVarsWithoutPtxPrinted of each library are printed.
+  const unsigned printed = ++yasai_vars_without_ptx_printed[detail];
+  if (printed <= kYasaiVarsWithoutPtxPrinted)
+    printf("GPGPU-Sim PTX: yasai: %s %s (%zu bytes) belongs to a module without PTX (%s); a host "
+           "access to it stops the run\n",
+           constant ? "__constant__" : "__device__ variable", deviceName, size, detail.c_str());
+  if (printed == kYasaiVarsWithoutPtxPrinted + 1)
+    printf("GPGPU-Sim PTX: yasai: further variables of a module without PTX (%s) are not printed\n",
+           detail.c_str());
   yasai_vars_without_ptx[hostVar] = yasai_var_without_ptx_t{deviceName, constant, detail};
 }
 

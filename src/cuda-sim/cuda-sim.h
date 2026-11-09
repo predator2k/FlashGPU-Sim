@@ -418,6 +418,11 @@ class cuda_sim {
   };
   /// yasai: the variables of libraries without PTX, indexed by hostVar.
   std::map<const void *, yasai_var_without_ptx_t> yasai_vars_without_ptx;
+  /// yasai: how many variables each library without PTX registered, indexed by the detail
+  /// string (the library and the architecture), for the cap on printed lines.
+  std::map<std::string, unsigned> yasai_vars_without_ptx_printed;
+  /// yasai: the number of variables of one library without PTX that are printed.
+  static constexpr unsigned kYasaiVarsWithoutPtxPrinted = 5;
   int g_ptx_sim_mode;  // if non-zero run functional simulation only (i.e., no
                        // notion of a clock cycle)
   unsigned gpgpu_param_num_shaders;
