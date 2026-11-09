@@ -1606,21 +1606,26 @@ void cudaRegisterVarInternal(
     if (dladdr(reg_fatbin->second, &reg_info) && reg_info.dli_fname != NULL && reg_info.dli_fname[0] != '\0')
       reg_library = realpath(reg_info.dli_fname, reg_resolved) ? reg_resolved : reg_info.dli_fname;
   }
-  // yasai: a library without PTX has modules that the simulator does not have, and on a GPU each
-  // module has its own copy of the variable, so the variable is recorded as one of such a module
-  // before local_name, which could otherwise choose another module's copy of the same name. None
-  // of the library's kernels can run here; host access to the variable stops the run as not
-  // modeled (cuda_sim::yasai_register_var_without_ptx).
-  const auto no_ptx = yasai_libraries_without_ptx().find(reg_library);
-  if (no_ptx != yasai_libraries_without_ptx().end() && !global && !ext) {
-    ctx->func_sim->yasai_register_var_without_ptx(
-        hostVar, deviceName, constant != 0, size,
-        reg_library + "; 0 PTX files indexed for compute capability " + std::to_string(no_ptx->second));
-    return;
-  }
   const std::string reg_name = yasai_scope::local_name(deviceName, reg_library);
-  if (!global && !ext && reg_name == deviceName && yasai_scope::has_local_candidates(deviceName))
+  if (!global && !ext && reg_name == deviceName && yasai_scope::has_local_candidates(deviceName)) {
+    // yasai: a library without PTX has its kernels served by name from another module that
+    // defines them (CUctx_st::register_function), so its variables resolve through local_name as
+    // any library's do: when one module defines the name, that module's copy is the one those
+    // kernels read (NVSHMEM's libnvshmem_host.so and the nvshmemi_device_state_d of the program's
+    // NVSHMEM device code). When several modules define the name, local_name cannot choose one
+    // (cuRAND's precalc_xorwow_matrix in transformer_engine's libtransformer_engine.so); the
+    // variable is then recorded as belonging to a module without PTX, and a host access to it
+    // stops the run as not modeled (cuda_sim::yasai_register_var_without_ptx). A library with
+    // PTX whose module is not found still stops here.
+    const auto no_ptx = yasai_libraries_without_ptx().find(reg_library);
+    if (no_ptx != yasai_libraries_without_ptx().end()) {
+      ctx->func_sim->yasai_register_var_without_ptx(
+          hostVar, deviceName, constant != 0, size,
+          reg_library + "; 0 PTX files indexed for compute capability " + std::to_string(no_ptx->second));
+      return;
+    }
     yasai_const::not_modeled(constant ? "const_module_not_found" : "global_module_not_found", deviceName, reg_library);
+  }
   if (constant && !global && !ext) {
     ctx->func_sim->gpgpu_ptx_sim_register_const_variable(hostVar, reg_name.c_str(),
                                                          size);
