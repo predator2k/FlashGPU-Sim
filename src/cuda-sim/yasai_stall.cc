@@ -1,7 +1,7 @@
 // yasai_stall.cc: see yasai_stall.h.
 #include "yasai_stall.h"
 
-#include <time.h>
+#include "../yasai_realtime.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -124,9 +124,9 @@ void note_load(uint64_t addr, size_t length, const void *data) {
 }
 
 uint64_t now_ns() {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
-  return uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+  // Real time: under a time-dilation preload the libc clock runs D times slower, and
+  // YASAI_STALL_S would then need D times as many real seconds (yasai_realtime.h).
+  return yasai_real_coarse_ns();
 }
 
 const settings &config() {

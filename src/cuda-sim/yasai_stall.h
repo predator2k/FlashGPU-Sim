@@ -138,7 +138,7 @@ void end_group(tracker &t);
 /// @param t The group's state.
 double quiet_seconds(const tracker &t);
 
-/// Monotonic clock in ns (coarse).
+/// Real monotonic clock in ns (coarse; not stretched by a time-dilation preload).
 uint64_t now_ns();
 
 }  // namespace yasai_stall

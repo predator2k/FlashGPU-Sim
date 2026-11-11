@@ -231,8 +231,8 @@ namespace {
 thread_local uint64_t t_yasai_graph_group = 0;
 thread_local bool t_yasai_graph_checked = false;
 std::atomic<uint64_t> g_yasai_next_graph_group{1};
-/// yasai: wall seconds a host thread waits at the host-ahead limit, with no device progress,
-/// before the warning line.
+/// yasai: real wall seconds a host thread waits at the host-ahead limit, with no device progress,
+/// before the warning line (yasai_real_mono_s, so a time-dilation preload does not stretch it).
 constexpr double kWarnS = 600;
 /// yasai: the manager whose host-ahead limit summary is printed at exit (the first with the limit).
 stream_manager *g_yasai_limit_summary_of = NULL;
@@ -276,17 +276,13 @@ void stream_manager::yasai_limit_pending(const stream_operation &op) {
   unsigned n = yasai_pending_ops();
   if (n < m_yasai_max_pending) return;
   m_yasai_limit_waits.fetch_add(1, std::memory_order_relaxed);
-  struct timespec t0;
-  clock_gettime(CLOCK_MONOTONIC, &t0);
-  double quiet_since = t0.tv_sec + t0.tv_nsec * 1e-9;
+  double quiet_since = yasai_real_mono_s();
   unsigned long long progress = g_yasai_device_progress.load(std::memory_order_relaxed);
   bool warned = false;
   unsigned us = 20;
   while ((n = yasai_pending_ops()) >= m_yasai_max_pending) {
     yasai_backoff(&us);
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    const double now = t.tv_sec + t.tv_nsec * 1e-9;
+    const double now = yasai_real_mono_s();
     const unsigned long long p = g_yasai_device_progress.load(std::memory_order_relaxed);
     if (p != progress) {
       progress = p;
