@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <cctype>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -431,7 +432,23 @@ std::string scope_file(const std::string &path, const std::string &unit_in) {
   make_dirs(dir);
   char hx[24];
   snprintf(hx, sizeof hx, "%016llx-", (unsigned long long)content_hash);
-  const std::string out_path = dir + "/" + hx + base;
+  // A long base (a whole path taken above, or a JIT module named after its template parameters)
+  // is shortened in the copy's file name to a hash of the whole base and its last 120 characters,
+  // which keep the file's own name; the name with its hash prefix and the temporary suffix then
+  // stays below the 255-byte file name limit (2026-11-11: an engine in a long working directory
+  // exceeded it). The suffix and the renamed records keep the whole base.
+  std::string file_base = base;
+  if (file_base.size() > 160) {
+    uint64_t h = 1469598103934665603ull;
+    for (char c : base) {
+      h ^= uint8_t(c);
+      h *= 1099511628211ull;
+    }
+    char bh[24];
+    snprintf(bh, sizeof bh, "%016llx-", (unsigned long long)h);
+    file_base = bh + base.substr(base.size() - 120);
+  }
+  const std::string out_path = dir + "/" + hx + file_base;
   if (dir_env && *dir_env) evict_lru_once(dir);
   struct stat st;
   const bool cached = stat(out_path.c_str(), &st) == 0;
@@ -447,7 +464,8 @@ std::string scope_file(const std::string &path, const std::string &unit_in) {
     tmpl.insert(tmpl.end(), suffix_x, suffix_x + sizeof suffix_x);  // with the terminating zero
     const int fd = mkstemp(tmpl.data());
     if (fd < 0) {
-      fprintf(stderr, "yasai-scope: cannot create a temporary file for %s\n", out_path.c_str());
+      fprintf(stderr, "yasai-scope: cannot create a temporary file for %s: %s\n", out_path.c_str(),
+              strerror(errno));
       abort();
     }
     close(fd);

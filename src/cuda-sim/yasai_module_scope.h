@@ -34,8 +34,10 @@ namespace yasai_scope {
 
 /// Path of the PTX file to parse in place of path: path itself when the file declares no
 /// module-local symbol (or YASAI_MODULE_SCOPE=0), otherwise a copy with every module-local name
-/// renamed, named <hash of the source>-<base name>, in YASAI_MODULE_SCOPE_DIR (a cache shared by
-/// runs) or in yasai_module_scope/ of the working directory. The text
+/// renamed, named <hash of the source>-<base name> (a base name longer than 160 characters, such as
+/// the whole path that a second file of one base name takes, is shortened to a hash of it and its
+/// last 120 characters), in YASAI_MODULE_SCOPE_DIR (a cache shared by runs) or in
+/// yasai_module_scope/ of the working directory. The text
 /// keeps its lines, so line-keyed information (SASS guides, debug output) still applies. A path
 /// is scanned once per process; later calls return the same copy.
 /// @param path PTX file.
